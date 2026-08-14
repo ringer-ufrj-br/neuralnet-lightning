@@ -2,25 +2,49 @@ import argparse
 import yaml
 import sys
 import os
+import logging
+from typing import Dict, Any
 
-# Garante que o Python encontre o pacote ai a partir da raiz do projeto
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Ensure Python finds the ai package from project root
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-def load_config(config_path):
+def load_config(config_path: str) -> Dict[str, Any]:
+    """
+    Loads a YAML configuration file.
+
+    Args:
+        config_path (str): Path to the YAML configuration file.
+
+    Returns:
+        Dict[str, Any]: Parsed configuration dictionary.
+    """
     with open(config_path, 'r') as file:
         return yaml.safe_load(file)
 
-def main():
-    parser = argparse.ArgumentParser(description="Orquestrador de Treinamento de Redes Neurais (ATLAS CERN).")
-    parser.add_argument('--config', type=str, default='config.yaml', help="Caminho para o arquivo YAML de configuração.")
-    parser.add_argument('--fold', type=int, default=None, help="Executar apenas um fold específico (útil para paralelismo via SLURM).")
+
+def main() -> None:
+    """
+    Main orchestrator function for Neural Network Training (ATLAS CERN).
+
+    Args:
+        None
+
+    Returns:
+        None
+    """
+    parser = argparse.ArgumentParser(description="Neural Network Training Orchestrator (ATLAS CERN).")
+    parser.add_argument('--config', type=str, default='config.yaml', help="Path to YAML configuration file.")
+    parser.add_argument('--fold', type=int, default=None, help="Execute a specific fold (useful for SLURM parallelism).")
     args = parser.parse_args()
 
     if not os.path.exists(args.config):
-        print(f"Erro: Arquivo de configuração '{args.config}' não encontrado.")
+        logger.error(f"❌ Configuration file '{args.config}' not found.")
         sys.exit(1)
 
-    print(f"Carregando configurações de: {args.config}")
+    logger.info(f"⚙️ Loading configuration from: {args.config}")
     config = load_config(args.config)
     
     model_type = config.get("model", "CNN2D")
@@ -50,9 +74,9 @@ def main():
             num_workers=config.get("num_workers", 0)
         ) 
     else:
-        raise ValueError(f"Modelo '{model_type}' não é suportado ou ainda não foi implementado na pipeline.")
+        raise ValueError(f"❌ Model '{model_type}' is not supported or not implemented in pipeline.")
 
-    # Inicia o fluxo completo de carregamento, treinamento e validação
+    # Start complete workflow: load, train, and evaluate
     pipeline.run(
         use_kfold=config.get("use_kfold", False),
         n_splits=config.get("n_splits", 5),

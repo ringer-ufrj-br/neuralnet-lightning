@@ -1,40 +1,65 @@
 import pandas as pd
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 import os
+import logging
+from typing import Dict, Union, List
+import numpy as np
+
+logger = logging.getLogger(__name__)
 
 class ModelSummary:
-    def __init__(self, output_dir="results/metrics"):
+    """
+    Summary class for calculating and storing evaluation metrics in tabular CSV format.
+    """
+
+    def __init__(self, output_dir: str = "results/metrics") -> None:
         """
-        Inicializa o sumário para calcular e salvar as principais métricas de avaliação.
+        Initializes ModelSummary instance.
+
+        Args:
+            output_dir (str): Directory where CSV metric files are saved. Defaults to 'results/metrics'.
         """
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         
-    def save_metrics(self, y_true, y_prob, threshold=0.5, filename="metrics_summary.csv"):
+    def save_metrics(
+        self, 
+        y_true: Union[List[int], np.ndarray], 
+        y_prob: Union[List[float], np.ndarray], 
+        threshold: float = 0.5, 
+        filename: str = "metrics_summary.csv"
+    ) -> Dict[str, float]:
         """
-        Calcula as métricas Accuracy, AUC, Precision, Recall e F1-Score 
-        e anexa os resultados em um arquivo CSV.
+        Calculates Accuracy, AUC, Precision, Recall, and F1-Score metrics, saving results to a CSV file.
+
+        Args:
+            y_true (Union[List[int], np.ndarray]): True target labels.
+            y_prob (Union[List[float], np.ndarray]): Predicted probabilities.
+            threshold (float): Classification decision threshold. Defaults to 0.5.
+            filename (str): CSV output filename. Defaults to 'metrics_summary.csv'.
+
+        Returns:
+            Dict[str, float]: Dictionary containing computed metrics.
         """
-        # Converte a probabilidade na classe binária usando o threshold (padrão = 0.5)
         y_pred = (y_prob >= threshold).astype(int)
         
         metrics = {
-            "Accuracy": accuracy_score(y_true, y_pred),
-            "AUC": roc_auc_score(y_true, y_prob),
-            "Precision": precision_score(y_true, y_pred, zero_division=0),
-            "Recall": recall_score(y_true, y_pred, zero_division=0),
-            "F1_Score": f1_score(y_true, y_pred, zero_division=0)
+            "Accuracy": float(accuracy_score(y_true, y_pred)),
+            "AUC": float(roc_auc_score(y_true, y_prob)),
+            "Precision": float(precision_score(y_true, y_pred, zero_division=0)),
+            "Recall": float(recall_score(y_true, y_pred, zero_division=0)),
+            "F1_Score": float(f1_score(y_true, y_pred, zero_division=0))
         }
         
         df = pd.DataFrame([metrics])
         filepath = os.path.join(self.output_dir, filename)
         
-        # Se o arquivo já existe, anexa os novos resultados. Se não, cria com cabeçalho
         if os.path.exists(filepath):
             df.to_csv(filepath, mode='a', header=False, index=False)
-            print(f"Métricas anexadas ao arquivo: {filepath}")
+            logger.info(f"📊 Appended metrics to file: {filepath}")
         else:
             df.to_csv(filepath, index=False)
-            print(f"Métricas salvas no novo arquivo: {filepath}")
+            logger.info(f"📝 Saved metrics to new file: {filepath}")
             
         return metrics
+

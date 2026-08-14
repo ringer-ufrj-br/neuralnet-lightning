@@ -1,23 +1,63 @@
 import torch
 from torch.utils.data import TensorDataset, DataLoader, random_split, Subset
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Callback
 import numpy as np
 import os
+import logging
+from typing import Tuple, List, Dict, Any, Type, Optional, Union
 from sklearn.model_selection import KFold
 
+logger = logging.getLogger(__name__)
+
+class LossHistoryCallback(Callback):
+    """Callback to store training and validation loss history."""
+    def __init__(self):
+        super().__init__()
+        self.train_loss = []
+        self.val_loss = []
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        metrics = trainer.callback_metrics
+        loss = metrics.get('train_loss_epoch')
+        if loss is None:
+            loss = metrics.get('train_loss')
+        if loss is not None:
+            self.train_loss.append(loss.item())
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        metrics = trainer.callback_metrics
+        loss = metrics.get('val_loss')
+        if loss is not None:
+            self.val_loss.append(loss.item())
+
+
 class ModelTrainer:
-    def __init__(self, max_epochs=20, batch_size=32, validation_split=0.2, patience=5, log_dir="lightning_logs", num_workers=0):
+    """
+    Generic PyTorch Lightning Trainer manager supporting single-holdout and K-Fold cross-validation.
+    """
+
+    def __init__(
+        self, 
+        max_epochs: int = 20, 
+        batch_size: int = 32, 
+        validation_split: float = 0.2, 
+        patience: int = 5, 
+        log_dir: str = "lightning_logs", 
+        num_workers: int = 0
+    ) -> None:
         """
-        Inicializa o Trainer Genérico para modelos PyTorch Lightning.
-        
+        Initializes ModelTrainer instance.
+
         Args:
-            max_epochs: Número máximo de épocas.
-            batch_size: Tamanho do batch.
-            validation_split: Fração dos dados usada para validação (se não usar k-fold).
-            patience: Quantidade de épocas sem melhoria antes de parar (EarlyStopping).
-            log_dir: Diretório onde salvar os pesos e logs do modelo.
-            num_workers: Quantidade de processos paralelos para carregar dados (0 = thread principal).
+            max_epochs (int): Maximum number of training epochs. Defaults to 20.
+            batch_size (int): Training batch size. Defaults to 32.
+            validation_split (float): Fraction of dataset reserved for validation in holdout. Defaults to 0.2.
+            patience (int): Number of epochs with no validation loss improvement before stopping. Defaults to 5.
+            log_dir (str): Output directory for model checkpoints and logs. Defaults to 'lightning_logs'.
+            num_workers (int): Number of subprocesses for data loading. Defaults to 0.
         """
         self.max_epochs = max_epochs
         self.batch_size = batch_size
@@ -26,9 +66,20 @@ class ModelTrainer:
         self.log_dir = log_dir
         self.num_workers = num_workers
 
-    def prepare_data(self, X, Y):
+    def prepare_data(
+        self, 
+        X: Union[np.ndarray, torch.Tensor], 
+        Y: Union[np.ndarray, torch.Tensor]
+    ) -> Tuple[DataLoader, DataLoader]:
         """
-        Converte arrays numpy para tensores e cria os DataLoaders de Treino e Validação simples.
+        Converts feature/label inputs into PyTorch DataLoaders split into train and validation sets.
+
+        Args:
+            X (Union[np.ndarray, torch.Tensor]): Input features.
+            Y (Union[np.ndarray, torch.Tensor]): Target labels.
+
+        Returns:
+            Tuple[DataLoader, DataLoader]: Pair of DataLoaders (train_loader, val_loader).
         """
         if isinstance(X, np.ndarray):
             X = torch.as_tensor(X, dtype=torch.float32)
@@ -50,15 +101,29 @@ class ModelTrainer:
         
         return train_loader, val_loader
 
-    def fit(self, model, X, Y):
+    def fit(
+        self, 
+        model: pl.LightningModule, 
+        X: Union[np.ndarray, torch.Tensor], 
+        Y: Union[np.ndarray, torch.Tensor]
+    ) -> pl.Trainer:
         """
-        Treina qualquer modelo (LightningModule) usando holdout simples (treino/validação única).
+        Trains a PyTorch Lightning module using simple train/validation holdout.
+
+        Args:
+            model (pl.LightningModule): The PyTorch Lightning model instance.
+            X (Union[np.ndarray, torch.Tensor]): Input features.
+            Y (Union[np.ndarray, torch.Tensor]): Target labels.
+
+        Returns:
+            Tuple[pl.Trainer, LossHistoryCallback]: The trained PyTorch Lightning Trainer instance and the loss history callback.
         """
-        print("Preparando DataLoaders para Holdout...")
+        logger.info("📦 Preparing DataLoaders for Holdout...")
         train_loader, val_loader = self.prepare_data(X, Y)
         
         os.makedirs(self.log_dir, exist_ok=True)
         
+        loss_callback = LossHistoryCallback()
         callbacks = [
             EarlyStopping(monitor="val_loss", patience=self.patience, mode="min", verbose=True),
             ModelCheckpoint(
@@ -67,7 +132,8 @@ class ModelTrainer:
                 save_top_k=1, 
                 mode="min",
                 filename=f"{model.__class__.__name__}-{{epoch:02d}}-{{val_loss:.4f}}"
-            )
+            ),
+            loss_callback
         ]
         
         trainer = pl.Trainer(
@@ -78,26 +144,34 @@ class ModelTrainer:
             default_root_dir=self.log_dir
         )
         
-        print(f"Iniciando treinamento do modelo {model.__class__.__name__}...")
+        logger.info(f"🚀 Starting training for model {model.__class__.__name__}...")
         trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
         
-        print(f"Treinamento finalizado! Melhor modelo: {trainer.checkpoint_callback.best_model_path}")
-        return trainer
+        logger.info(f"✅ Training completed! Best model saved at: {trainer.checkpoint_callback.best_model_path}")
+        return trainer, loss_callback
 
-    def fit_kfold(self, model_class, model_kwargs, X, Y, n_splits=5, target_fold=None):
+    def fit_kfold(
+        self, 
+        model_class: Type[pl.LightningModule], 
+        model_kwargs: Dict[str, Any], 
+        X: Union[np.ndarray, torch.Tensor], 
+        Y: Union[np.ndarray, torch.Tensor], 
+        n_splits: int = 5, 
+        target_fold: Optional[int] = None
+    ) -> Tuple[List[pl.Trainer], List[pl.LightningModule], List[LossHistoryCallback]]:
         """
-        Executa validação cruzada (K-Fold).
-        Cria uma nova instância do modelo a cada fold para não vazar pesos.
-        
+        Executes K-Fold cross-validation, creating a fresh model instance per fold.
+
         Args:
-            model_class: A classe do modelo (ex: ModelCNN2D).
-            model_kwargs: Dicionário com os argumentos (ex: {'learning_rate': 1e-3}).
-            X, Y: Dados de entrada.
-            n_splits: Número de subdivisões.
-            target_fold: Executar apenas um fold isolado (1-indexed). Útil para SLURM.
-            
+            model_class (Type[pl.LightningModule]): Model class to instantiate.
+            model_kwargs (Dict[str, Any]): Keyword arguments for model constructor.
+            X (Union[np.ndarray, torch.Tensor]): Input features.
+            Y (Union[np.ndarray, torch.Tensor]): Target labels.
+            n_splits (int): Number of K-Fold splits. Defaults to 5.
+            target_fold (Optional[int]): Target fold number (1-indexed) to train individually. Defaults to None.
+
         Returns:
-            tuple: (fold_trainers, fold_models) Listas contendo os trainers e modelos de cada fold.
+            Tuple[List[pl.Trainer], List[pl.LightningModule], List[LossHistoryCallback]]: Lists of (fold_trainers, fold_models, fold_loss_callbacks).
         """
         if isinstance(X, np.ndarray):
             X = torch.as_tensor(X, dtype=torch.float32)
@@ -105,26 +179,23 @@ class ModelTrainer:
             Y = torch.as_tensor(Y, dtype=torch.float32)
 
         dataset = TensorDataset(X, Y)
-        
-        # shuffle=True garante que as amostras sejam misturadas antes de fatiar
         kfold = KFold(n_splits=n_splits, shuffle=True, random_state=42)
         
         fold_trainers = []
         fold_models = []
+        fold_loss_callbacks = []
         
-        print(f"Iniciando Validação Cruzada com {n_splits} folds...")
+        logger.info(f"🔁 Starting Cross-Validation with {n_splits} folds...")
         
         for fold, (train_ids, val_ids) in enumerate(kfold.split(dataset)):
             if target_fold is not None and (fold + 1) != target_fold:
                 continue
                 
-            print(f"\n{'='*20} Fold {fold + 1}/{n_splits} {'='*20}")
+            logger.info(f"📌 ==================== Fold {fold + 1}/{n_splits} ====================")
             
-            # Subsets para este fold
             train_sub = Subset(dataset, train_ids)
             val_sub = Subset(dataset, val_ids)
             
-            # DataLoaders independentes para o fold
             train_loader = DataLoader(
                 train_sub, 
                 batch_size=self.batch_size, 
@@ -140,10 +211,10 @@ class ModelTrainer:
             
             model = model_class(**model_kwargs)
             
-            # Diretório de logs específico para o fold
             fold_log_dir = os.path.join(self.log_dir, f"fold_{fold+1}")
             os.makedirs(fold_log_dir, exist_ok=True)
             
+            loss_callback = LossHistoryCallback()
             callbacks = [
                 EarlyStopping(monitor="val_loss", patience=self.patience, mode="min", verbose=True),
                 ModelCheckpoint(
@@ -152,7 +223,8 @@ class ModelTrainer:
                     save_top_k=1, 
                     mode="min",
                     filename=f"{model.__class__.__name__}-fold{fold+1}-{{epoch:02d}}-{{val_loss:.4f}}"
-                )
+                ),
+                loss_callback
             ]
             
             trainer = pl.Trainer(
@@ -166,8 +238,9 @@ class ModelTrainer:
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
             fold_trainers.append(trainer)
             fold_models.append(model)
+            fold_loss_callbacks.append(loss_callback)
             
-            print(f"Melhor modelo do Fold {fold + 1} salvo em: {trainer.checkpoint_callback.best_model_path}")
+            logger.info(f"✅ Fold {fold + 1} best model saved at: {trainer.checkpoint_callback.best_model_path}")
             
-        print(f"\nValidação Cruzada de {n_splits} Folds Concluída!")
-        return fold_trainers, fold_models
+        logger.info(f"🎉 Cross-Validation of {n_splits} Folds completed!")
+        return fold_trainers, fold_models, fold_loss_callbacks

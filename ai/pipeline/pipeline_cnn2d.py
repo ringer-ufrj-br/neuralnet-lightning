@@ -2,9 +2,13 @@ import os
 import sys
 import torch
 import numpy as np
+import logging
+from typing import Optional, Union, Tuple, List, Any
 from sklearn.model_selection import train_test_split
 
-# Adiciona o diretório raiz ao path para garantir que as importações funcionem se o script for rodado de qualquer lugar
+logger = logging.getLogger(__name__)
+
+# Ensure root directory is in path for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from ai.loader.loader import DataLoader
@@ -17,21 +21,45 @@ from ai.evaluation.monitor import ModelMonitor
 from ai.evaluation.summary import ModelSummary
 
 class PipelineCNN2D:
-    def __init__(self, data_path=None, max_files=None, label_col='label', model_name="CNN2D", max_epochs=20, batch_size=32, patience=5, num_workers=0, balance_data=True):
+    """
+    End-to-end training and evaluation pipeline for 2D CNN models.
+    """
+
+    def __init__(
+        self, 
+        data_path: Optional[str] = None, 
+        max_files: Optional[int] = None, 
+        label_col: str = 'label', 
+        model_name: str = "CNN2D", 
+        max_epochs: int = 20, 
+        batch_size: int = 32, 
+        patience: int = 5, 
+        num_workers: int = 0, 
+        balance_data: bool = True
+    ) -> None:
         """
-        Inicializa o pipeline completo para o modelo CNN 2D.
+        Initializes PipelineCNN2D instance.
+
+        Args:
+            data_path (Optional[str]): Data folder or pattern path.
+            max_files (Optional[int]): Maximum number of files to process per folder.
+            label_col (str): Column name containing labels. Defaults to 'label'.
+            model_name (str): Model name for logging and results folder. Defaults to 'CNN2D'.
+            max_epochs (int): Maximum training epochs. Defaults to 20.
+            batch_size (int): Training batch size. Defaults to 32.
+            patience (int): Early stopping patience. Defaults to 5.
+            num_workers (int): Parallel worker subprocesses. Defaults to 0.
+            balance_data (bool): Whether to apply undersampling data balancing. Defaults to True.
         """
         self.model_name = model_name
         self.label_col = label_col
         
-        # Configuração de diretórios centralizada por nome de modelo
         self.results_dir = os.path.join("results", self.model_name)
         
         self.loader = DataLoader(data_path=data_path, max_files=max_files)
         self.preprocessor = PreprocessCNN2D()
         self.balancer = DataBalancer() if balance_data else None
         
-        # O trainer vai salvar os checkpoints dentro de results/CNN2D/lightning_logs
         self.trainer = ModelTrainer(
             max_epochs=max_epochs, 
             batch_size=batch_size,
@@ -40,19 +68,37 @@ class PipelineCNN2D:
             log_dir=os.path.join(self.results_dir, "lightning_logs")
         )
         
-        # Avaliadores configurados para pastas específicas do modelo
         self.monitor = ModelMonitor(output_dir=os.path.join(self.results_dir, "plots"))
         self.summary = ModelSummary(output_dir=os.path.join(self.results_dir, "metrics"))
 
-    def evaluate_model(self, model, X_test, Y_test, threshold=0.5, suffix=""):
-        """Avalia o modelo treinado em dados invisíveis e gera relatórios."""
+    def evaluate_model(
+        self, 
+        model: torch.nn.Module, 
+        X_test: np.ndarray, 
+        Y_test: np.ndarray, 
+        threshold: float = 0.5, 
+        suffix: str = "",
+        loss_callback: Optional[Any] = None
+    ) -> None:
+        """
+        Evaluates trained model on unseen test dataset and generates metric reports/plots.
+
+        Args:
+            model (torch.nn.Module): Trained model module.
+            X_test (np.ndarray): Test feature matrix/tensors.
+            Y_test (np.ndarray): Test true labels array.
+            threshold (float): Classification decision threshold. Defaults to 0.5.
+            suffix (str): Filename suffix for evaluation reports. Defaults to ''.
+
+        Returns:
+            None
+        """
         suffix_print = f" ({suffix})" if suffix else ""
-        print(f"\n-> Etapa 4: Avaliando o modelo {self.model_name} (Threshold={threshold}){suffix_print}...")
+        logger.info(f"📊 Step 4: Evaluating model {self.model_name} (Threshold={threshold}){suffix_print}...")
         
-        model.eval() # Modo inferência, desativa Dropout/BatchNorm
+        model.eval()
         with torch.no_grad():
             X_tensor = torch.as_tensor(X_test, dtype=torch.float32)
-            # Passa no modelo e aplica sigmoide para pegar probabilidades (0 a 1)
             logits = model(X_tensor)
             y_prob = torch.sigmoid(logits).numpy().flatten()
             
@@ -61,73 +107,85 @@ class PipelineCNN2D:
         
         file_suffix = f"_{suffix}" if suffix else ""
         
-        print(f"Salvando CSV de métricas em {self.summary.output_dir}...")
+        logger.info(f"📝 Saving CSV metrics to {self.summary.output_dir}...")
         self.summary.save_metrics(y_true, y_prob, threshold=threshold, filename=f"test_metrics{file_suffix}.csv")
         
-        print(f"Salvando Gráficos (ROC, Confusion Matrix) em {self.monitor.output_dir}...")
+        logger.info(f"🖼️ Saving evaluation plots to {self.monitor.output_dir}...")
         self.monitor.plot_roc_curve(y_true, y_prob, filename=f"roc_curve{file_suffix}.pdf")
         self.monitor.plot_confusion_matrix(y_true, y_pred, filename=f"confusion_matrix{file_suffix}.pdf")
-        print(f"Avaliação completa{suffix_print}!")
-
-    def run(self, use_kfold=False, n_splits=5, test_size=0.15, learning_rate=0.001, threshold=0.5, target_fold=None):
-        """
-        Executa todas as etapas do pipeline de ponta a ponta.
-        """
-        print(f"Iniciando Pipeline Completa: {self.model_name}")
         
-        # Etapa 1: Carregamento
-        print("\n-> Etapa 1: Carregando dados...")
+        if loss_callback is not None:
+            self.monitor.plot_loss(loss_callback.train_loss, loss_callback.val_loss, filename=f"loss_curve{file_suffix}.pdf")
+            
+        logger.info(f"✅ Evaluation complete{suffix_print}!")
+
+    def run(
+        self, 
+        use_kfold: bool = False, 
+        n_splits: int = 5, 
+        test_size: float = 0.15, 
+        learning_rate: float = 0.001, 
+        threshold: float = 0.5, 
+        target_fold: Optional[int] = None
+    ) -> Optional[Union[Tuple[ModelCNN2D, Any], Tuple[List[Any], List[ModelCNN2D]]]]:
+        """
+        Executes end-to-end pipeline (loading, preprocessing, balancing, split, training, evaluation).
+
+        Args:
+            use_kfold (bool): Whether to use K-Fold cross-validation. Defaults to False.
+            n_splits (int): Number of K-Fold splits. Defaults to 5.
+            test_size (float): Holdout test dataset ratio. Defaults to 0.15.
+            learning_rate (float): Model learning rate. Defaults to 0.001.
+            threshold (float): Decision threshold. Defaults to 0.5.
+            target_fold (Optional[int]): Target fold index for isolated fold run. Defaults to None.
+
+        Returns:
+            Optional[Union[Tuple[ModelCNN2D, Any], Tuple[List[Any], List[ModelCNN2D]]]]: Model and trainer objects or None if data loading fails.
+        """
+        logger.info(f"🚀 Starting Pipeline: {self.model_name}")
+        
+        logger.info("📂 Step 1: Loading dataset...")
         df = self.loader.execute()
         
         if df is None or df.empty:
-            print("Erro: Nenhum dado foi carregado.")
+            logger.error("❌ No data was loaded.")
             return None
             
-        # Etapa 1.5: Geração de Labels
-        print("\n-> Geração de Labels...")
+        logger.info("🏷️ Step 1.5: Generating labels...")
         df = LabelGenerator.apply_label(df, file_path_col='file_path', label_col=self.label_col)
         df.drop(columns=['file_path'], inplace=True)
             
-        # Etapa 2: Pré-processamento
-        print("\n-> Etapa 2: Pré-processamento...")
+        logger.info("⚙️ Step 2: Preprocessing features into 2D image tensors...")
         X = self.preprocessor.transform(df)
         Y = self.preprocessor.get_labels(df, label_col=self.label_col)
         
         if Y is None:
-            print("Erro: Labels não encontrados.")
+            logger.error("❌ Labels column not found.")
             return None
             
         if self.balancer:
-            print("\n-> Etapa 2.5: Balanceamento de Dados...")
+            logger.info("⚖️ Step 2.5: Balancing dataset classes...")
             X, Y = self.balancer.apply(X, Y)
             
-        # Separa um Test Set absoluto (holdout verdadeiro) para a Etapa 4 de Avaliação
-        # Este dado NUNCA é visto pelo Trainer.
-        print(f"Separando {test_size*100}% dos dados para Teste Isolado...")
+        logger.info(f"✂️ Splitting {test_size * 100}% data for holdout testing...")
         X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=test_size, random_state=42, shuffle=True)
         
-        # Etapa 3: Treinamento
-        print(f"\n-> Etapa 3: Treinamento (K-Fold={use_kfold})...")
+        logger.info(f"🏋️ Step 3: Training (K-Fold={use_kfold})...")
         
         if use_kfold:
             model_kwargs = {'learning_rate': learning_rate}
-            fold_trainers, fold_models = self.trainer.fit_kfold(
+            fold_trainers, fold_models, fold_loss_callbacks = self.trainer.fit_kfold(
                 ModelCNN2D, model_kwargs, X_train, Y_train, 
                 n_splits=n_splits, target_fold=target_fold
             )
-            print("\n[Aviso K-Fold]: A avaliação gráfica será gerada individualmente para cada fold treinado!")
-            for i, model in enumerate(fold_models):
-                # Se for rodado um fold específico, a lista só tem 1 elemento, então o sufixo é o target_fold
+            logger.info("📢 Generating visual evaluation per trained fold...")
+            for i, (model, loss_callback) in enumerate(zip(fold_models, fold_loss_callbacks)):
                 fold_idx = target_fold if target_fold is not None else (i + 1)
-                self.evaluate_model(model, X_test, Y_test, threshold=threshold, suffix=f"fold_{fold_idx}")
+                self.evaluate_model(model, X_test, Y_test, threshold=threshold, suffix=f"fold_{fold_idx}", loss_callback=loss_callback)
             return fold_trainers, fold_models
         else:
-            # Treina normal
             model = ModelCNN2D(learning_rate=learning_rate)
-            trained_trainer = self.trainer.fit(model, X_train, Y_train)
+            trained_trainer, loss_callback = self.trainer.fit(model, X_train, Y_train)
             
-            # Etapa 4: Avaliação
-            # Analisa o modelo usando o test_set puro isolado.
-            self.evaluate_model(model, X_test, Y_test, threshold=threshold)
-            
+            self.evaluate_model(model, X_test, Y_test, threshold=threshold, loss_callback=loss_callback)
             return model, trained_trainer

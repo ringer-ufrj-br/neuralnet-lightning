@@ -1,10 +1,25 @@
 import pandas as pd
 import glob
 import os
+import logging
+from typing import List, Optional
 from tqdm import tqdm
 
+logger = logging.getLogger(__name__)
+
 class DataLoader:
-    def __init__(self, data_path=None, max_files=None):
+    """
+    Data loader class for finding and reading parquet dataset files.
+    """
+
+    def __init__(self, data_path: Optional[str] = None, max_files: Optional[int] = None) -> None:
+        """
+        Initializes DataLoader instance.
+
+        Args:
+            data_path (Optional[str]): Path or glob pattern for dataset parquet files.
+            max_files (Optional[int]): Maximum number of files per folder to load.
+        """
         self.max_files = max_files
         if data_path is None:
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -12,39 +27,56 @@ class DataLoader:
         else:
             self.data_path = data_path
 
-    def get_files(self):
-        # Se o caminho fornecido for uma pasta (comum para datasets particionados), busca os .parquet dentro
+    def get_files(self) -> List[str]:
+        """
+        Retrieves list of valid parquet files matching data_path.
+
+        Args:
+            None
+
+        Returns:
+            List[str]: List of resolved file paths.
+        """
         if os.path.isdir(self.data_path):
             search_path = os.path.join(self.data_path, "**", "*.parquet")
         else:
             search_path = self.data_path
             
-        arquivos_por_pasta = {}
+        files_per_folder = {}
         for f in glob.glob(search_path, recursive=True):
             if os.path.isfile(f):
-                pasta = os.path.dirname(f)
-                if pasta not in arquivos_por_pasta:
-                    arquivos_por_pasta[pasta] = []
-                arquivos_por_pasta[pasta].append(f)
+                folder = os.path.dirname(f)
+                if folder not in files_per_folder:
+                    files_per_folder[folder] = []
+                files_per_folder[folder].append(f)
         
-        arquivos = []
-        for pasta, arqs in arquivos_por_pasta.items():
-            arqs.sort()
+        files = []
+        for folder, file_list in files_per_folder.items():
+            file_list.sort()
             if self.max_files is not None:
-                arquivos.extend(arqs[:self.max_files])
+                files.extend(file_list[:self.max_files])
             else:
-                arquivos.extend(arqs)
+                files.extend(file_list)
                 
-        print(f"Encontrados {len(arquivos)} arquivos válidos")
-        return arquivos
+        logger.info(f"📂 Found {len(files)} valid parquet files.")
+        return files
 
-    def load_dataset(self, arquivos):
-        if not arquivos:
-            print("Nenhum arquivo encontrado para carregar.")
+    def load_dataset(self, files: List[str]) -> Optional[pd.DataFrame]:
+        """
+        Reads parquet files and concatenates them into a single DataFrame.
+
+        Args:
+            files (List[str]): List of file paths to load.
+
+        Returns:
+            Optional[pd.DataFrame]: Combined pandas DataFrame or None if empty.
+        """
+        if not files:
+            logger.warning("⚠️ No files found to load.")
             return None
         
         dfs = []
-        for f in tqdm(arquivos, desc="Carregando Parquets", unit="arquivo"):
+        for f in tqdm(files, desc="📥 Loading Parquets", unit="file"):
             df_temp = pd.read_parquet(f)
             df_temp['file_path'] = f
             dfs.append(df_temp)
@@ -52,9 +84,18 @@ class DataLoader:
         df = pd.concat(dfs, ignore_index=True)
         return df
 
-    def execute(self):
-        arquivos = self.get_files()
-        df = self.load_dataset(arquivos)
+    def execute(self) -> Optional[pd.DataFrame]:
+        """
+        Executes complete data loading pipeline (find files and read dataset).
+
+        Args:
+            None
+
+        Returns:
+            Optional[pd.DataFrame]: Concatenated dataset DataFrame.
+        """
+        files = self.get_files()
+        df = self.load_dataset(files)
         return df
 
 if __name__ == "__main__":
