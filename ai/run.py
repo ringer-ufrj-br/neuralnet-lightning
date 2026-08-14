@@ -38,6 +38,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Neural Network Training Orchestrator (ATLAS CERN).")
     parser.add_argument('--config', type=str, default='config.yaml', help="Path to YAML configuration file.")
     parser.add_argument('--fold', type=int, default=None, help="Execute a specific fold (useful for SLURM parallelism).")
+    parser.add_argument('--accelerator', type=str, default=None, help="PyTorch Lightning accelerator (e.g. auto, cpu, cuda).")
+    parser.add_argument('--devices', type=str, default=None, help="Devices to use (e.g. auto, 1, 0).")
     args = parser.parse_args()
 
     if not os.path.exists(args.config):
@@ -46,6 +48,9 @@ def main() -> None:
 
     logger.info(f"⚙️ Loading configuration from: {args.config}")
     config = load_config(args.config)
+    
+    accelerator = args.accelerator or config.get("accelerator", "auto")
+    devices = args.devices or config.get("devices", "auto")
     
     model_type = config.get("model", "CNN2D")
     
@@ -59,7 +64,9 @@ def main() -> None:
             max_epochs=config.get("max_epochs", 20),
             batch_size=config.get("batch_size", 32),
             patience=config.get("patience", 5),
-            num_workers=config.get("num_workers", 0)
+            num_workers=config.get("num_workers", 0),
+            accelerator=accelerator,
+            devices=devices
         )
     elif model_type == "MLP":
         from ai.pipeline.pipeline_mlp import PipelineMLP
@@ -71,7 +78,9 @@ def main() -> None:
             max_epochs=config.get("max_epochs", 20),
             batch_size=config.get("batch_size", 32),
             patience=config.get("patience", 5),
-            num_workers=config.get("num_workers", 0)
+            num_workers=config.get("num_workers", 0),
+            accelerator=accelerator,
+            devices=devices
         ) 
     else:
         raise ValueError(f"❌ Model '{model_type}' is not supported or not implemented in pipeline.")

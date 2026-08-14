@@ -14,7 +14,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 from ai.loader.loader import DataLoader
 from ai.label.label_generator import LabelGenerator
 from ai.preprocess.cnn2d import PreprocessCNN2D
-from ai.preprocess.balancer import DataBalancer
 from ai.models.cnn2d import ModelCNN2D
 from ai.trainer.trainer import ModelTrainer
 from ai.evaluation.monitor import ModelMonitor
@@ -22,7 +21,7 @@ from ai.evaluation.summary import ModelSummary
 
 class PipelineCNN2D:
     """
-    End-to-end training and evaluation pipeline for 2D CNN models.
+    End-to-end training and evaluation pipeline for 2D CNN models using weighted loss.
     """
 
     def __init__(
@@ -34,8 +33,9 @@ class PipelineCNN2D:
         max_epochs: int = 20, 
         batch_size: int = 32, 
         patience: int = 5, 
-        num_workers: int = 0, 
-        balance_data: bool = True
+        num_workers: int = 0,
+        accelerator: str = "auto",
+        devices: Union[int, str, List[int]] = "auto"
     ) -> None:
         """
         Initializes PipelineCNN2D instance.
@@ -49,7 +49,8 @@ class PipelineCNN2D:
             batch_size (int): Training batch size. Defaults to 32.
             patience (int): Early stopping patience. Defaults to 5.
             num_workers (int): Parallel worker subprocesses. Defaults to 0.
-            balance_data (bool): Whether to apply undersampling data balancing. Defaults to True.
+            accelerator (str): PyTorch Lightning accelerator ('auto', 'cpu', 'cuda'). Defaults to 'auto'.
+            devices (Union[int, str, List[int]]): Devices specification. Defaults to 'auto'.
         """
         self.model_name = model_name
         self.label_col = label_col
@@ -58,14 +59,15 @@ class PipelineCNN2D:
         
         self.loader = DataLoader(data_path=data_path, max_files=max_files)
         self.preprocessor = PreprocessCNN2D()
-        self.balancer = DataBalancer() if balance_data else None
         
         self.trainer = ModelTrainer(
             max_epochs=max_epochs, 
             batch_size=batch_size,
             patience=patience,
             num_workers=num_workers,
-            log_dir=os.path.join(self.results_dir, "lightning_logs")
+            log_dir=os.path.join(self.results_dir, "lightning_logs"),
+            accelerator=accelerator,
+            devices=devices
         )
         
         self.monitor = ModelMonitor(output_dir=os.path.join(self.results_dir, "plots"))
@@ -89,6 +91,7 @@ class PipelineCNN2D:
             Y_test (np.ndarray): Test true labels array.
             threshold (float): Classification decision threshold. Defaults to 0.5.
             suffix (str): Filename suffix for evaluation reports. Defaults to ''.
+            loss_callback (Optional[Any]): Loss history callback. Defaults to None.
 
         Returns:
             None
@@ -100,18 +103,28 @@ class PipelineCNN2D:
         with torch.no_grad():
             X_tensor = torch.as_tensor(X_test, dtype=torch.float32)
             logits = model(X_tensor)
-            y_prob = torch.sigmoid(logits).numpy().flatten()
+            y_prob = torch.sigmoid(logits).cpu().numpy().flatten()
             
         y_true = Y_test.flatten()
         y_pred = (y_prob >= threshold).astype(int)
         
         file_suffix = f"_{suffix}" if suffix else ""
         
+        pos_weight_val = None
+        if hasattr(model, 'pos_weight') and model.pos_weight is not None:
+            pos_weight_val = float(model.pos_weight.item())
+        
         logger.info(f"📝 Saving CSV metrics to {self.summary.output_dir}...")
-        self.summary.save_metrics(y_true, y_prob, threshold=threshold, filename=f"test_metrics{file_suffix}.csv")
+        self.summary.save_metrics(
+            y_true, y_prob, 
+            threshold=threshold, 
+            pos_weight=pos_weight_val,
+            filename=f"test_metrics{file_suffix}.csv"
+        )
         
         logger.info(f"🖼️ Saving evaluation plots to {self.monitor.output_dir}...")
         self.monitor.plot_roc_curve(y_true, y_prob, filename=f"roc_curve{file_suffix}.pdf")
+        self.monitor.plot_pr_curve(y_true, y_prob, filename=f"pr_curve{file_suffix}.pdf")
         self.monitor.plot_confusion_matrix(y_true, y_pred, filename=f"confusion_matrix{file_suffix}.pdf")
         
         if loss_callback is not None:
@@ -129,7 +142,7 @@ class PipelineCNN2D:
         target_fold: Optional[int] = None
     ) -> Optional[Union[Tuple[ModelCNN2D, Any], Tuple[List[Any], List[ModelCNN2D]]]]:
         """
-        Executes end-to-end pipeline (loading, preprocessing, balancing, split, training, evaluation).
+        Executes end-to-end pipeline (loading, preprocessing, split, training with weighted loss, evaluation).
 
         Args:
             use_kfold (bool): Whether to use K-Fold cross-validation. Defaults to False.
@@ -163,14 +176,10 @@ class PipelineCNN2D:
             logger.error("❌ Labels column not found.")
             return None
             
-        if self.balancer:
-            logger.info("⚖️ Step 2.5: Balancing dataset classes...")
-            X, Y = self.balancer.apply(X, Y)
-            
         logger.info(f"✂️ Splitting {test_size * 100}% data for holdout testing...")
         X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=test_size, random_state=42, shuffle=True)
         
-        logger.info(f"🏋️ Step 3: Training (K-Fold={use_kfold})...")
+        logger.info(f"🏋️ Step 3: Training (K-Fold={use_kfold}, Weighted Loss Enabled)...")
         
         if use_kfold:
             model_kwargs = {'learning_rate': learning_rate}

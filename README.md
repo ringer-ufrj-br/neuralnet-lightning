@@ -82,6 +82,30 @@ python ai/run.py --fold 0
 
 ---
 
+## ⚖️ Estratégia de Balanceamento de Classes (Weighted Loss)
+
+O repositório utiliza **função de custo ponderada** (`nn.BCEWithLogitsLoss(pos_weight=pos_weight)`) em substituição ao *undersampling* aleatório, preservando 100% dos dados originais e evitando o descarte de informações relevantes.
+
+### 1. Cálculo Dinâmico de `pos_weight`
+O peso da classe positiva é calculado estritamente a partir das amostras do conjunto de **treino** de cada execução/fold (evitando qualquer vazamento de dados de teste ou validação):
+$$\text{pos\_weight} = \frac{N_{\text{negativos}}}{N_{\text{positivos}}}$$
+
+- **No K-Fold**: A cada fold, o `pos_weight` é recalculado para os dados específicos daquele split (`train_ids`).
+- **Buffer PyTorch**: O `pos_weight` é registrado como buffer (`register_buffer("pos_weight", ...)`) no `LightningModule`, garantindo que acompanhe o dispositivo (CPU/GPU) sem ser otimizado como parâmetro.
+- **Consistência**: A partição estratificada com `random_state=42` garante que múltiplos modelos (`CNN2D`, `MLP`) comparem seus resultados sob os mesmos splits e pesos.
+
+### 2. Métricas de Avaliação para Dados Desbalanceados
+Com a preservação do desbalanceamento natural, a acurácia global deixa de ser a única métrica de referência. O pipeline monitora e registra:
+- **Precision, Recall e F1-Score** (por classe)
+- **AUC-ROC** (Área sob a curva ROC)
+- **AUC-PR / Average Precision** (Área sob a curva Precision-Recall — métrica primária em forte desbalanceamento)
+- **Curva Precision-Recall (`pr_curve.pdf`)** e **Matriz de Confusão (`confusion_matrix.pdf`)**
+
+### 3. Calibração do Limiar de Decisão (*Threshold*)
+Como o modelo é treinado com penalidade assimétrica (`pos_weight`), o limiar padrão de `0.5` pode favorecer o recall em detrimento da precisão. Recomenda-se analisar a curva PR gerada em `results/<MODEL>/plots/pr_curve.pdf` para selecionar o ponto de operação ideal (ajustável via parâmetro `threshold` no `config.yaml`).
+
+---
+
 ## 🧹 Limpeza do Ambiente
 
 Para remover o ambiente virtual e arquivos compilados `.pyc`:

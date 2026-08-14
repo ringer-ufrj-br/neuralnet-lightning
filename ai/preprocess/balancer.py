@@ -6,7 +6,9 @@ logger = logging.getLogger(__name__)
 
 class DataBalancer:
     """
-    Data balancer class using random undersampling to balance dataset class distribution.
+    [DEPRECATED] Data balancer class using random undersampling to balance dataset class distribution.
+    Note: The pipeline has migrated to cost-sensitive learning via weighted loss (BCEWithLogitsLoss with pos_weight)
+    in ai.trainer.trainer to preserve 100% of training samples and avoid artificial subsampling.
     """
 
     def __init__(self, random_state: int = 42) -> None:

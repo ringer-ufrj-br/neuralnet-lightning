@@ -10,6 +10,34 @@ from sklearn.model_selection import KFold
 
 logger = logging.getLogger(__name__)
 
+def compute_pos_weight(y: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+    """
+    Computes positive class weight for binary classification using:
+    pos_weight = n_negatives / n_positives
+
+    Args:
+        y (Union[np.ndarray, torch.Tensor]): Target labels (0 and 1).
+
+    Returns:
+        torch.Tensor: 1D FloatTensor containing pos_weight.
+    """
+    if isinstance(y, torch.Tensor):
+        y_arr = y.detach().cpu().numpy().flatten()
+    else:
+        y_arr = np.asarray(y).flatten()
+
+    n_pos = int((y_arr == 1).sum())
+    n_neg = int((y_arr == 0).sum())
+
+    if n_pos == 0:
+        logger.warning("⚠️ compute_pos_weight: No positive samples found in training split. Defaulting pos_weight to 1.0.")
+        return torch.tensor([1.0], dtype=torch.float32)
+
+    pos_weight_val = float(n_neg) / float(n_pos)
+    logger.info(f"⚖️ Class Weight Calculation (Train Split Only): Negatives={n_neg}, Positives={n_pos} -> pos_weight={pos_weight_val:.4f}")
+    return torch.tensor([pos_weight_val], dtype=torch.float32)
+
+
 class LossHistoryCallback(Callback):
     """Callback to store training and validation loss history."""
     def __init__(self):
@@ -36,7 +64,8 @@ class LossHistoryCallback(Callback):
 
 class ModelTrainer:
     """
-    Generic PyTorch Lightning Trainer manager supporting single-holdout and K-Fold cross-validation.
+    Generic PyTorch Lightning Trainer manager supporting single-holdout and K-Fold cross-validation
+    with dynamic positive class weighting (weighted loss).
     """
 
     def __init__(
@@ -46,7 +75,10 @@ class ModelTrainer:
         validation_split: float = 0.2, 
         patience: int = 5, 
         log_dir: str = "lightning_logs", 
-        num_workers: int = 0
+        num_workers: int = 0,
+        gradient_clip_val: Optional[float] = 1.0,
+        accelerator: str = "auto",
+        devices: Union[int, str, List[int]] = "auto"
     ) -> None:
         """
         Initializes ModelTrainer instance.
@@ -58,6 +90,9 @@ class ModelTrainer:
             patience (int): Number of epochs with no validation loss improvement before stopping. Defaults to 5.
             log_dir (str): Output directory for model checkpoints and logs. Defaults to 'lightning_logs'.
             num_workers (int): Number of subprocesses for data loading. Defaults to 0.
+            gradient_clip_val (Optional[float]): Value for gradient clipping. Defaults to 1.0.
+            accelerator (str): PyTorch Lightning accelerator ('auto', 'cpu', 'cuda', etc.). Defaults to 'auto'.
+            devices (Union[int, str, List[int]]): Devices to use ('auto', 1, [0], etc.). Defaults to 'auto'.
         """
         self.max_epochs = max_epochs
         self.batch_size = batch_size
@@ -65,21 +100,25 @@ class ModelTrainer:
         self.patience = patience
         self.log_dir = log_dir
         self.num_workers = num_workers
+        self.gradient_clip_val = gradient_clip_val
+        self.accelerator = accelerator
+        self.devices = devices
 
     def prepare_data(
         self, 
         X: Union[np.ndarray, torch.Tensor], 
         Y: Union[np.ndarray, torch.Tensor]
-    ) -> Tuple[DataLoader, DataLoader]:
+    ) -> Tuple[DataLoader, DataLoader, torch.Tensor]:
         """
-        Converts feature/label inputs into PyTorch DataLoaders split into train and validation sets.
+        Converts feature/label inputs into PyTorch DataLoaders split into train and validation sets,
+        calculating positive class weight strictly from the training split.
 
         Args:
             X (Union[np.ndarray, torch.Tensor]): Input features.
             Y (Union[np.ndarray, torch.Tensor]): Target labels.
 
         Returns:
-            Tuple[DataLoader, DataLoader]: Pair of DataLoaders (train_loader, val_loader).
+            Tuple[DataLoader, DataLoader, torch.Tensor]: (train_loader, val_loader, pos_weight).
         """
         if isinstance(X, np.ndarray):
             X = torch.as_tensor(X, dtype=torch.float32)
@@ -96,17 +135,22 @@ class ModelTrainer:
             generator=torch.Generator().manual_seed(42)
         )
         
+        # Calculate pos_weight strictly on the training subset
+        train_indices = train_dataset.indices
+        train_labels = Y[train_indices]
+        pos_weight = compute_pos_weight(train_labels)
+        
         train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
         val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
         
-        return train_loader, val_loader
+        return train_loader, val_loader, pos_weight
 
     def fit(
         self, 
         model: pl.LightningModule, 
         X: Union[np.ndarray, torch.Tensor], 
         Y: Union[np.ndarray, torch.Tensor]
-    ) -> pl.Trainer:
+    ) -> Tuple[pl.Trainer, LossHistoryCallback]:
         """
         Trains a PyTorch Lightning module using simple train/validation holdout.
 
@@ -119,8 +163,11 @@ class ModelTrainer:
             Tuple[pl.Trainer, LossHistoryCallback]: The trained PyTorch Lightning Trainer instance and the loss history callback.
         """
         logger.info("📦 Preparing DataLoaders for Holdout...")
-        train_loader, val_loader = self.prepare_data(X, Y)
+        train_loader, val_loader, pos_weight = self.prepare_data(X, Y)
         
+        if hasattr(model, 'set_pos_weight'):
+            model.set_pos_weight(pos_weight)
+            
         os.makedirs(self.log_dir, exist_ok=True)
         
         loss_callback = LossHistoryCallback()
@@ -139,9 +186,10 @@ class ModelTrainer:
         trainer = pl.Trainer(
             max_epochs=self.max_epochs,
             callbacks=callbacks,
-            accelerator="auto",
-            devices="auto",
-            default_root_dir=self.log_dir
+            accelerator=self.accelerator,
+            devices=self.devices,
+            default_root_dir=self.log_dir,
+            gradient_clip_val=self.gradient_clip_val
         )
         
         logger.info(f"🚀 Starting training for model {model.__class__.__name__}...")
@@ -160,7 +208,8 @@ class ModelTrainer:
         target_fold: Optional[int] = None
     ) -> Tuple[List[pl.Trainer], List[pl.LightningModule], List[LossHistoryCallback]]:
         """
-        Executes K-Fold cross-validation, creating a fresh model instance per fold.
+        Executes K-Fold cross-validation, creating a fresh model instance per fold with
+        pos_weight dynamically recomputed strictly from each fold's training split.
 
         Args:
             model_class (Type[pl.LightningModule]): Model class to instantiate.
@@ -193,6 +242,10 @@ class ModelTrainer:
                 
             logger.info(f"📌 ==================== Fold {fold + 1}/{n_splits} ====================")
             
+            # Compute pos_weight exclusively on this fold's training indices
+            train_labels_fold = Y[train_ids]
+            pos_weight_fold = compute_pos_weight(train_labels_fold)
+            
             train_sub = Subset(dataset, train_ids)
             val_sub = Subset(dataset, val_ids)
             
@@ -209,7 +262,11 @@ class ModelTrainer:
                 num_workers=self.num_workers
             )
             
-            model = model_class(**model_kwargs)
+            # Inject pos_weight into model constructor kwargs
+            current_model_kwargs = dict(model_kwargs)
+            current_model_kwargs['pos_weight'] = pos_weight_fold
+            
+            model = model_class(**current_model_kwargs)
             
             fold_log_dir = os.path.join(self.log_dir, f"fold_{fold+1}")
             os.makedirs(fold_log_dir, exist_ok=True)
@@ -230,9 +287,10 @@ class ModelTrainer:
             trainer = pl.Trainer(
                 max_epochs=self.max_epochs,
                 callbacks=callbacks,
-                accelerator="auto",
-                devices="auto",
-                default_root_dir=fold_log_dir
+                accelerator=self.accelerator,
+                devices=self.devices,
+                default_root_dir=fold_log_dir,
+                gradient_clip_val=self.gradient_clip_val
             )
             
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)

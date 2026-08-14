@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import roc_curve, auc, confusion_matrix
+from sklearn.metrics import roc_curve, auc, confusion_matrix, precision_recall_curve, average_precision_score
 import os
 import logging
 from typing import List, Union
@@ -16,7 +16,7 @@ except ImportError:
 
 class ModelMonitor:
     """
-    Evaluator class for generating visual performance plots (ROC curve, Confusion Matrix, Loss curves).
+    Evaluator class for generating visual performance plots (ROC curve, PR curve, Confusion Matrix, Loss curves).
     """
 
     def __init__(self, output_dir: str = "results/plots") -> None:
@@ -59,6 +59,40 @@ class ModelMonitor:
         plt.savefig(filepath)
         plt.close()
         logger.info(f"📈 Saved ROC curve to: {filepath}")
+
+    def plot_pr_curve(self, y_true: Union[List[int], np.ndarray], y_prob: Union[List[float], np.ndarray], filename: str = "pr_curve.pdf") -> None:
+        """
+        Plots and saves the Precision-Recall (PR) curve with Average Precision (AP / PR-AUC).
+
+        Args:
+            y_true (Union[List[int], np.ndarray]): True target labels.
+            y_prob (Union[List[float], np.ndarray]): Predicted probabilities.
+            filename (str): Output filename. Defaults to 'pr_curve.pdf'.
+
+        Returns:
+            None
+        """
+        precision, recall, _ = precision_recall_curve(y_true, y_prob)
+        ap = average_precision_score(y_true, y_prob)
+        
+        y_true_arr = np.asarray(y_true).flatten()
+        pos_ratio = (y_true_arr == 1).sum() / max(len(y_true_arr), 1)
+
+        plt.figure(figsize=(8, 6))
+        plt.plot(recall, precision, color='purple', lw=2, label=f'PR curve (AP = {ap:.4f})')
+        plt.axhline(y=pos_ratio, color='navy', lw=2, linestyle='--', label=f'No Skill Baseline ({pos_ratio:.3f})')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title('Precision-Recall Curve')
+        plt.legend(loc="lower left")
+        plt.grid(True, alpha=0.3)
+        
+        filepath = os.path.join(self.output_dir, filename)
+        plt.savefig(filepath)
+        plt.close()
+        logger.info(f"📈 Saved Precision-Recall curve to: {filepath}")
         
     def plot_confusion_matrix(self, y_true: Union[List[int], np.ndarray], y_pred: Union[List[int], np.ndarray], filename: str = "confusion_matrix.pdf") -> None:
         """

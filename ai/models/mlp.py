@@ -2,24 +2,31 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
-from torchmetrics import Accuracy, AUROC
-from typing import Tuple, Any
+from torchmetrics import Accuracy, AUROC, Precision, Recall, F1Score, AveragePrecision
+from typing import Tuple, Any, Optional, Union
 
 class ModelMLP(pl.LightningModule):
     """
-    Multi-Layer Perceptron (MLP) PyTorch Lightning module for binary classification.
+    Multi-Layer Perceptron (MLP) PyTorch Lightning module for binary classification
+    with weighted loss support and comprehensive evaluation metrics.
     """
 
-    def __init__(self, input_dim: int = 100, learning_rate: float = 0.001) -> None:
+    def __init__(
+        self, 
+        input_dim: int = 100, 
+        learning_rate: float = 0.001,
+        pos_weight: Optional[Union[float, torch.Tensor]] = None
+    ) -> None:
         """
         Initializes ModelMLP architecture and evaluation metrics.
 
         Args:
             input_dim (int): Input feature dimension. Defaults to 100.
             learning_rate (float): Optimizer learning rate. Defaults to 0.001.
+            pos_weight (Optional[Union[float, torch.Tensor]]): Positive class weight for loss balancing. Defaults to None.
         """
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['pos_weight'])
         self.learning_rate = learning_rate
 
         # Network Architecture
@@ -32,13 +39,51 @@ class ModelMLP(pl.LightningModule):
             nn.Linear(32, 1)
         )
 
-        # Metrics
+        # Register pos_weight as buffer (moves with device, not trained by optimizer)
+        if pos_weight is not None:
+            if not isinstance(pos_weight, torch.Tensor):
+                pos_weight = torch.tensor([pos_weight], dtype=torch.float32)
+            elif pos_weight.ndim == 0:
+                pos_weight = pos_weight.unsqueeze(0).float()
+            else:
+                pos_weight = pos_weight.float()
+        self.register_buffer("pos_weight", pos_weight)
+
+        # Loss Criterion
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
+
+        # Training Metrics
         self.train_acc = Accuracy(task="binary")
-        self.val_acc = Accuracy(task="binary")
+        self.train_precision = Precision(task="binary")
+        self.train_recall = Recall(task="binary")
+        self.train_f1 = F1Score(task="binary")
         self.train_auc = AUROC(task="binary")
+        self.train_pr_auc = AveragePrecision(task="binary")
+
+        # Validation Metrics
+        self.val_acc = Accuracy(task="binary")
+        self.val_precision = Precision(task="binary")
+        self.val_recall = Recall(task="binary")
+        self.val_f1 = F1Score(task="binary")
         self.val_auc = AUROC(task="binary")
-        
-        self.criterion = nn.BCEWithLogitsLoss()
+        self.val_pr_auc = AveragePrecision(task="binary")
+
+    def set_pos_weight(self, pos_weight: Union[float, torch.Tensor]) -> None:
+        """
+        Dynamically sets or updates the positive class weight buffer and recreation of criterion.
+
+        Args:
+            pos_weight (Union[float, torch.Tensor]): Positive class weight value or tensor.
+        """
+        if not isinstance(pos_weight, torch.Tensor):
+            pos_weight = torch.tensor([pos_weight], dtype=torch.float32)
+        elif pos_weight.ndim == 0:
+            pos_weight = pos_weight.unsqueeze(0).float()
+        else:
+            pos_weight = pos_weight.float()
+            
+        self.register_buffer("pos_weight", pos_weight)
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -50,8 +95,7 @@ class ModelMLP(pl.LightningModule):
         Returns:
             torch.Tensor: Unnormalized output logits of shape (Batch, 1).
         """
-        x = self.classifier(x)
-        return x
+        return self.classifier(x)
 
     def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """
@@ -70,13 +114,22 @@ class ModelMLP(pl.LightningModule):
         logits = self(x)
         loss = self.criterion(logits, y)
         preds = torch.sigmoid(logits)
+        y_int = y.long()
         
-        self.train_acc(preds, y)
-        self.train_auc(preds, y)
+        self.train_acc(preds, y_int)
+        self.train_precision(preds, y_int)
+        self.train_recall(preds, y_int)
+        self.train_f1(preds, y_int)
+        self.train_auc(preds, y_int)
+        self.train_pr_auc(preds, y_int)
         
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train_acc', self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('train_auc', self.train_auc, on_step=False, on_epoch=True, prog_bar=False)
+        self.log('train_acc', self.train_acc, on_step=False, on_epoch=True, prog_bar=False)
+        self.log('train_f1', self.train_f1, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train_precision', self.train_precision, on_step=False, on_epoch=True, prog_bar=False)
+        self.log('train_recall', self.train_recall, on_step=False, on_epoch=True, prog_bar=False)
+        self.log('train_auc_roc', self.train_auc, on_step=False, on_epoch=True, prog_bar=False)
+        self.log('train_auc_pr', self.train_pr_auc, on_step=False, on_epoch=True, prog_bar=False)
         
         return loss
 
@@ -97,13 +150,22 @@ class ModelMLP(pl.LightningModule):
         logits = self(x)
         loss = self.criterion(logits, y)
         preds = torch.sigmoid(logits)
+        y_int = y.long()
         
-        self.val_acc(preds, y)
-        self.val_auc(preds, y)
+        self.val_acc(preds, y_int)
+        self.val_precision(preds, y_int)
+        self.val_recall(preds, y_int)
+        self.val_f1(preds, y_int)
+        self.val_auc(preds, y_int)
+        self.val_pr_auc(preds, y_int)
         
         self.log('val_loss', loss, prog_bar=True)
-        self.log('val_acc', self.val_acc, prog_bar=True)
-        self.log('val_auc', self.val_auc, prog_bar=True)
+        self.log('val_acc', self.val_acc, prog_bar=False)
+        self.log('val_f1', self.val_f1, prog_bar=True)
+        self.log('val_precision', self.val_precision, prog_bar=False)
+        self.log('val_recall', self.val_recall, prog_bar=False)
+        self.log('val_auc_roc', self.val_auc, prog_bar=True)
+        self.log('val_auc_pr', self.val_pr_auc, prog_bar=True)
         
         return loss
 

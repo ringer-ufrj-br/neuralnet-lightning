@@ -5,6 +5,7 @@ PYTHON = $(VENV)/bin/python
 PIP = $(VENV)/bin/pip
 
 venv:
+	rm -rf neuralnet-env
 	python3 -m venv $(VENV)
 	$(PIP) install --upgrade pip
 	$(PIP) install -r requirements.txt
