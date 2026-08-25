@@ -33,12 +33,9 @@ class ModelMLP(pl.LightningModule):
 
         # Network Architecture
         self.classifier = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.Linear(input_dim, 5),
             nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
+            nn.Linear(5, 1)
         )
 
         # Register pos_weight as buffer (moves with device, not trained by optimizer)
