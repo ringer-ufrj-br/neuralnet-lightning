@@ -131,7 +131,7 @@ class ModelMLP(pl.LightningModule):
         
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log('train_acc', self.train_acc, on_step=False, on_epoch=True, prog_bar=False)
-        self.log('train_f1', self.train_f1, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train_f1', self.train_f1, on_step=False, on_epoch=True, prog_bar=False)
         self.log('train_precision', self.train_precision, on_step=False, on_epoch=True, prog_bar=False)
         self.log('train_recall', self.train_recall, on_step=False, on_epoch=True, prog_bar=False)
         self.log('train_auc_roc', self.train_auc, on_step=False, on_epoch=True, prog_bar=False)
@@ -168,13 +168,13 @@ class ModelMLP(pl.LightningModule):
         self._val_preds.append(preds.detach())
         self._val_targets.append(y_int.detach())
 
-        self.log('val_loss', loss, prog_bar=True)
+        self.log('val_loss', loss, prog_bar=False)
         self.log('val_acc', self.val_acc, prog_bar=False)
-        self.log('val_f1', self.val_f1, prog_bar=True)
+        self.log('val_f1', self.val_f1, prog_bar=False)
         self.log('val_precision', self.val_precision, prog_bar=False)
         self.log('val_recall', self.val_recall, prog_bar=False)
-        self.log('val_auc_roc', self.val_auc, prog_bar=True)
-        self.log('val_auc_pr', self.val_pr_auc, prog_bar=True)
+        self.log('val_auc_roc', self.val_auc, prog_bar=False)
+        self.log('val_auc_pr', self.val_pr_auc, prog_bar=False)
 
         return loss
 
