@@ -32,7 +32,7 @@ class PipelineMLP:
         model_name: str = "MLP", 
         max_epochs: int = 20, 
         batch_size: int = 32, 
-        patience: int = 5, 
+        patience: int = 5,
         num_workers: int = 0,
         accelerator: str = "auto",
         devices: Union[int, str, List[int]] = "auto"
@@ -54,20 +54,22 @@ class PipelineMLP:
         """
         self.model_name = model_name
         self.label_col = label_col
-        
+
         self.results_dir = os.path.join("results", self.model_name)
-        
+
         self.loader = DataLoader(data_path=data_path, max_files=max_files)
         self.preprocessor = PreprocessMLP()
         
         self.trainer = ModelTrainer(
-            max_epochs=max_epochs, 
+            max_epochs=max_epochs,
             batch_size=batch_size,
             patience=patience,
             num_workers=num_workers,
             log_dir=os.path.join(self.results_dir, "lightning_logs"),
             accelerator=accelerator,
-            devices=devices
+            devices=devices,
+            monitor_metric="val_sp",
+            monitor_mode="max"
         )
         
         self.monitor = ModelMonitor(output_dir=os.path.join(self.results_dir, "plots"))
@@ -116,14 +118,25 @@ class PipelineMLP:
         
         logger.info(f"📝 Saving CSV metrics to {self.summary.output_dir}...")
         self.summary.save_metrics(
-            y_true, y_prob, 
-            threshold=threshold, 
+            y_true, y_prob,
+            threshold=threshold,
             pos_weight=pos_weight_val,
             filename=f"test_metrics{file_suffix}.csv"
         )
 
+        logger.info("🎯 Computing operating points (Tight/Medium/Loose)...")
+        operating_points = self.summary.save_operating_points(
+            y_true, y_prob,
+            filename=f"operating_points{file_suffix}.csv"
+        )
+        for point in operating_points:
+            logger.info(
+                f"   {point['Operating_Point']:<7} PD={point['PD']:.4f} (target {point['Target_PD']:.2f}) "
+                f"-> FA={point['FA']:.4f}, SP={point['SP_Index']:.4f}, threshold={point['Threshold']:.4f}"
+            )
+
         logger.info(f"🖼️ Saving evaluation plots to {self.monitor.output_dir}...")
-        self.monitor.plot_roc_curve(y_true, y_prob, filename=f"roc_curve{file_suffix}.pdf")
+        self.monitor.plot_roc_curve(y_true, y_prob, filename=f"roc_curve{file_suffix}.pdf", operating_points=operating_points)
         self.monitor.plot_pr_curve(y_true, y_prob, filename=f"pr_curve{file_suffix}.pdf")
         self.monitor.plot_confusion_matrix(y_true, y_pred, filename=f"confusion_matrix{file_suffix}.pdf")
         
@@ -133,12 +146,12 @@ class PipelineMLP:
         logger.info(f"✅ Evaluation complete{suffix_print}!")
 
     def run(
-        self, 
-        use_kfold: bool = False, 
-        n_splits: int = 5, 
-        test_size: float = 0.15, 
-        learning_rate: float = 0.001, 
-        threshold: float = 0.5, 
+        self,
+        use_kfold: bool = False,
+        n_splits: int = 5,
+        test_size: float = 0.15,
+        learning_rate: float = 0.001,
+        threshold: float = 0.5,
         target_fold: Optional[int] = None
     ) -> Optional[Union[Tuple[ModelMLP, Any], Tuple[List[Any], List[ModelMLP]]]]:
         """
@@ -156,31 +169,31 @@ class PipelineMLP:
             Optional[Union[Tuple[ModelMLP, Any], Tuple[List[Any], List[ModelMLP]]]]: Model and trainer objects or None if data loading fails.
         """
         logger.info(f"🚀 Starting Pipeline: {self.model_name}")
-        
+
         logger.info("📂 Step 1: Loading dataset...")
         df = self.loader.execute()
-        
+
         if df is None or df.empty:
             logger.error("❌ No data was loaded.")
             return None
-            
+
         logger.info("🏷️ Step 1.5: Generating labels...")
         df = LabelGenerator.apply_label(df, file_path_col='file_path', label_col=self.label_col)
         df.drop(columns=['file_path'], inplace=True)
-            
+
         logger.info("⚙️ Step 2: Preprocessing features...")
         X = self.preprocessor.transform(df)
         Y = self.preprocessor.get_labels(df, label_col=self.label_col)
-        
+
         if Y is None:
             logger.error("❌ Labels column not found.")
             return None
-            
+
         logger.info(f"✂️ Splitting {test_size * 100}% data for holdout testing...")
         X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=test_size, random_state=42, shuffle=True)
-        
+
         logger.info(f"🏋️ Step 3: Training (K-Fold={use_kfold}, Weighted Loss Enabled)...")
-        
+
         if use_kfold:
             model_kwargs = {'learning_rate': learning_rate}
             fold_trainers, fold_models, fold_loss_callbacks = self.trainer.fit_kfold(

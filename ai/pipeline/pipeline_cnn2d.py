@@ -61,13 +61,15 @@ class PipelineCNN2D:
         self.preprocessor = PreprocessCNN2D()
         
         self.trainer = ModelTrainer(
-            max_epochs=max_epochs, 
+            max_epochs=max_epochs,
             batch_size=batch_size,
             patience=patience,
             num_workers=num_workers,
             log_dir=os.path.join(self.results_dir, "lightning_logs"),
             accelerator=accelerator,
-            devices=devices
+            devices=devices,
+            monitor_metric="val_sp",
+            monitor_mode="max"
         )
         
         self.monitor = ModelMonitor(output_dir=os.path.join(self.results_dir, "plots"))
@@ -116,14 +118,25 @@ class PipelineCNN2D:
         
         logger.info(f"📝 Saving CSV metrics to {self.summary.output_dir}...")
         self.summary.save_metrics(
-            y_true, y_prob, 
-            threshold=threshold, 
+            y_true, y_prob,
+            threshold=threshold,
             pos_weight=pos_weight_val,
             filename=f"test_metrics{file_suffix}.csv"
         )
-        
+
+        logger.info("🎯 Computing operating points (Tight/Medium/Loose)...")
+        operating_points = self.summary.save_operating_points(
+            y_true, y_prob,
+            filename=f"operating_points{file_suffix}.csv"
+        )
+        for point in operating_points:
+            logger.info(
+                f"   {point['Operating_Point']:<7} PD={point['PD']:.4f} (target {point['Target_PD']:.2f}) "
+                f"-> FA={point['FA']:.4f}, SP={point['SP_Index']:.4f}, threshold={point['Threshold']:.4f}"
+            )
+
         logger.info(f"🖼️ Saving evaluation plots to {self.monitor.output_dir}...")
-        self.monitor.plot_roc_curve(y_true, y_prob, filename=f"roc_curve{file_suffix}.pdf")
+        self.monitor.plot_roc_curve(y_true, y_prob, filename=f"roc_curve{file_suffix}.pdf", operating_points=operating_points)
         self.monitor.plot_pr_curve(y_true, y_prob, filename=f"pr_curve{file_suffix}.pdf")
         self.monitor.plot_confusion_matrix(y_true, y_pred, filename=f"confusion_matrix{file_suffix}.pdf")
         

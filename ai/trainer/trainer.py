@@ -78,7 +78,9 @@ class ModelTrainer:
         num_workers: int = 0,
         gradient_clip_val: Optional[float] = 1.0,
         accelerator: str = "auto",
-        devices: Union[int, str, List[int]] = "auto"
+        devices: Union[int, str, List[int]] = "auto",
+        monitor_metric: str = "val_loss",
+        monitor_mode: str = "min"
     ) -> None:
         """
         Initializes ModelTrainer instance.
@@ -87,12 +89,14 @@ class ModelTrainer:
             max_epochs (int): Maximum number of training epochs. Defaults to 20.
             batch_size (int): Training batch size. Defaults to 32.
             validation_split (float): Fraction of dataset reserved for validation in holdout. Defaults to 0.2.
-            patience (int): Number of epochs with no validation loss improvement before stopping. Defaults to 5.
+            patience (int): Number of epochs with no improvement on the monitored metric before stopping. Defaults to 5.
             log_dir (str): Output directory for model checkpoints and logs. Defaults to 'lightning_logs'.
             num_workers (int): Number of subprocesses for data loading. Defaults to 0.
             gradient_clip_val (Optional[float]): Value for gradient clipping. Defaults to 1.0.
             accelerator (str): PyTorch Lightning accelerator ('auto', 'cpu', 'cuda', etc.). Defaults to 'auto'.
             devices (Union[int, str, List[int]]): Devices to use ('auto', 1, [0], etc.). Defaults to 'auto'.
+            monitor_metric (str): Logged metric name used by EarlyStopping/ModelCheckpoint. Defaults to 'val_loss'.
+            monitor_mode (str): 'min' or 'max', matching the monitored metric's improvement direction. Defaults to 'min'.
         """
         self.max_epochs = max_epochs
         self.batch_size = batch_size
@@ -103,6 +107,101 @@ class ModelTrainer:
         self.gradient_clip_val = gradient_clip_val
         self.accelerator = accelerator
         self.devices = devices
+        self.monitor_metric = monitor_metric
+        self.monitor_mode = monitor_mode
+
+    def _select_gpu_device(self) -> Optional[torch.device]:
+        """
+        Resolves a single CUDA device to preload the dataset onto, or None if training
+        won't run on a single GPU (CPU-only, or multi-device where each process needs its
+        own shard and pre-pinning to one device would be wrong).
+        """
+        if self.accelerator == "cpu" or not torch.cuda.is_available():
+            return None
+        if self.accelerator not in ("auto", "gpu", "cuda"):
+            return None
+        if isinstance(self.devices, list) and len(self.devices) > 1:
+            return None
+        if isinstance(self.devices, int) and self.devices > 1:
+            return None
+        return torch.device("cuda")
+
+    def _stage_dataset(self, X: torch.Tensor, Y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """
+        If the whole (X, Y) tensor pair comfortably fits in free GPU memory, moves it there
+        once so DataLoader batches are already GPU-resident and never need a per-step
+        host-to-device copy - the CPU stops being the bottleneck for small/medium datasets.
+        Falls back to CPU tensors (used with DataLoader's normal per-batch transfer) otherwise.
+
+        Args:
+            X (torch.Tensor): Feature tensor.
+            Y (torch.Tensor): Label tensor.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, int]: (X, Y, num_workers) - num_workers is forced
+            to 0 when data is GPU-resident, since CUDA tensors can't be shared with worker processes.
+        """
+        device = self._select_gpu_device()
+        if device is None:
+            return X, Y, self.num_workers
+
+        dataset_bytes = X.element_size() * X.nelement() + Y.element_size() * Y.nelement()
+        free_bytes, _ = torch.cuda.mem_get_info()
+
+        # Leave headroom for the CUDA context, model weights, activations and gradients
+        if dataset_bytes > free_bytes * 0.5:
+            logger.info(
+                f"↔️ Dataset ({dataset_bytes / 1e6:.0f}MB) too large to keep GPU-resident "
+                f"({free_bytes / 1e6:.0f}MB free) — batches will transfer per-step instead."
+            )
+            return X, Y, self.num_workers
+
+        logger.info(f"🚀 Staging full dataset ({dataset_bytes / 1e6:.0f}MB) on {device} — no per-batch host-to-device copy.")
+        return X.to(device), Y.to(device), 0
+
+    def _build_trainer(
+        self,
+        model: pl.LightningModule,
+        log_dir: str,
+        extra_callbacks: Optional[List[Callback]] = None
+    ) -> Tuple[pl.Trainer, LossHistoryCallback]:
+        """
+        Builds a pl.Trainer with the standard EarlyStopping/ModelCheckpoint/loss-history
+        callbacks, monitoring self.monitor_metric. Shared by all fit*/fit_kfold* variants.
+
+        Args:
+            model (pl.LightningModule): Model instance (used for checkpoint filename prefix).
+            log_dir (str): Directory for checkpoints/logs.
+            extra_callbacks (Optional[List[Callback]]): Additional callbacks to append (e.g. SetEpochCallback).
+
+        Returns:
+            Tuple[pl.Trainer, LossHistoryCallback]: The configured trainer and its loss-history callback.
+        """
+        os.makedirs(log_dir, exist_ok=True)
+
+        loss_callback = LossHistoryCallback()
+        callbacks = [
+            EarlyStopping(monitor=self.monitor_metric, patience=self.patience, mode=self.monitor_mode, verbose=True),
+            ModelCheckpoint(
+                dirpath=log_dir,
+                monitor=self.monitor_metric,
+                save_top_k=1,
+                mode=self.monitor_mode,
+                filename=f"{model.__class__.__name__}-{{epoch:02d}}-{{{self.monitor_metric}:.4f}}"
+            ),
+            loss_callback
+        ]
+        callbacks.extend(extra_callbacks or [])
+
+        trainer = pl.Trainer(
+            max_epochs=self.max_epochs,
+            callbacks=callbacks,
+            accelerator=self.accelerator,
+            devices=self.devices,
+            default_root_dir=log_dir,
+            gradient_clip_val=self.gradient_clip_val
+        )
+        return trainer, loss_callback
 
     def prepare_data(
         self, 
@@ -125,24 +224,25 @@ class ModelTrainer:
         if isinstance(Y, np.ndarray):
             Y = torch.as_tensor(Y, dtype=torch.float32)
 
+        X, Y, num_workers = self._stage_dataset(X, Y)
         dataset = TensorDataset(X, Y)
-        
+
         val_size = int(len(dataset) * self.validation_split)
         train_size = len(dataset) - val_size
-        
+
         train_dataset, val_dataset = random_split(
             dataset, [train_size, val_size],
             generator=torch.Generator().manual_seed(42)
         )
-        
+
         # Calculate pos_weight strictly on the training subset
         train_indices = train_dataset.indices
         train_labels = Y[train_indices]
         pos_weight = compute_pos_weight(train_labels)
-        
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
-        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
-        
+
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
+
         return train_loader, val_loader, pos_weight
 
     def fit(
@@ -167,31 +267,9 @@ class ModelTrainer:
         
         if hasattr(model, 'set_pos_weight'):
             model.set_pos_weight(pos_weight)
-            
-        os.makedirs(self.log_dir, exist_ok=True)
-        
-        loss_callback = LossHistoryCallback()
-        callbacks = [
-            EarlyStopping(monitor="val_loss", patience=self.patience, mode="min", verbose=True),
-            ModelCheckpoint(
-                dirpath=self.log_dir, 
-                monitor="val_loss", 
-                save_top_k=1, 
-                mode="min",
-                filename=f"{model.__class__.__name__}-{{epoch:02d}}-{{val_loss:.4f}}"
-            ),
-            loss_callback
-        ]
-        
-        trainer = pl.Trainer(
-            max_epochs=self.max_epochs,
-            callbacks=callbacks,
-            accelerator=self.accelerator,
-            devices=self.devices,
-            default_root_dir=self.log_dir,
-            gradient_clip_val=self.gradient_clip_val
-        )
-        
+
+        trainer, loss_callback = self._build_trainer(model, self.log_dir)
+
         logger.info(f"🚀 Starting training for model {model.__class__.__name__}...")
         trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
         
@@ -227,6 +305,7 @@ class ModelTrainer:
         if isinstance(Y, np.ndarray):
             Y = torch.as_tensor(Y, dtype=torch.float32)
 
+        X, Y, num_workers = self._stage_dataset(X, Y)
         dataset = TensorDataset(X, Y)
         kfold = KFold(n_splits=n_splits, shuffle=True, random_state=42)
         
@@ -250,16 +329,16 @@ class ModelTrainer:
             val_sub = Subset(dataset, val_ids)
             
             train_loader = DataLoader(
-                train_sub, 
-                batch_size=self.batch_size, 
-                shuffle=True, 
-                num_workers=self.num_workers
+                train_sub,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=num_workers
             )
             val_loader = DataLoader(
-                val_sub, 
-                batch_size=self.batch_size, 
-                shuffle=False, 
-                num_workers=self.num_workers
+                val_sub,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=num_workers
             )
             
             # Inject pos_weight into model constructor kwargs
@@ -267,32 +346,10 @@ class ModelTrainer:
             current_model_kwargs['pos_weight'] = pos_weight_fold
             
             model = model_class(**current_model_kwargs)
-            
+
             fold_log_dir = os.path.join(self.log_dir, f"fold_{fold+1}")
-            os.makedirs(fold_log_dir, exist_ok=True)
-            
-            loss_callback = LossHistoryCallback()
-            callbacks = [
-                EarlyStopping(monitor="val_loss", patience=self.patience, mode="min", verbose=True),
-                ModelCheckpoint(
-                    dirpath=fold_log_dir, 
-                    monitor="val_loss", 
-                    save_top_k=1, 
-                    mode="min",
-                    filename=f"{model.__class__.__name__}-fold{fold+1}-{{epoch:02d}}-{{val_loss:.4f}}"
-                ),
-                loss_callback
-            ]
-            
-            trainer = pl.Trainer(
-                max_epochs=self.max_epochs,
-                callbacks=callbacks,
-                accelerator=self.accelerator,
-                devices=self.devices,
-                default_root_dir=fold_log_dir,
-                gradient_clip_val=self.gradient_clip_val
-            )
-            
+            trainer, loss_callback = self._build_trainer(model, fold_log_dir)
+
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
             fold_trainers.append(trainer)
             fold_models.append(model)

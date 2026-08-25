@@ -5,6 +5,8 @@ import pytorch_lightning as pl
 from torchmetrics import Accuracy, AUROC, Precision, Recall, F1Score, AveragePrecision
 from typing import Tuple, Any, Optional, Union
 
+from ai.evaluation.metrics import compute_pd_fa, sp_index
+
 class ModelMLP(pl.LightningModule):
     """
     Multi-Layer Perceptron (MLP) PyTorch Lightning module for binary classification
@@ -67,6 +69,10 @@ class ModelMLP(pl.LightningModule):
         self.val_f1 = F1Score(task="binary")
         self.val_auc = AUROC(task="binary")
         self.val_pr_auc = AveragePrecision(task="binary")
+
+        # Buffers accumulated across validation batches to compute the epoch-level SP Index
+        self._val_preds: list = []
+        self._val_targets: list = []
 
     def set_pos_weight(self, pos_weight: Union[float, torch.Tensor]) -> None:
         """
@@ -158,7 +164,10 @@ class ModelMLP(pl.LightningModule):
         self.val_f1(preds, y_int)
         self.val_auc(preds, y_int)
         self.val_pr_auc(preds, y_int)
-        
+
+        self._val_preds.append(preds.detach())
+        self._val_targets.append(y_int.detach())
+
         self.log('val_loss', loss, prog_bar=True)
         self.log('val_acc', self.val_acc, prog_bar=False)
         self.log('val_f1', self.val_f1, prog_bar=True)
@@ -166,8 +175,26 @@ class ModelMLP(pl.LightningModule):
         self.log('val_recall', self.val_recall, prog_bar=False)
         self.log('val_auc_roc', self.val_auc, prog_bar=True)
         self.log('val_auc_pr', self.val_pr_auc, prog_bar=True)
-        
+
         return loss
+
+    def on_validation_epoch_end(self) -> None:
+        """
+        Computes the SP Index (sqrt(sqrt(pd*(1-fa)) * (pd+1-fa)/2)) over the full validation
+        set at the default 0.5 decision boundary, used by EarlyStopping/ModelCheckpoint.
+        """
+        if not self._val_preds:
+            return
+
+        preds = torch.cat(self._val_preds)
+        targets = torch.cat(self._val_targets)
+        pd_rate, fa_rate = compute_pd_fa(preds, targets)
+        sp = sp_index(pd_rate, fa_rate)
+
+        self.log('val_sp', sp, prog_bar=True)
+
+        self._val_preds.clear()
+        self._val_targets.clear()
 
     def configure_optimizers(self) -> Any:
         """

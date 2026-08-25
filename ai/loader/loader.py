@@ -1,9 +1,9 @@
 import pandas as pd
+import polars as pl
 import glob
 import os
 import logging
 from typing import List, Optional
-from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,11 @@ class DataLoader:
 
     def load_dataset(self, files: List[str]) -> Optional[pd.DataFrame]:
         """
-        Reads parquet files and concatenates them into a single DataFrame.
+        Reads and concatenates parquet files into a single DataFrame using polars as the
+        reading/concatenation engine (single lazy scan across all files, one Arrow-native
+        concat), which avoids the per-file Python object overhead and the N-way in-memory
+        duplication that pandas' read-then-concat loop incurs. Converted to pandas at the
+        end for compatibility with the rest of the pipeline (label generation, preprocessors).
 
         Args:
             files (List[str]): List of file paths to load.
@@ -74,14 +78,9 @@ class DataLoader:
         if not files:
             logger.warning("⚠️ No files found to load.")
             return None
-        
-        dfs = []
-        for f in tqdm(files, desc="📥 Loading Parquets", unit="file"):
-            df_temp = pd.read_parquet(f)
-            df_temp['file_path'] = f
-            dfs.append(df_temp)
-            
-        df = pd.concat(dfs, ignore_index=True)
+
+        logger.info(f"📥 Reading {len(files)} parquet files via polars...")
+        df = pl.scan_parquet(files, include_file_paths="file_path", low_memory=True).collect().to_pandas()
         return df
 
     def execute(self) -> Optional[pd.DataFrame]:

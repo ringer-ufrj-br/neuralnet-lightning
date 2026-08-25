@@ -3,7 +3,7 @@ import seaborn as sns
 from sklearn.metrics import roc_curve, auc, confusion_matrix, precision_recall_curve, average_precision_score
 import os
 import logging
-from typing import List, Union
+from typing import Dict, List, Optional, Union
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,13 @@ class ModelMonitor:
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         
-    def plot_roc_curve(self, y_true: Union[List[int], np.ndarray], y_prob: Union[List[float], np.ndarray], filename: str = "roc_curve.pdf") -> None:
+    def plot_roc_curve(
+        self,
+        y_true: Union[List[int], np.ndarray],
+        y_prob: Union[List[float], np.ndarray],
+        filename: str = "roc_curve.pdf",
+        operating_points: Optional[List[Dict[str, float]]] = None
+    ) -> None:
         """
         Plots and saves the Receiver Operating Characteristic (ROC) curve with AUC metric.
 
@@ -37,24 +43,36 @@ class ModelMonitor:
             y_true (Union[List[int], np.ndarray]): True target labels.
             y_prob (Union[List[float], np.ndarray]): Predicted probabilities.
             filename (str): Output filename. Defaults to 'roc_curve.pdf'.
+            operating_points (Optional[List[Dict[str, float]]]): Working points (e.g. tight/medium/loose)
+                as produced by ai.evaluation.summary.compute_operating_points, marked as FA-vs-PD dots.
 
         Returns:
             None
         """
         fpr, tpr, _ = roc_curve(y_true, y_prob)
         roc_auc = auc(fpr, tpr)
-        
+
         plt.figure(figsize=(8, 6))
         plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
         plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+
+        if operating_points:
+            for point in operating_points:
+                plt.scatter(point["FA"], point["PD"], color='crimson', zorder=5)
+                plt.annotate(
+                    f"{point['Operating_Point']} (PD={point['PD']:.3f}, FA={point['FA']:.3f})",
+                    (point["FA"], point["PD"]),
+                    textcoords="offset points", xytext=(8, -4), fontsize=8
+                )
+
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate (FPR)')
-        plt.ylabel('True Positive Rate (TPR)')
+        plt.xlabel('False Alarm Rate (FA)')
+        plt.ylabel('Probability of Detection (PD)')
         plt.title('ROC Curve')
         plt.legend(loc="lower right")
         plt.grid(True, alpha=0.3)
-        
+
         filepath = os.path.join(self.output_dir, filename)
         plt.savefig(filepath)
         plt.close()
