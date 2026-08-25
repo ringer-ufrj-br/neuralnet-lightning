@@ -18,6 +18,7 @@ from ai.models.cnn2d import ModelCNN2D
 from ai.trainer.trainer import ModelTrainer
 from ai.evaluation.monitor import ModelMonitor
 from ai.evaluation.summary import ModelSummary
+from ai.binning.kinematics import et_bin_index, eta_bin_index, bin_label, bin_description
 
 class PipelineCNN2D:
     """
@@ -32,10 +33,12 @@ class PipelineCNN2D:
         model_name: str = "CNN2D", 
         max_epochs: int = 20, 
         batch_size: int = 32, 
-        patience: int = 5, 
+        patience: int = 5,
         num_workers: int = 0,
         accelerator: str = "auto",
-        devices: Union[int, str, List[int]] = "auto"
+        devices: Union[int, str, List[int]] = "auto",
+        et_bin: Optional[int] = None,
+        eta_bin: Optional[int] = None
     ) -> None:
         """
         Initializes PipelineCNN2D instance.
@@ -51,12 +54,24 @@ class PipelineCNN2D:
             num_workers (int): Parallel worker subprocesses. Defaults to 0.
             accelerator (str): PyTorch Lightning accelerator ('auto', 'cpu', 'cuda'). Defaults to 'auto'.
             devices (Union[int, str, List[int]]): Devices specification. Defaults to 'auto'.
+            et_bin (Optional[int]): Et bin index (0-4, see ai.binning.kinematics). Trains on the
+                whole dataset when None (together with eta_bin) or on only that kinematic slice
+                when both are set - the standard 5x5=25-network Ringer scheme. Defaults to None.
+            eta_bin (Optional[int]): |eta| bin index (0-4). Defaults to None.
         """
+        if (et_bin is None) != (eta_bin is None):
+            raise ValueError("❌ et_bin and eta_bin must be set together (or both left as None).")
+
         self.model_name = model_name
         self.label_col = label_col
-        
+        self.et_bin = et_bin
+        self.eta_bin = eta_bin
+
         self.results_dir = os.path.join("results", self.model_name)
-        
+        if et_bin is not None:
+            self.results_dir = os.path.join(self.results_dir, bin_label(et_bin, eta_bin))
+            logger.info(f"🎯 Kinematic bin selected: {bin_description(et_bin, eta_bin)}")
+
         self.loader = DataLoader(data_path=data_path, max_files=max_files)
         self.preprocessor = PreprocessCNN2D()
         
@@ -180,7 +195,18 @@ class PipelineCNN2D:
         logger.info("🏷️ Step 1.5: Generating labels...")
         df = LabelGenerator.apply_label(df, file_path_col='file_path', label_col=self.label_col)
         df.drop(columns=['file_path'], inplace=True)
-            
+
+        if self.et_bin is not None:
+            logger.info(f"✂️ Step 1.6: Restricting to kinematic bin {bin_label(self.et_bin, self.eta_bin)} "
+                        f"({bin_description(self.et_bin, self.eta_bin)})...")
+            in_bin = (et_bin_index(df['cl_et'].values) == self.et_bin) & \
+                     (eta_bin_index(df['cl_eta'].values) == self.eta_bin)
+            df = df[in_bin]
+            logger.info(f"   {len(df)} rows remain in this bin.")
+            if df.empty:
+                logger.error("❌ No data remaining after kinematic binning.")
+                return None
+
         logger.info("⚙️ Step 2: Preprocessing features into 2D image tensors...")
         X = self.preprocessor.transform(df)
         Y = self.preprocessor.get_labels(df, label_col=self.label_col)

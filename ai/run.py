@@ -38,6 +38,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Neural Network Training Orchestrator (ATLAS CERN).")
     parser.add_argument('--config', type=str, default='config.yaml', help="Path to YAML configuration file.")
     parser.add_argument('--fold', type=int, default=None, help="Execute a specific fold (useful for SLURM parallelism).")
+    parser.add_argument('--et-bin', type=int, default=None, help="Et bin index 0-4 (requires --eta-bin too, useful for SLURM parallelism of the 25-network grid).")
+    parser.add_argument('--eta-bin', type=int, default=None, help="|eta| bin index 0-4 (requires --et-bin too).")
     parser.add_argument('--accelerator', type=str, default=None, help="PyTorch Lightning accelerator (e.g. auto, cpu, cuda).")
     parser.add_argument('--devices', type=str, default=None, help="Devices to use (e.g. auto, 1, 0).")
     args = parser.parse_args()
@@ -66,7 +68,9 @@ def main() -> None:
             patience=config.get("patience", 5),
             num_workers=config.get("num_workers", 0),
             accelerator=accelerator,
-            devices=devices
+            devices=devices,
+            et_bin=args.et_bin,
+            eta_bin=args.eta_bin
         )
     elif model_type == "MLP":
         from ai.pipeline.pipeline_mlp import PipelineMLP
@@ -80,7 +84,9 @@ def main() -> None:
             patience=config.get("patience", 5),
             num_workers=config.get("num_workers", 0),
             accelerator=accelerator,
-            devices=devices
+            devices=devices,
+            et_bin=args.et_bin,
+            eta_bin=args.eta_bin
         )
     else:
         raise ValueError(f"❌ Model '{model_type}' is not supported or not implemented in pipeline.")
