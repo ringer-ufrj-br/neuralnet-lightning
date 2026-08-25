@@ -6,15 +6,65 @@ from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 
+
+def _selected_ring_columns(prefix: str) -> List[str]:
+    """
+    Selected ring columns for MLP training - we selected 1/2 of rings in each layer (fixed,
+    not parameterized). Mirrors the reference selection from prior Ringer trainings:
+
+    pre-sample - 8 rings
+    EM1 - 64 rings
+    EM2 - 8 rings
+    EM3 - 8 rings
+    Had1 - 4 rings
+    Had2 - 4 rings
+    Had3 - 4 rings
+
+    Args:
+        prefix (str): printf-style column name template with one '%i' placeholder, e.g. 'cl_ring_%i'.
+
+    Returns:
+        List[str]: The 50 selected column names, in ring order.
+    """
+    # rings presample
+    presample = [prefix % iring for iring in range(8 // 2)]
+
+    # EM1 list
+    sum_rings = 8
+    em1 = [prefix % iring for iring in range(sum_rings, sum_rings + (64 // 2))]
+
+    # EM2 list
+    sum_rings = 8 + 64
+    em2 = [prefix % iring for iring in range(sum_rings, sum_rings + (8 // 2))]
+
+    # EM3 list
+    sum_rings = 8 + 64 + 8
+    em3 = [prefix % iring for iring in range(sum_rings, sum_rings + (8 // 2))]
+
+    # HAD1 list
+    sum_rings = 8 + 64 + 8 + 8
+    had1 = [prefix % iring for iring in range(sum_rings, sum_rings + (4 // 2))]
+
+    # HAD2 list
+    sum_rings = 8 + 64 + 8 + 8 + 4
+    had2 = [prefix % iring for iring in range(sum_rings, sum_rings + (4 // 2))]
+
+    # HAD3 list
+    sum_rings = 8 + 64 + 8 + 8 + 4 + 4
+    had3 = [prefix % iring for iring in range(sum_rings, sum_rings + (4 // 2))]
+
+    return presample + em1 + em2 + em3 + had1 + had2 + had3
+
+
 class PreprocessMLP:
     """
-    Preprocessor for MLP pipeline extracting ring features from DataFrame,
-    applying cleaning, optional log-scale transformations, and StandardScaler normalization.
+    Preprocessor for MLP pipeline extracting the leading half of each calorimeter layer's
+    ring features (50 of 100 rings, see _selected_ring_columns) from a DataFrame, applying
+    cleaning, optional log-scale transformations, and StandardScaler normalization.
     """
 
     def __init__(
-        self, 
-        num_rings: int = 100, 
+        self,
         use_scaler: bool = True,
         apply_log1p: bool = True
     ) -> None:
@@ -22,14 +72,12 @@ class PreprocessMLP:
         Initializes PreprocessMLP instance.
 
         Args:
-            num_rings (int): Number of ring features to extract. Defaults to 100.
             use_scaler (bool): Whether to apply StandardScaler normalization. Defaults to True.
             apply_log1p (bool): Whether to apply log1p transformation to energy values. Defaults to True.
         """
-        self.num_rings = num_rings
         self.use_scaler = use_scaler
         self.apply_log1p = apply_log1p
-        self.ring_columns = [f"cl_ring_{i}" for i in range(self.num_rings)]
+        self.ring_columns = _selected_ring_columns("cl_ring_%i")
         self.scaler = StandardScaler() if use_scaler else None
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
@@ -45,7 +93,7 @@ class PreprocessMLP:
         # Determine ring columns: check cl_ring_i first, with fallback to cl_truth_ring_i
         cols = self.ring_columns
         if not all(col in df.columns for col in cols):
-            fallback_cols = [f"cl_truth_ring_{i}" for i in range(self.num_rings)]
+            fallback_cols = _selected_ring_columns("cl_truth_ring_%i")
             if all(col in df.columns for col in fallback_cols):
                 logger.info("ℹ️ Ring columns 'cl_ring_*' not found; using fallback 'cl_truth_ring_*'.")
                 cols = fallback_cols

@@ -192,10 +192,11 @@ class PipelineMLP:
         logger.info(f"✂️ Splitting {test_size * 100}% data for holdout testing...")
         X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=test_size, random_state=42, shuffle=True)
 
-        logger.info(f"🏋️ Step 3: Training (K-Fold={use_kfold}, Weighted Loss Enabled)...")
+        input_dim = X.shape[1]
+        logger.info(f"🏋️ Step 3: Training (input_dim={input_dim}, K-Fold={use_kfold}, Weighted Loss Enabled)...")
 
         if use_kfold:
-            model_kwargs = {'learning_rate': learning_rate}
+            model_kwargs = {'learning_rate': learning_rate, 'input_dim': input_dim}
             fold_trainers, fold_models, fold_loss_callbacks = self.trainer.fit_kfold(
                 ModelMLP, model_kwargs, X_train, Y_train,
                 n_splits=n_splits, target_fold=target_fold
@@ -206,7 +207,7 @@ class PipelineMLP:
                 self.evaluate_model(model, X_test, Y_test, threshold=threshold, suffix=f"fold_{fold_idx}", loss_callback=loss_callback)
             return fold_trainers, fold_models
         else:
-            model = ModelMLP(learning_rate=learning_rate)
+            model = ModelMLP(learning_rate=learning_rate, input_dim=input_dim)
             trained_trainer, loss_callback = self.trainer.fit(model, X_train, Y_train)
 
             self.evaluate_model(model, X_test, Y_test, threshold=threshold, loss_callback=loss_callback)

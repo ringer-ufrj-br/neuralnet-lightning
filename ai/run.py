@@ -81,7 +81,7 @@ def main() -> None:
             num_workers=config.get("num_workers", 0),
             accelerator=accelerator,
             devices=devices
-        ) 
+        )
     else:
         raise ValueError(f"❌ Model '{model_type}' is not supported or not implemented in pipeline.")
 
