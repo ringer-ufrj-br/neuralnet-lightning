@@ -240,14 +240,8 @@ não tomar todas as GPUs da fila:
 
 Cancelar a grade inteira é `scancel <id-do-array>`; uma região só é `scancel <id>_<indice>`.
 
-Para paralelizar os folds de uma região única, um job por fold:
-
-```bash
-./slurm_kfold.sh 5 ai/configs/mlp.yaml
-```
-
-Ambos encadeiam com `--dependency=afterok`, então avaliação e tabelão só disparam quando os
-treinos terminam com sucesso.
+O tabelão encadeia com `--dependency=afterok`, então só dispara quando todas as tarefas do
+array terminam com sucesso.
 
 ---
 
