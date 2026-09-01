@@ -5,7 +5,6 @@ max_epochs: 50
 batch_size: 1024            # mesmo batch do treino ringer legado em TF (share/legacy_code)
 learning_rate: 0.001
 patience: 8
-num_workers: 0
 threshold: 0.8
 max_files: 100
 n_splits: 5

@@ -3,7 +3,7 @@ import seaborn as sns
 from sklearn.metrics import roc_curve, auc, confusion_matrix, precision_recall_curve, average_precision_score
 import os
 import logging
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -169,3 +169,100 @@ class ModelMonitor:
         plt.savefig(filepath)
         plt.close()
         logger.info(f"📉 Saved Loss Curve to: {filepath}")
+
+    def plot_roc_folds(
+        self,
+        fold_scores: Dict[int, Tuple[np.ndarray, np.ndarray]],
+        filename: str = "roc_folds.pdf",
+        operating_points: Optional[List[Dict[str, float]]] = None,
+        title: str = "ROC Curve — Cross Validation",
+        zoom: bool = True
+    ) -> Optional[str]:
+        """
+        Overlays the ROC curve of every fold in one figure, with the mean curve and a
+        +/-1 sigma band, so the spread quoted in the cross-validation table has a visual
+        counterpart. Curves are interpolated onto a shared FA grid before averaging, since
+        each fold's roc_curve() returns its own set of thresholds.
+
+        Args:
+            fold_scores (Dict[int, Tuple[np.ndarray, np.ndarray]]): Mapping fold number ->
+                (y_true, y_prob).
+            filename (str): Output filename. Defaults to 'roc_folds.pdf'.
+            operating_points (Optional[List[Dict[str, float]]]): Working points to mark,
+                typically the fold-averaged ones.
+            title (str): Figure title.
+            zoom (bool): Also draw a zoomed inset over the high-PD / low-FA corner, which is
+                the only region that matters at the tight working point. Defaults to True.
+
+        Returns:
+            Optional[str]: The written path, or None when there was nothing to plot.
+        """
+        if not fold_scores:
+            logger.warning("⚠️ No fold scores supplied; skipping fold ROC overlay.")
+            return None
+
+        grid = np.linspace(0.0, 1.0, 1001)
+        interpolated, aucs = [], []
+
+        plt.figure(figsize=(8, 6))
+        for fold in sorted(fold_scores):
+            y_true, y_prob = fold_scores[fold]
+            fpr, tpr, _ = roc_curve(y_true, y_prob)
+            fold_auc = auc(fpr, tpr)
+            aucs.append(fold_auc)
+            interpolated.append(np.interp(grid, fpr, tpr))
+            plt.plot(fpr, tpr, lw=1.0, alpha=0.45, label=f"Fold {fold} (AUC = {fold_auc:.4f})")
+
+        stacked = np.vstack(interpolated)
+        mean_tpr, std_tpr = stacked.mean(axis=0), stacked.std(axis=0)
+
+        plt.plot(
+            grid, mean_tpr, color="crimson", lw=2.2,
+            label=f"Mean (AUC = {np.mean(aucs):.4f} ± {np.std(aucs):.4f})"
+        )
+        if len(interpolated) > 1:
+            plt.fill_between(
+                grid,
+                np.clip(mean_tpr - std_tpr, 0, 1),
+                np.clip(mean_tpr + std_tpr, 0, 1),
+                color="crimson", alpha=0.18, label="±1 std. dev."
+            )
+        plt.plot([0, 1], [0, 1], color="navy", lw=1.2, linestyle="--")
+
+        if operating_points:
+            for point in operating_points:
+                plt.scatter(point["FA"], point["PD"], color="black", marker="*", s=90, zorder=5)
+                plt.annotate(
+                    f"{point['Operating_Point']}",
+                    (point["FA"], point["PD"]),
+                    textcoords="offset points", xytext=(8, -10), fontsize=8
+                )
+
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel("False Alarm Rate (FA)")
+        plt.ylabel("Probability of Detection (PD)")
+        plt.title(title)
+        plt.legend(loc="lower right", fontsize=8)
+        plt.grid(True, alpha=0.3)
+
+        if zoom:
+            # Placed in the mid-right of the axes: a well-performing ROC hugs the top-left
+            # corner, so this region is empty, and it stays clear of the lower-right legend.
+            inset = plt.gca().inset_axes([0.44, 0.33, 0.52, 0.44])
+            for fold in sorted(fold_scores):
+                y_true, y_prob = fold_scores[fold]
+                fpr, tpr, _ = roc_curve(y_true, y_prob)
+                inset.plot(fpr, tpr, lw=1.0, alpha=0.45)
+            inset.plot(grid, mean_tpr, color="crimson", lw=1.8)
+            inset.set_xlim(0.0, 0.2)
+            inset.set_ylim(0.8, 1.005)
+            inset.grid(True, alpha=0.3)
+            inset.tick_params(labelsize=7)
+            inset.set_title("zoom", fontsize=8)
+
+        filepath = os.path.join(self.output_dir, filename)
+        plt.savefig(filepath)
+        plt.close()
+        logger.info(f"📈 Saved per-fold ROC overlay to: {filepath}")
+        return filepath

@@ -276,8 +276,15 @@ class BasePipeline:
 
         The parquet rows carry no stable physical key - (run_number, event_number, cl_idx)
         repeats heavily across files - so the holdout can only be referenced positionally.
-        That makes this fingerprint the guard rail: it pins the file list and the row/class
-        counts, and a mismatch means the positional indices no longer point at the same rows.
+        That makes this fingerprint the guard rail: it pins the file list, the row/class
+        counts and an order-sensitive row digest; a mismatch means the positional indices no
+        longer point at the same rows.
+
+        The row digest hashes the label sequence and the cl_et sequence in row order. Counts
+        alone are permutation-invariant, and labels alone are constant within each source file
+        (they derive from the file path), so only a per-row quantity like cl_et makes a
+        reordering *inside* a file - which streaming collects are in principle free to do -
+        detectable.
 
         Args:
             df (pd.DataFrame): The loaded DataFrame.
@@ -288,6 +295,11 @@ class BasePipeline:
         """
         files = sorted(self.loader.get_files())
         digest = hashlib.sha1("\n".join(files).encode()).hexdigest()
+
+        row_hasher = hashlib.sha1(np.ascontiguousarray(Y, dtype=np.int8).tobytes())
+        if 'cl_et' in df.columns:
+            row_hasher.update(np.ascontiguousarray(df['cl_et'].to_numpy(), dtype=np.float32).tobytes())
+
         return {
             "data_path": self.data_path,
             "max_files": self.max_files,
@@ -296,6 +308,7 @@ class BasePipeline:
             "n_rows": int(len(df)),
             "n_positives": int((Y == 1).sum()),
             "n_negatives": int((Y == 0).sum()),
+            "rows_sha1": row_hasher.hexdigest(),
         }
 
     @staticmethod
@@ -311,7 +324,7 @@ class BasePipeline:
         Raises:
             RuntimeError: If the fingerprints disagree.
         """
-        blocking = ["n_rows", "n_files", "files_sha1", "n_positives", "n_negatives"]
+        blocking = ["n_rows", "n_files", "files_sha1", "n_positives", "n_negatives", "rows_sha1"]
         differences = [
             f"{key}: trained on {stored.get(key)!r}, now {current.get(key)!r}"
             for key in blocking

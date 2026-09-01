@@ -1,6 +1,8 @@
+import os
 import numpy as np
 import pandas as pd
 import logging
+import joblib
 from typing import Tuple, Optional
 from tqdm import tqdm
 
@@ -88,6 +90,62 @@ class PreprocessCNN2D:
             X[:, i, :, :] = layer_arrays
             
         return X
+
+    def fit(self, df: pd.DataFrame) -> "PreprocessCNN2D":
+        """
+        No-op fit, present so this preprocessor honours the same fit/transform/save/load
+        contract as PreprocessMLP and can be driven by the shared pipeline. The cell-to-image
+        conversion is fully deterministic (padding + log1p), with nothing learned from data.
+
+        Args:
+            df (pd.DataFrame): Training rows only (unused).
+
+        Returns:
+            PreprocessCNN2D: self, for chaining.
+        """
+        return self
+
+    def fit_transform(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Fits on the given rows and transforms them in one call.
+
+        Args:
+            df (pd.DataFrame): Training rows only.
+
+        Returns:
+            np.ndarray: Multi-channel tensor array of shape (N, 7, 7, 15).
+        """
+        return self.fit(df).transform(df)
+
+    def save(self, filepath: str) -> str:
+        """
+        Persists the preprocessor configuration alongside the trained checkpoints.
+
+        Args:
+            filepath (str): Destination path (.joblib).
+
+        Returns:
+            str: The written path.
+        """
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+        joblib.dump(self, filepath)
+        logger.info(f"💾 Saved preprocessor to: {filepath}")
+        return filepath
+
+    @staticmethod
+    def load(filepath: str) -> "PreprocessCNN2D":
+        """
+        Loads a preprocessor previously written by save().
+
+        Args:
+            filepath (str): Path to the .joblib file.
+
+        Returns:
+            PreprocessCNN2D: The restored instance.
+        """
+        preprocessor = joblib.load(filepath)
+        logger.info(f"📂 Loaded preprocessor from: {filepath}")
+        return preprocessor
 
     def get_labels(self, df: pd.DataFrame, label_col: str = 'label') -> Optional[np.ndarray]:
         """

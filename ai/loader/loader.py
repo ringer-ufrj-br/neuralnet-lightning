@@ -78,7 +78,7 @@ class DataLoader:
         """
         return pl.scan_parquet(files, include_file_paths="file_path", low_memory=True)
 
-    def load_dataset(self, files: List[str], columns: Optional[List[str]] = None) -> Optional[pd.DataFrame]:
+    def load_dataset(self, files: List[str], columns: List[str]) -> Optional[pd.DataFrame]:
         """
         Reads and concatenates parquet files into a single DataFrame using polars as the
         reading/concatenation engine (single lazy scan across all files, streamed collect),
@@ -86,10 +86,13 @@ class DataLoader:
         that pandas' read-then-concat loop incurs. Converted to pandas at the end for
         compatibility with the rest of the pipeline (label generation, preprocessors).
 
+        `columns` is deliberately required: the raw files carry 300+ columns including the
+        nested calorimeter images, and collecting them all is what used to exhaust memory on
+        full-dataset runs. The pipeline itself composes scan() directly instead.
+
         Args:
             files (List[str]): List of file paths to load.
-            columns (Optional[List[str]]): Columns to read ('file_path' is always kept).
-                None loads every column.
+            columns (List[str]): Columns to read ('file_path' is always kept).
 
         Returns:
             Optional[pd.DataFrame]: Combined pandas DataFrame or None if empty.
@@ -99,28 +102,7 @@ class DataLoader:
             return None
 
         logger.info(f"📥 Reading {len(files)} parquet files via polars...")
-        lf = self.scan(files)
-        if columns is not None:
-            keep = list(dict.fromkeys(columns))
-            if "file_path" not in keep:
-                keep.append("file_path")
-            lf = lf.select(keep)
-        return lf.collect(engine="streaming").to_pandas()
-
-    def execute(self) -> Optional[pd.DataFrame]:
-        """
-        Executes complete data loading pipeline (find files and read dataset).
-
-        Args:
-            None
-
-        Returns:
-            Optional[pd.DataFrame]: Concatenated dataset DataFrame.
-        """
-        files = self.get_files()
-        df = self.load_dataset(files)
-        return df
-
-if __name__ == "__main__":
-    loader = DataLoader()
-    loader.execute()
+        keep = list(dict.fromkeys(columns))
+        if "file_path" not in keep:
+            keep.append("file_path")
+        return self.scan(files).select(keep).collect(engine="streaming").to_pandas()

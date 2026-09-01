@@ -3,15 +3,18 @@
 # ==============================================================================
 # Orquestrador Paralelo de Validação Cruzada (K-Fold) via SLURM
 # ==============================================================================
-# Cada fold vira 1 job na partition de GPU; o próprio SLURM escalona entre os nós
-# disponíveis (sem fixar hostname). Ajuste PARTITION/RESERVATION abaixo se mudar.
+# Cada fold vira 1 job de TREINO na partition de GPU; o próprio SLURM escalona
+# entre os nós disponíveis (sem fixar hostname). Quando todos os folds terminam,
+# um job de AVALIAÇÃO roda automaticamente (--dependency=afterok) e produz as
+# métricas, os gráficos e a fatia do tabelão desta região.
+# Ajuste PARTITION/RESERVATION abaixo se mudar.
 
 PARTITION="gpu"
 RESERVATION="gdi"
 
 # Parâmetros de entrada com valores padrão
-NUM_FOLDS=${1:-3}           # Padrão: rodar 3 folds (deve bater com o yaml)
-CONFIG_FILE=${2:-"config.yaml"}
+NUM_FOLDS=${1:-5}           # Padrão: rodar 5 folds (deve bater com n_splits do yaml)
+CONFIG_FILE=${2:-"ai/configs/mlp.yaml"}
 
 echo "====================================================================="
 echo "Iniciando submissão paralela via SLURM (partition: $PARTITION)"
@@ -24,23 +27,39 @@ LOG_DIR="results/logs_slurm"
 mkdir -p "$LOG_DIR"
 
 # Loop disparando 1 sbatch para CADA fold; o SLURM decide o nó/GPU.
+TRAIN_JOB_IDS=()
 for (( fold=1; fold<=NUM_FOLDS; fold++ )); do
 
-    echo "Submetendo Fold $fold..."
+    echo "Submetendo treino do Fold $fold..."
 
-    sbatch -p "$PARTITION" --reservation="$RESERVATION" -N 1 --gres=gpu:1 \
-         --job-name="CNN_2D_Cern_fold_${fold}" \
-         --output="${LOG_DIR}/fold_${fold}_%j.out" \
-         --error="${LOG_DIR}/fold_${fold}_%j.err" \
-         --wrap="python ai/run.py --config $CONFIG_FILE --fold $fold"
+    JOB_ID=$(sbatch --parsable -p "$PARTITION" --reservation="$RESERVATION" -N 1 --gres=gpu:1 \
+         --job-name="train_fold_${fold}" \
+         --output="${LOG_DIR}/train_fold_${fold}_%j.out" \
+         --error="${LOG_DIR}/train_fold_${fold}_%j.err" \
+         --wrap="python ai/run.py train --config $CONFIG_FILE --fold $fold")
+
+    TRAIN_JOB_IDS+=("$JOB_ID")
 
     # Pequeno delay apenas para evitar concorrência no gerenciador de filas
     sleep 1
 done
 
+# Avaliação depende de TODOS os folds: só faz sentido comparar folds quando todos
+# os checkpoints existem (o tabelão é média ± desvio entre eles).
+DEPENDENCY=$(IFS=:; echo "${TRAIN_JOB_IDS[*]}")
+echo "Submetendo avaliação (após os folds ${DEPENDENCY})..."
+
+EVAL_JOB_ID=$(sbatch --parsable -p "$PARTITION" --reservation="$RESERVATION" -N 1 --gres=gpu:1 \
+     --dependency="afterok:${DEPENDENCY}" \
+     --job-name="evaluate" \
+     --output="${LOG_DIR}/evaluate_%j.out" \
+     --error="${LOG_DIR}/evaluate_%j.err" \
+     --wrap="python ai/run.py evaluate --config $CONFIG_FILE && python ai/run.py report --config $CONFIG_FILE")
+
 echo "====================================================================="
 echo "Todos os $NUM_FOLDS folds foram submetidos para a fila!"
+echo "Avaliação + tabelão enfileirados como job ${EVAL_JOB_ID}."
 echo "Use 'squeue -u \$USER' para monitorar o andamento."
 echo "Para cancelar tudo, rode 'scancel -u \$USER'."
 echo "====================================================================="
-echo "Confira os gráficos em 'results/' e os logs em '${LOG_DIR}/' quando acabarem."
+echo "Confira os resultados em 'results/' e os logs em '${LOG_DIR}/' quando acabarem."
