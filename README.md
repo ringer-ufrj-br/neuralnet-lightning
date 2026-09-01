@@ -117,20 +117,21 @@ python ai/run.py evaluate --config ai/configs/mlp.yaml --reuse-scores
 
 ### 3. Tabelão
 
+Todos os modelos já avaliados, sem precisar passar nada:
+
 ```bash
-python ai/run.py report --config ai/configs/mlp.yaml --formats tex,pdf
+python ai/run.py report
 ```
 
-Comparando vários modelos numa tabela só (a ordem dos nomes é a ordem das linhas):
+`--config` e `--models` são **alternativas**, não complementos — cada um é uma forma de dizer
+quais modelos entram na tabela:
 
 ```bash
-python ai/run.py report --config ai/configs/mlp.yaml --models MLP,CNN2D
+python ai/run.py report --config ai/configs/mlp.yaml     # o modelo nomeado no YAML
 ```
 
-Ou todos os que já foram avaliados:
-
 ```bash
-python ai/run.py report --config ai/configs/mlp.yaml --all-models
+python ai/run.py report --models MLP,CNN2D               # esses, nessa ordem de linhas
 ```
 
 Saída em `results/<MODEL>/tabelao/` para um modelo só, e em `results/comparison/tabelao/`
@@ -152,7 +153,7 @@ métricas) de propósito: assim uma região **treinada mas não avaliada** apare
 Para ver o inventário sem construir nada:
 
 ```bash
-python ai/run.py report --all-models --list
+python ai/run.py report --list
 ```
 
 ```
@@ -166,20 +167,30 @@ Toda execução do `report` imprime esse inventário antes de montar a tabela e 
 comando exato para corrigir, quando uma região foi treinada e não avaliada, ou quando só parte
 dos folds foi avaliada.
 
-Com `--models` ou `--all-models`, o `--config` é dispensável — o `report` lê a árvore de
-resultados, não os dados.
+O `--config` é sempre dispensável: o `report` lê a árvore de resultados, não os dados.
 
-### 4. SLURM
+#### Tabela integrada (arquivo separado)
+
+Além de uma tabela por ponto de operação com a grade por região, o `report` salva a **tabela
+integrada** em arquivos próprios: `tabelao_integrated.tex`, `.pdf`/`.png` e o
+`tabelao_integrated_long.csv`. Ela pooleia todas as regiões e traz uma linha por modelo, com
+um grupo de colunas por ponto de operação — o resultado inteiro numa linha por modelo.
+
+A integração é ponderada pela população, não pela média das taxas: cada região tem seu próprio
+limiar, então o número integrado é razão de contagens somadas.
+
+$$P_D^{int} = \frac{\sum_r P_D^r \, N_{sinal}^r}{\sum_r N_{sinal}^r}, \qquad
+  F_A^{int} = \frac{\sum_r F_A^r \, N_{ruído}^r}{\sum_r N_{ruído}^r}$$
+
+O pooling acontece **por fold**, antes de agregar, então o ± da tabela integrada é a dispersão
+real entre folds do número integrado. `threshold` e as AUCs ficam vazios (o limiar é por região
+e as AUCs não se combinam a partir de sumários).
+
+Para pular a tabela integrada:
 
 ```bash
-./slurm_kfold.sh 5 ai/configs/mlp.yaml    # 1 job por fold + avaliação encadeada
+python ai/run.py report --no-integrated
 ```
-
-```bash
-./slurm_bins.sh ai/configs/mlp.yaml       # 1 job por bin da grade 5x5 + tabelão final
-```
-
-Ambos usam `--dependency=afterok`, então a avaliação e o tabelão só disparam quando os treinos terminam com sucesso.
 
 ---
 
@@ -202,10 +213,13 @@ results/<MODEL>[/et<i>_eta<j>]/
 │   └── folds_long.csv         # tabela canônica desta região
 └── plots/                     # ROC, PR, matriz de confusão, loss, ROC dos folds
 
-results/<MODEL>/tabelao/       # ou results/comparison/tabelao/ ao comparar modelos
-├── tabelao_long.csv           # tabela canônica agregada (fonte da verdade)
-├── tabelao_<ponto>.tex        # fragmento LaTeX para \input{}
-└── tabelao_<ponto>.pdf        # render da tabela (sem precisar de LaTeX)
+results/<MODEL>/tabelao/               # ou results/comparison/tabelao/ ao comparar modelos
+├── tabelao_long.csv                   # tabela canônica agregada (fonte da verdade)
+├── tabelao_<ponto>.tex                # por região: fragmento LaTeX para \input{}
+├── tabelao_<ponto>.pdf                # por região: render sem precisar de LaTeX
+├── tabelao_integrated_long.csv        # integrado: números poolados por fold
+├── tabelao_integrated.tex             # integrado: fragmento LaTeX
+└── tabelao_integrated.pdf             # integrado: render
 ```
 
 Todos os CSVs são **sobrescritos** a cada execução (antes eram anexados, o que fazia execuções antigas se acumularem como se fossem folds extras).

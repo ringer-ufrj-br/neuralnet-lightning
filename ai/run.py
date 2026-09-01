@@ -17,7 +17,7 @@ import yaml
 import sys
 import os
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -106,14 +106,39 @@ def resolve_operating_points(config: Dict[str, Any]) -> Optional[Dict[str, float
     return {str(name): float(target) for name, target in points.items()}
 
 
-def add_common_arguments(parser: argparse.ArgumentParser) -> None:
+def resolve_report_models(config: Dict[str, Any], models_arg: Optional[str]) -> Optional[List[str]]:
+    """
+    Decides which models the table covers. --models and --config are alternatives, not
+    companions: either names the models directly, the other names one through the YAML.
+
+    Args:
+        config (Dict[str, Any]): Parsed configuration (empty when no --config was given).
+        models_arg (Optional[str]): Raw --models value, comma separated.
+
+    Returns:
+        Optional[List[str]]: Model names in row order, or None to include every model found.
+    """
+    if models_arg:
+        names = [name.strip() for name in models_arg.split(',') if name.strip()]
+        if config.get("model") and config["model"] not in names:
+            logger.info(f"ℹ️ --models overrides the config's model ('{config['model']}').")
+        return names or None
+    if config.get("model"):
+        return [config["model"]]
+    logger.info("ℹ️ No --config or --models given; including every evaluated model found.")
+    return None
+
+
+def add_common_arguments(parser: argparse.ArgumentParser, config_default: Optional[str] = 'config.yaml') -> None:
     """
     Adds the arguments shared by every subcommand.
 
     Args:
         parser (argparse.ArgumentParser): Subcommand parser to extend.
+        config_default (Optional[str]): Default for --config. None makes the config genuinely
+            optional, which is what `report` wants: it reads the results tree, not the data.
     """
-    parser.add_argument('--config', type=str, default='config.yaml', help="Path to YAML configuration file.")
+    parser.add_argument('--config', type=str, default=config_default, help="Path to YAML configuration file.")
     parser.add_argument('--et-bin', type=int, default=None, help="Et bin index 0-4 (requires --eta-bin too, useful for SLURM parallelism of the 25-network grid).")
     parser.add_argument('--eta-bin', type=int, default=None, help="|eta| bin index 0-4 (requires --et-bin too).")
     parser.add_argument('--accelerator', type=str, default=None, help="PyTorch Lightning accelerator (e.g. auto, cpu, cuda).")
@@ -143,11 +168,11 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument('--no-plots', action='store_true', help="Skip figure rendering (metrics and tables only).")
 
     report_parser = subparsers.add_parser("report", help="Aggregate every evaluated region into the cross-validation table.")
-    add_common_arguments(report_parser)
+    add_common_arguments(report_parser, config_default=None)
     report_parser.add_argument('--results-root', type=str, default='results', help="Root results directory to scan. Defaults to 'results'.")
     report_parser.add_argument('--output-dir', type=str, default=None, help="Where to write the table. Defaults to results/<MODEL>/tabelao, or results/comparison/tabelao when comparing models.")
-    report_parser.add_argument('--models', type=str, default=None, help="Comma-separated models to compare, in row order (e.g. 'MLP,CNN2D'). Defaults to the model in the config.")
-    report_parser.add_argument('--all-models', action='store_true', help="Compare every evaluated model instead of only the configured one.")
+    report_parser.add_argument('--models', type=str, default=None, help="Comma-separated models to compare, in row order (e.g. 'MLP,CNN2D'). Alternative to --config; without either, every evaluated model is included.")
+    report_parser.add_argument('--no-integrated', action='store_false', dest='integrated', help="Skip the separate integrated table (phase-space total), leaving only the per-region tables.")
     report_parser.add_argument('--formats', type=str, default='tex,pdf', help="Comma-separated render formats: 'tex' plus image extensions such as pdf/png. Defaults to 'tex,pdf'.")
     report_parser.add_argument('--decimals', type=int, default=2, help="Decimal places in the table cells. Defaults to 2.")
     report_parser.add_argument('--list', action='store_true', dest='list_only', help="List the trained/evaluated regions found on disk and exit, without building the table.")
@@ -171,15 +196,14 @@ def main() -> None:
 
     args = build_parser().parse_args(argv)
 
-    # `report` reads the results tree, not the data, so it only needs a config to know which
-    # model to default to - and not even that when --models/--all-models says so explicitly.
-    config_optional = args.command == "report" and (args.all_models or args.models)
-
-    if os.path.exists(args.config):
+    # `report` reads the results tree, not the data, so a config is only ever a shorthand for
+    # "the model named in it" - and --models says the same thing directly. Requiring both was
+    # redundant; requiring either was arbitrary.
+    if args.config is None:
+        config = {}
+    elif os.path.exists(args.config):
         logger.info(f"⚙️ Loading configuration from: {args.config}")
         config = load_config(args.config)
-    elif config_optional:
-        config = {}
     else:
         logger.error(f"❌ Configuration file '{args.config}' not found.")
         sys.exit(1)
@@ -187,12 +211,7 @@ def main() -> None:
     if args.command == "report":
         from ai.evaluation.tabelao import build_report, discover_regions, log_inventory
 
-        if args.all_models:
-            model_names = None
-        elif args.models:
-            model_names = [name.strip() for name in args.models.split(',') if name.strip()]
-        else:
-            model_names = [config.get("model", "CNN2D")]
+        model_names = resolve_report_models(config, args.models)
 
         if args.list_only:
             log_inventory(discover_regions(args.results_root, model_names), args.results_root)
@@ -203,6 +222,7 @@ def main() -> None:
             model_names=model_names,
             output_dir=args.output_dir,
             decimals=args.decimals,
+            integrated=args.integrated,
             formats=tuple(fmt.strip() for fmt in args.formats.split(',') if fmt.strip())
         )
         total = sum(len(paths) for paths in written.values())
