@@ -7,14 +7,26 @@
 # entre os nós disponíveis (sem fixar hostname). Quando todos os folds terminam,
 # um job de AVALIAÇÃO roda automaticamente (--dependency=afterok) e produz as
 # métricas, os gráficos e a fatia do tabelão desta região.
-# Ajuste PARTITION/RESERVATION abaixo se mudar.
+# Ajuste PARTITION abaixo se mudar.
 
 PARTITION="gpu"
-RESERVATION="gdi"
 
 # Parâmetros de entrada com valores padrão
 NUM_FOLDS=${1:-5}           # Padrão: rodar 5 folds (deve bater com n_splits do yaml)
 CONFIG_FILE=${2:-"ai/configs/mlp.yaml"}
+
+# O job roda no nó de computação, que não herda confiavelmente o ambiente do nó de login:
+# resolvemos o interpretador do venv por caminho absoluto e fixamos o diretório de trabalho
+# do job no repositório (os caminhos de config, data/ e results/ são todos relativos a ele).
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="${PYTHON:-$REPO_DIR/neuralnet-env/bin/python}"
+
+if [ ! -x "$PYTHON" ]; then
+    echo "ERRO: interpretador nao encontrado em '$PYTHON'." >&2
+    echo "      Crie o ambiente com 'make venv' (de dentro de uma alocacao, nao no no de login)" >&2
+    echo "      ou aponte outro com PYTHON=/caminho/para/python $0 ..." >&2
+    exit 1
+fi
 
 echo "====================================================================="
 echo "Iniciando submissão paralela via SLURM (partition: $PARTITION)"
@@ -32,11 +44,11 @@ for (( fold=1; fold<=NUM_FOLDS; fold++ )); do
 
     echo "Submetendo treino do Fold $fold..."
 
-    JOB_ID=$(sbatch --parsable -p "$PARTITION" --reservation="$RESERVATION" -N 1 --gres=gpu:1 \
+    JOB_ID=$(sbatch --parsable -p "$PARTITION" --chdir="$REPO_DIR" -N 1 --gres=gpu:1 \
          --job-name="train_fold_${fold}" \
          --output="${LOG_DIR}/train_fold_${fold}_%j.out" \
          --error="${LOG_DIR}/train_fold_${fold}_%j.err" \
-         --wrap="python ai/run.py train --config $CONFIG_FILE --fold $fold")
+         --wrap="$PYTHON ai/run.py train --config $CONFIG_FILE --fold $fold")
 
     TRAIN_JOB_IDS+=("$JOB_ID")
 
@@ -49,12 +61,12 @@ done
 DEPENDENCY=$(IFS=:; echo "${TRAIN_JOB_IDS[*]}")
 echo "Submetendo avaliação (após os folds ${DEPENDENCY})..."
 
-EVAL_JOB_ID=$(sbatch --parsable -p "$PARTITION" --reservation="$RESERVATION" -N 1 --gres=gpu:1 \
+EVAL_JOB_ID=$(sbatch --parsable -p "$PARTITION" --chdir="$REPO_DIR" -N 1 --gres=gpu:1 \
      --dependency="afterok:${DEPENDENCY}" \
      --job-name="evaluate" \
      --output="${LOG_DIR}/evaluate_%j.out" \
      --error="${LOG_DIR}/evaluate_%j.err" \
-     --wrap="python ai/run.py evaluate --config $CONFIG_FILE && python ai/run.py report --config $CONFIG_FILE")
+     --wrap="$PYTHON ai/run.py evaluate --config $CONFIG_FILE && $PYTHON ai/run.py report --config $CONFIG_FILE")
 
 echo "====================================================================="
 echo "Todos os $NUM_FOLDS folds foram submetidos para a fila!"

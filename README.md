@@ -48,6 +48,35 @@ A separação existe para que **re-avaliar não exija retreinar**: recortar pont
    source activate.sh
    ```
 
+### Em cluster (SLURM)
+
+Faça o `make venv` **de dentro de uma alocação**, não no nó de login: a instalação do torch
+baixa alguns GB e nós de login costumam limitar CPU/memória. Alocar uma GPU no mesmo
+partition dos jobs também permite confirmar que o CUDA enxerga o dispositivo:
+
+```bash
+srun -p gpu --gres=gpu:1 --pty bash
+```
+
+```bash
+make venv && ./neuralnet-env/bin/python -c "import torch; print(torch.cuda.is_available())"
+```
+
+O venv precisa ficar num sistema de arquivos que os nós de computação enxergam (o próprio
+diretório do repositório, não um scratch local do nó).
+
+Feito isso, **a submissão em si roda no nó de login** — `slurm_*.sh` só chama `sbatch`. Os
+scripts resolvem o interpretador em `neuralnet-env/bin/python` por caminho absoluto e passam
+`--chdir` para o repositório, então não dependem do ambiente do nó de login nem de onde você
+submete. Para usar outro interpretador (módulo do cluster, conda, imagem):
+
+```bash
+PYTHON=/caminho/para/python ./slurm_bins.sh ai/configs/mlp.yaml
+```
+
+Os dados podem ser copiados para `data/` com `make copy-data`, ou — evitando duplicar alguns
+GB — apontando `data_path` do YAML direto para o caminho compartilhado.
+
 ---
 
 ## ⚙️ Configuração (`ai/configs/*.yaml`)
@@ -191,6 +220,34 @@ Para pular a tabela integrada:
 ```bash
 python ai/run.py report --no-integrated
 ```
+
+### 4. SLURM
+
+A grade 5×5 vai como **um job array** de 25 tarefas — cada tarefa deriva seu par (et, eta) do
+`SLURM_ARRAY_TASK_ID`, treina os folds daquele bin e avalia em seguida. Ao fim do array, um job
+dependente monta o tabelão:
+
+```bash
+./slurm_bins.sh ai/configs/mlp.yaml
+```
+
+Segundo argumento opcional limita quantas tarefas rodam em paralelo (`--array=0-24%N`), para
+não tomar todas as GPUs da fila:
+
+```bash
+./slurm_bins.sh ai/configs/mlp.yaml 4
+```
+
+Cancelar a grade inteira é `scancel <id-do-array>`; uma região só é `scancel <id>_<indice>`.
+
+Para paralelizar os folds de uma região única, um job por fold:
+
+```bash
+./slurm_kfold.sh 5 ai/configs/mlp.yaml
+```
+
+Ambos encadeiam com `--dependency=afterok`, então avaliação e tabelão só disparam quando os
+treinos terminam com sucesso.
 
 ---
 

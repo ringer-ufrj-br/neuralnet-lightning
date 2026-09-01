@@ -1,68 +1,78 @@
 #!/bin/bash
 
 # ==============================================================================
-# Orquestrador Paralelo da Grade Et x Eta (5x5 = 25 redes) via SLURM
+# Orquestrador da Grade Et x Eta (5x5 = 25 redes) via SLURM job array
 # ==============================================================================
-# Cada bin vira 1 job na partition de GPU, que TREINA todos os folds daquele bin
-# e em seguida AVALIA (métricas, gráficos e a fatia do tabelão daquela região).
-# Quando os 25 bins terminam, um job final monta o tabelão completo.
-# Ajuste PARTITION/RESERVATION abaixo se mudar.
-
-PARTITION="gpu"
-RESERVATION="gdi"
+# A grade inteira vira UM job array de 25 tarefas: cada tarefa deriva seu par
+# (et, eta) do SLURM_ARRAY_TASK_ID, TREINA todos os folds daquele bin e em
+# seguida AVALIA (métricas, gráficos e a fatia do tabelão daquela região).
+# Quando o array termina, um job final monta o tabelão completo.
 
 # Parâmetros de entrada com valores padrão
 CONFIG_FILE=${1:-"ai/configs/mlp.yaml"}
+MAX_CONCURRENT=${2:-}          # opcional: limita quantas tarefas rodam ao mesmo tempo
 
 N_ET_BINS=5
 N_ETA_BINS=5
+N_TASKS=$(( N_ET_BINS * N_ETA_BINS ))
+
+# O job roda no nó de computação, que não herda confiavelmente o ambiente do nó de login:
+# resolvemos o interpretador do venv por caminho absoluto e fixamos o diretório de trabalho
+# do job no repositório (os caminhos de config, data/ e results/ são todos relativos a ele).
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="${PYTHON:-$REPO_DIR/neuralnet-env/bin/python}"
+
+if [ ! -x "$PYTHON" ]; then
+    echo "ERRO: interpretador nao encontrado em '$PYTHON'." >&2
+    echo "      Crie o ambiente com 'make venv' (de dentro de uma alocacao, nao no no de login)" >&2
+    echo "      ou aponte outro com PYTHON=/caminho/para/python $0 ..." >&2
+    exit 1
+fi
+
+# Índices do array: 0..24, opcionalmente com throttle (%N) para não tomar todas as GPUs.
+ARRAY_SPEC="0-$(( N_TASKS - 1 ))"
+if [ -n "$MAX_CONCURRENT" ]; then
+    ARRAY_SPEC="${ARRAY_SPEC}%${MAX_CONCURRENT}"
+fi
 
 echo "====================================================================="
-echo "Iniciando submissão da grade Et x Eta via SLURM (partition: $PARTITION)"
-echo "Grade: ${N_ET_BINS}x${N_ETA_BINS} = $((N_ET_BINS * N_ETA_BINS)) redes"
+echo "Submetendo a grade Et x Eta como job array"
+echo "Grade: ${N_ET_BINS}x${N_ETA_BINS} = ${N_TASKS} redes (array ${ARRAY_SPEC})"
 echo "Arquivo de Configuração: $CONFIG_FILE"
+echo "Interpretador: $PYTHON"
 echo "====================================================================="
 
 # Cria pasta para os logs do SLURM (arquivos .out e .err)
-LOG_DIR="results/logs_slurm"
+LOG_DIR="$REPO_DIR/results/logs_slurm"
 mkdir -p "$LOG_DIR"
 
-# Loop disparando 1 sbatch para CADA bin (et, eta); o SLURM decide o nó/GPU.
-JOB_IDS=()
-for (( et=0; et<N_ET_BINS; et++ )); do
-    for (( eta=0; eta<N_ETA_BINS; eta++ )); do
+# O \$ é escapado de propósito: SLURM_ARRAY_TASK_ID só existe quando a tarefa roda no nó,
+# então a aritmética que mapeia o índice para (et, eta) precisa ser avaliada lá, não aqui.
+ARRAY_JOB_ID=$(sbatch --parsable --chdir="$REPO_DIR" -N 1 --gres=gpu:1 \
+     --array="$ARRAY_SPEC" \
+     --job-name="et_eta_grid" \
+     --output="${LOG_DIR}/grid_%A_%a.out" \
+     --error="${LOG_DIR}/grid_%A_%a.err" \
+     --wrap="et=\$(( SLURM_ARRAY_TASK_ID / $N_ETA_BINS )); \
+             eta=\$(( SLURM_ARRAY_TASK_ID % $N_ETA_BINS )); \
+             echo \"Task \$SLURM_ARRAY_TASK_ID -> et\${et}_eta\${eta}\"; \
+             $PYTHON ai/run.py train --config $CONFIG_FILE --et-bin \$et --eta-bin \$eta && \
+             $PYTHON ai/run.py evaluate --config $CONFIG_FILE --et-bin \$et --eta-bin \$eta")
 
-        echo "Submetendo bin et${et}_eta${eta}..."
-
-        JOB_ID=$(sbatch --parsable -p "$PARTITION" --reservation="$RESERVATION" -N 1 --gres=gpu:1 \
-             --job-name="et${et}_eta${eta}" \
-             --output="${LOG_DIR}/et${et}_eta${eta}_%j.out" \
-             --error="${LOG_DIR}/et${et}_eta${eta}_%j.err" \
-             --wrap="python ai/run.py train --config $CONFIG_FILE --et-bin $et --eta-bin $eta && \
-                     python ai/run.py evaluate --config $CONFIG_FILE --et-bin $et --eta-bin $eta")
-
-        JOB_IDS+=("$JOB_ID")
-        # Pequeno delay apenas para evitar concorrência no gerenciador de filas
-        sleep 1
-    done
-done
-
-# O tabelão agrega as 25 regiões, então só pode rodar depois que todas terminarem.
-DEPENDENCY=$(IFS=:; echo "${JOB_IDS[*]}")
-echo "Submetendo montagem do tabelão (após os ${#JOB_IDS[@]} bins)..."
-
-REPORT_JOB_ID=$(sbatch --parsable -p "$PARTITION" --reservation="$RESERVATION" -N 1 \
-     --dependency="afterok:${DEPENDENCY}" \
+# O tabelão agrega as 25 regiões, então só pode rodar depois que o array inteiro terminar.
+# 'afterok:<id do array>' espera todas as tarefas concluírem com sucesso.
+REPORT_JOB_ID=$(sbatch --parsable --chdir="$REPO_DIR" -N 1 \
+     --dependency="afterok:${ARRAY_JOB_ID}" \
      --job-name="report" \
      --output="${LOG_DIR}/report_%j.out" \
      --error="${LOG_DIR}/report_%j.err" \
-     --wrap="python ai/run.py report --config $CONFIG_FILE")
+     --wrap="$PYTHON ai/run.py report --config $CONFIG_FILE")
 
 echo "====================================================================="
-echo "Todas as ${#JOB_IDS[@]} redes da grade Et x Eta foram submetidas para a fila!"
+echo "Job array ${ARRAY_JOB_ID} submetido (${N_TASKS} tarefas)."
 echo "Tabelão enfileirado como job ${REPORT_JOB_ID}."
-echo "Use 'squeue -u \$USER' para monitorar o andamento."
-echo "Para cancelar tudo, rode 'scancel -u \$USER'."
+echo "Use 'squeue -u \$USER' para monitorar e 'scancel ${ARRAY_JOB_ID}' para cancelar a grade."
+echo "Uma tarefa isolada: 'scancel ${ARRAY_JOB_ID}_<indice>'."
 echo "====================================================================="
 echo "Resultados por região em 'results/<MODEL>/et<N>_eta<M>/', tabelão em"
 echo "'results/<MODEL>/tabelao/' e logs em '${LOG_DIR}/'."
