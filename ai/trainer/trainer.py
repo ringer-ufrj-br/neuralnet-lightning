@@ -1,14 +1,66 @@
 import torch
-from torch.utils.data import TensorDataset, DataLoader, random_split, Subset
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Callback
 import numpy as np
 import os
 import logging
-from typing import Tuple, List, Dict, Any, Type, Optional, Union
-from sklearn.model_selection import KFold
+from typing import Iterator, Tuple, List, Dict, Any, Type, Optional, Union
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
 logger = logging.getLogger(__name__)
+
+
+class TensorBatchLoader:
+    """
+    Batch iterator over in-memory tensors that yields whole batches by fancy-indexing the
+    underlying tensors, instead of torch's DataLoader-over-TensorDataset path which fetches
+    every row individually and re-stacks 128 one-row tensors per batch in Python. For the
+    small models in this project that per-item overhead - not the forward pass - was the
+    training bottleneck. Works equally for CPU tensors and GPU-staged tensors (indexing
+    happens on whatever device the tensors live on, so nothing is copied per batch).
+    """
+
+    def __init__(
+        self,
+        X: torch.Tensor,
+        Y: torch.Tensor,
+        indices: Optional[torch.Tensor] = None,
+        batch_size: int = 128,
+        shuffle: bool = False
+    ) -> None:
+        """
+        Initializes the loader.
+
+        Args:
+            X (torch.Tensor): Feature tensor, full dataset.
+            Y (torch.Tensor): Label tensor, full dataset.
+            indices (Optional[torch.Tensor]): Row subset this loader draws from (e.g. one
+                fold's train or validation split). None uses every row.
+            batch_size (int): Rows per batch. Defaults to 128.
+            shuffle (bool): Re-shuffle the row order on every epoch. Defaults to False.
+        """
+        self.X = X
+        self.Y = Y
+        self.indices = None if indices is None else indices.to(X.device)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.n = len(X) if indices is None else len(indices)
+
+    def __len__(self) -> int:
+        return (self.n + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        if self.shuffle:
+            order = torch.randperm(self.n, device=self.X.device)
+            order = order if self.indices is None else self.indices[order]
+        else:
+            order = self.indices
+        for start in range(0, self.n, self.batch_size):
+            if order is None:
+                yield self.X[start:start + self.batch_size], self.Y[start:start + self.batch_size]
+            else:
+                sel = order[start:start + self.batch_size]
+                yield self.X[sel], self.Y[sel]
 
 def compute_pos_weight(y: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
     """
@@ -80,7 +132,8 @@ class ModelTrainer:
         accelerator: str = "auto",
         devices: Union[int, str, List[int]] = "auto",
         monitor_metric: str = "val_loss",
-        monitor_mode: str = "min"
+        monitor_mode: str = "min",
+        checkpoint_dir: Optional[str] = None
     ) -> None:
         """
         Initializes ModelTrainer instance.
@@ -91,12 +144,15 @@ class ModelTrainer:
             validation_split (float): Fraction of dataset reserved for validation in holdout. Defaults to 0.2.
             patience (int): Number of epochs with no improvement on the monitored metric before stopping. Defaults to 5.
             log_dir (str): Output directory for model checkpoints and logs. Defaults to 'lightning_logs'.
-            num_workers (int): Number of subprocesses for data loading. Defaults to 0.
+            num_workers (int): Accepted for config compatibility; unused now that batches are
+                sliced from in-memory tensors instead of assembled by worker processes. Defaults to 0.
             gradient_clip_val (Optional[float]): Value for gradient clipping. Defaults to 1.0.
             accelerator (str): PyTorch Lightning accelerator ('auto', 'cpu', 'cuda', etc.). Defaults to 'auto'.
             devices (Union[int, str, List[int]]): Devices to use ('auto', 1, [0], etc.). Defaults to 'auto'.
             monitor_metric (str): Logged metric name used by EarlyStopping/ModelCheckpoint. Defaults to 'val_loss'.
             monitor_mode (str): 'min' or 'max', matching the monitored metric's improvement direction. Defaults to 'min'.
+            checkpoint_dir (Optional[str]): Directory where the best checkpoint of each fold is
+                written under a fixed, predictable name. Defaults to log_dir.
         """
         self.max_epochs = max_epochs
         self.batch_size = batch_size
@@ -109,6 +165,7 @@ class ModelTrainer:
         self.devices = devices
         self.monitor_metric = monitor_metric
         self.monitor_mode = monitor_mode
+        self.checkpoint_dir = checkpoint_dir or log_dir
 
     def _select_gpu_device(self) -> Optional[torch.device]:
         """
@@ -126,24 +183,23 @@ class ModelTrainer:
             return None
         return torch.device("cuda")
 
-    def _stage_dataset(self, X: torch.Tensor, Y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    def _stage_dataset(self, X: torch.Tensor, Y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         If the whole (X, Y) tensor pair comfortably fits in free GPU memory, moves it there
-        once so DataLoader batches are already GPU-resident and never need a per-step
+        once so TensorBatchLoader slices are already GPU-resident and never need a per-step
         host-to-device copy - the CPU stops being the bottleneck for small/medium datasets.
-        Falls back to CPU tensors (used with DataLoader's normal per-batch transfer) otherwise.
+        Falls back to CPU tensors (transferred per batch by Lightning) otherwise.
 
         Args:
             X (torch.Tensor): Feature tensor.
             Y (torch.Tensor): Label tensor.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, int]: (X, Y, num_workers) - num_workers is forced
-            to 0 when data is GPU-resident, since CUDA tensors can't be shared with worker processes.
+            Tuple[torch.Tensor, torch.Tensor]: (X, Y), possibly GPU-resident.
         """
         device = self._select_gpu_device()
         if device is None:
-            return X, Y, self.num_workers
+            return X, Y
 
         dataset_bytes = X.element_size() * X.nelement() + Y.element_size() * Y.nelement()
         free_bytes, _ = torch.cuda.mem_get_info()
@@ -154,40 +210,62 @@ class ModelTrainer:
                 f"↔️ Dataset ({dataset_bytes / 1e6:.0f}MB) too large to keep GPU-resident "
                 f"({free_bytes / 1e6:.0f}MB free) — batches will transfer per-step instead."
             )
-            return X, Y, self.num_workers
+            return X, Y
 
         logger.info(f"🚀 Staging full dataset ({dataset_bytes / 1e6:.0f}MB) on {device} — no per-batch host-to-device copy.")
-        return X.to(device), Y.to(device), 0
+        return X.to(device), Y.to(device)
 
     def _build_trainer(
         self,
         model: pl.LightningModule,
         log_dir: str,
+        checkpoint_dir: Optional[str] = None,
+        checkpoint_name: Optional[str] = None,
         extra_callbacks: Optional[List[Callback]] = None
     ) -> Tuple[pl.Trainer, LossHistoryCallback]:
         """
         Builds a pl.Trainer with the standard EarlyStopping/ModelCheckpoint/loss-history
         callbacks, monitoring self.monitor_metric. Shared by all fit*/fit_kfold* variants.
 
+        When `checkpoint_name` is given, the best checkpoint is written to a **fixed** path
+        (`<checkpoint_dir>/<checkpoint_name>.ckpt`) instead of one carrying the epoch and the
+        metric value. save_top_k=1 only prunes within a single run, so metric-in-the-name files
+        from earlier runs used to pile up in the same directory with no way for a later
+        evaluation step to tell which one was current.
+
         Args:
             model (pl.LightningModule): Model instance (used for checkpoint filename prefix).
-            log_dir (str): Directory for checkpoints/logs.
+            log_dir (str): Directory for logs.
+            checkpoint_dir (Optional[str]): Directory for the checkpoint. Defaults to log_dir.
+            checkpoint_name (Optional[str]): Stem of the checkpoint file, without extension.
             extra_callbacks (Optional[List[Callback]]): Additional callbacks to append (e.g. SetEpochCallback).
 
         Returns:
             Tuple[pl.Trainer, LossHistoryCallback]: The configured trainer and its loss-history callback.
         """
         os.makedirs(log_dir, exist_ok=True)
+        checkpoint_dir = checkpoint_dir or log_dir
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        if checkpoint_name is not None:
+            filename = checkpoint_name
+            stale = os.path.join(checkpoint_dir, f"{checkpoint_name}.ckpt")
+            if os.path.exists(stale):
+                os.remove(stale)
+                logger.info(f"🧹 Removed stale checkpoint from a previous run: {stale}")
+        else:
+            filename = f"{model.__class__.__name__}-{{epoch:02d}}-{{{self.monitor_metric}:.4f}}"
 
         loss_callback = LossHistoryCallback()
         callbacks = [
             EarlyStopping(monitor=self.monitor_metric, patience=self.patience, mode=self.monitor_mode, verbose=True),
             ModelCheckpoint(
-                dirpath=log_dir,
+                dirpath=checkpoint_dir,
                 monitor=self.monitor_metric,
                 save_top_k=1,
                 mode=self.monitor_mode,
-                filename=f"{model.__class__.__name__}-{{epoch:02d}}-{{{self.monitor_metric}:.4f}}"
+                filename=filename,
+                auto_insert_metric_name=checkpoint_name is None
             ),
             loss_callback
         ]
@@ -204,44 +282,40 @@ class ModelTrainer:
         return trainer, loss_callback
 
     def prepare_data(
-        self, 
-        X: Union[np.ndarray, torch.Tensor], 
+        self,
+        X: Union[np.ndarray, torch.Tensor],
         Y: Union[np.ndarray, torch.Tensor]
-    ) -> Tuple[DataLoader, DataLoader, torch.Tensor]:
+    ) -> Tuple[TensorBatchLoader, TensorBatchLoader, torch.Tensor]:
         """
-        Converts feature/label inputs into PyTorch DataLoaders split into train and validation sets,
-        calculating positive class weight strictly from the training split.
+        Converts feature/label inputs into batch loaders split into train and validation sets
+        (same seeded permutation split random_split used to produce), calculating positive
+        class weight strictly from the training split.
 
         Args:
             X (Union[np.ndarray, torch.Tensor]): Input features.
             Y (Union[np.ndarray, torch.Tensor]): Target labels.
 
         Returns:
-            Tuple[DataLoader, DataLoader, torch.Tensor]: (train_loader, val_loader, pos_weight).
+            Tuple[TensorBatchLoader, TensorBatchLoader, torch.Tensor]: (train_loader, val_loader, pos_weight).
         """
         if isinstance(X, np.ndarray):
             X = torch.as_tensor(X, dtype=torch.float32)
         if isinstance(Y, np.ndarray):
             Y = torch.as_tensor(Y, dtype=torch.float32)
 
-        X, Y, num_workers = self._stage_dataset(X, Y)
-        dataset = TensorDataset(X, Y)
+        X, Y = self._stage_dataset(X, Y)
 
-        val_size = int(len(dataset) * self.validation_split)
-        train_size = len(dataset) - val_size
-
-        train_dataset, val_dataset = random_split(
-            dataset, [train_size, val_size],
-            generator=torch.Generator().manual_seed(42)
-        )
+        val_size = int(len(X) * self.validation_split)
+        train_size = len(X) - val_size
+        permutation = torch.randperm(len(X), generator=torch.Generator().manual_seed(42))
+        train_indices = permutation[:train_size]
+        val_indices = permutation[train_size:]
 
         # Calculate pos_weight strictly on the training subset
-        train_indices = train_dataset.indices
-        train_labels = Y[train_indices]
-        pos_weight = compute_pos_weight(train_labels)
+        pos_weight = compute_pos_weight(Y[train_indices.to(Y.device)])
 
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
-        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
+        train_loader = TensorBatchLoader(X, Y, train_indices, batch_size=self.batch_size, shuffle=True)
+        val_loader = TensorBatchLoader(X, Y, val_indices, batch_size=self.batch_size, shuffle=False)
 
         return train_loader, val_loader, pos_weight
 
@@ -268,7 +342,11 @@ class ModelTrainer:
         if hasattr(model, 'set_pos_weight'):
             model.set_pos_weight(pos_weight)
 
-        trainer, loss_callback = self._build_trainer(model, self.log_dir)
+        trainer, loss_callback = self._build_trainer(
+            model, self.log_dir,
+            checkpoint_dir=self.checkpoint_dir,
+            checkpoint_name="holdout"
+        )
 
         logger.info(f"🚀 Starting training for model {model.__class__.__name__}...")
         trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
@@ -283,79 +361,112 @@ class ModelTrainer:
         X: Union[np.ndarray, torch.Tensor], 
         Y: Union[np.ndarray, torch.Tensor], 
         n_splits: int = 5, 
-        target_fold: Optional[int] = None
-    ) -> Tuple[List[pl.Trainer], List[pl.LightningModule], List[LossHistoryCallback]]:
+        target_fold: Optional[int] = None,
+        seed: int = 42
+    ) -> List[Dict[str, Any]]:
         """
         Executes K-Fold cross-validation, creating a fresh model instance per fold with
         pos_weight dynamically recomputed strictly from each fold's training split.
+
+        Splits are stratified on the label so that every fold keeps the dataset's
+        signal/background proportion - with the strong class imbalance of this dataset a plain
+        KFold can hand a fold a wildly different pos_weight than its siblings, which shows up
+        as spurious spread in the cross-validation table.
 
         Args:
             model_class (Type[pl.LightningModule]): Model class to instantiate.
             model_kwargs (Dict[str, Any]): Keyword arguments for model constructor.
             X (Union[np.ndarray, torch.Tensor]): Input features.
             Y (Union[np.ndarray, torch.Tensor]): Target labels.
-            n_splits (int): Number of K-Fold splits. Defaults to 5.
+            n_splits (int): Number of K-Fold splits. Defaults to 5. Pass 1 to skip
+                cross-validation and train a single model on one stratified holdout split.
             target_fold (Optional[int]): Target fold number (1-indexed) to train individually. Defaults to None.
+            seed (int): Seed for the fold partition. Must match across parallel per-fold jobs
+                so they all see the same partition. Defaults to 42.
 
         Returns:
-            Tuple[List[pl.Trainer], List[pl.LightningModule], List[LossHistoryCallback]]: Lists of (fold_trainers, fold_models, fold_loss_callbacks).
+            List[Dict[str, Any]]: One record per trained fold with keys 'fold', 'model',
+            'trainer', 'loss_callback', 'pos_weight', 'checkpoint', 'best_score' and 'epochs'.
         """
         if isinstance(X, np.ndarray):
             X = torch.as_tensor(X, dtype=torch.float32)
         if isinstance(Y, np.ndarray):
             Y = torch.as_tensor(Y, dtype=torch.float32)
 
-        X, Y, num_workers = self._stage_dataset(X, Y)
-        dataset = TensorDataset(X, Y)
-        kfold = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-        
-        fold_trainers = []
-        fold_models = []
-        fold_loss_callbacks = []
-        
-        logger.info(f"🔁 Starting Cross-Validation with {n_splits} folds...")
-        
-        for fold, (train_ids, val_ids) in enumerate(kfold.split(dataset)):
-            if target_fold is not None and (fold + 1) != target_fold:
+        X, Y = self._stage_dataset(X, Y)
+
+        labels = Y.detach().cpu().numpy().flatten()
+
+        if n_splits < 2:
+            # n_splits=1 is the documented way to opt out of cross-validation: one model on a
+            # single stratified train/validation split. It still flows through the same fold
+            # machinery, so the artefacts, the metrics and the table are produced identically -
+            # just with a single fold and therefore a zero spread.
+            logger.info(f"🔂 n_splits={n_splits}: training a single model on one stratified "
+                        f"{self.validation_split:.0%} validation split instead of cross-validating.")
+            train_ids, val_ids = train_test_split(
+                np.arange(len(labels)), test_size=self.validation_split,
+                random_state=seed, shuffle=True, stratify=labels
+            )
+            splits = [(np.sort(train_ids), np.sort(val_ids))]
+        else:
+            kfold = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+            splits = kfold.split(np.zeros(len(labels)), labels)
+            logger.info(f"🔁 Starting Cross-Validation with {n_splits} stratified folds (seed={seed})...")
+
+        fold_records: List[Dict[str, Any]] = []
+
+        for fold, (train_ids, val_ids) in enumerate(splits):
+            fold_number = fold + 1
+            if target_fold is not None and fold_number != target_fold:
                 continue
-                
-            logger.info(f"📌 ==================== Fold {fold + 1}/{n_splits} ====================")
-            
+
+            logger.info(f"📌 ==================== Fold {fold_number}/{n_splits} ====================")
+
             # Compute pos_weight exclusively on this fold's training indices
             train_labels_fold = Y[train_ids]
             pos_weight_fold = compute_pos_weight(train_labels_fold)
-            
-            train_sub = Subset(dataset, train_ids)
-            val_sub = Subset(dataset, val_ids)
-            
-            train_loader = DataLoader(
-                train_sub,
-                batch_size=self.batch_size,
-                shuffle=True,
-                num_workers=num_workers
+
+            train_loader = TensorBatchLoader(
+                X, Y, torch.as_tensor(train_ids, dtype=torch.long),
+                batch_size=self.batch_size, shuffle=True
             )
-            val_loader = DataLoader(
-                val_sub,
-                batch_size=self.batch_size,
-                shuffle=False,
-                num_workers=num_workers
+            val_loader = TensorBatchLoader(
+                X, Y, torch.as_tensor(val_ids, dtype=torch.long),
+                batch_size=self.batch_size, shuffle=False
             )
-            
+
             # Inject pos_weight into model constructor kwargs
             current_model_kwargs = dict(model_kwargs)
             current_model_kwargs['pos_weight'] = pos_weight_fold
-            
+
             model = model_class(**current_model_kwargs)
 
-            fold_log_dir = os.path.join(self.log_dir, f"fold_{fold+1}")
-            trainer, loss_callback = self._build_trainer(model, fold_log_dir)
+            fold_log_dir = os.path.join(self.log_dir, f"fold_{fold_number}")
+            trainer, loss_callback = self._build_trainer(
+                model, fold_log_dir,
+                checkpoint_dir=self.checkpoint_dir,
+                checkpoint_name=f"fold_{fold_number}"
+            )
 
             trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-            fold_trainers.append(trainer)
-            fold_models.append(model)
-            fold_loss_callbacks.append(loss_callback)
-            
-            logger.info(f"✅ Fold {fold + 1} best model saved at: {trainer.checkpoint_callback.best_model_path}")
-            
-        logger.info(f"🎉 Cross-Validation of {n_splits} Folds completed!")
-        return fold_trainers, fold_models, fold_loss_callbacks
+
+            checkpoint_callback = trainer.checkpoint_callback
+            best_score = checkpoint_callback.best_model_score
+            fold_records.append({
+                "fold": fold_number,
+                "model": model,
+                "trainer": trainer,
+                "loss_callback": loss_callback,
+                "pos_weight": float(pos_weight_fold.item()),
+                "checkpoint": checkpoint_callback.best_model_path,
+                "best_score": float(best_score) if best_score is not None else None,
+                "epochs": int(trainer.current_epoch),
+                "n_train": int(len(train_ids)),
+                "n_val": int(len(val_ids)),
+            })
+
+            logger.info(f"✅ Fold {fold_number} best model saved at: {checkpoint_callback.best_model_path}")
+
+        logger.info(f"🎉 Training of {len(fold_records)} fold(s) completed!")
+        return fold_records

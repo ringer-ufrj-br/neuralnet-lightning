@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
-from torchmetrics import Accuracy, AUROC, Precision, Recall, F1Score, AveragePrecision
+from torchmetrics import Accuracy, AUROC, MetricCollection, Precision, Recall, F1Score, AveragePrecision
 from typing import Tuple, Any, Optional, Union
 
 from ai.evaluation.metrics import compute_pd_fa, sp_index
@@ -68,21 +68,22 @@ class ModelCNN2D(pl.LightningModule):
         # Loss Criterion
         self.criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
 
-        # Training Metrics
-        self.train_acc = Accuracy(task="binary")
-        self.train_precision = Precision(task="binary")
-        self.train_recall = Recall(task="binary")
-        self.train_f1 = F1Score(task="binary")
-        self.train_auc = AUROC(task="binary")
-        self.train_pr_auc = AveragePrecision(task="binary")
-
-        # Validation Metrics
-        self.val_acc = Accuracy(task="binary")
-        self.val_precision = Precision(task="binary")
-        self.val_recall = Recall(task="binary")
-        self.val_f1 = F1Score(task="binary")
-        self.val_auc = AUROC(task="binary")
-        self.val_pr_auc = AveragePrecision(task="binary")
+        # Epoch-level metrics, grouped in a MetricCollection so the threshold-based ones
+        # (acc/precision/recall/f1) share one confusion-matrix state and the curve-based ones
+        # (auc_roc/auc_pr) share one prediction buffer. Updated with .update() in the steps -
+        # never called directly - so nothing is computed per batch; all logging is on_epoch.
+        # Computing these per step (the previous metric(preds, y) pattern) dominated training
+        # time: AUROC alone re-sorted its whole buffer on every step of an epoch.
+        metrics = MetricCollection({
+            'acc': Accuracy(task="binary"),
+            'precision': Precision(task="binary"),
+            'recall': Recall(task="binary"),
+            'f1': F1Score(task="binary"),
+            'auc_roc': AUROC(task="binary"),
+            'auc_pr': AveragePrecision(task="binary"),
+        })
+        self.train_metrics = metrics.clone(prefix='train_')
+        self.val_metrics = metrics.clone(prefix='val_')
 
         # Buffers accumulated across validation batches to compute the epoch-level SP Index
         self._val_preds: list = []
@@ -138,22 +139,19 @@ class ModelCNN2D(pl.LightningModule):
         preds = torch.sigmoid(logits)
         y_int = y.long()
         
-        self.train_acc(preds, y_int)
-        self.train_precision(preds, y_int)
-        self.train_recall(preds, y_int)
-        self.train_f1(preds, y_int)
-        self.train_auc(preds, y_int)
-        self.train_pr_auc(preds, y_int)
-        
+        self.train_metrics.update(preds, y_int)
+
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train_acc', self.train_acc, on_step=False, on_epoch=True, prog_bar=False)
-        self.log('train_f1', self.train_f1, on_step=False, on_epoch=True, prog_bar=False)
-        self.log('train_precision', self.train_precision, on_step=False, on_epoch=True, prog_bar=False)
-        self.log('train_recall', self.train_recall, on_step=False, on_epoch=True, prog_bar=False)
-        self.log('train_auc_roc', self.train_auc, on_step=False, on_epoch=True, prog_bar=False)
-        self.log('train_auc_pr', self.train_pr_auc, on_step=False, on_epoch=True, prog_bar=False)
-        
+
         return loss
+
+    def on_train_epoch_end(self) -> None:
+        """
+        Computes and logs the accumulated training metrics once per epoch. Logging them here
+        instead of per step keeps Lightning's logging machinery out of the hot loop.
+        """
+        self.log_dict(self.train_metrics.compute())
+        self.train_metrics.reset()
 
     def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """
@@ -174,33 +172,26 @@ class ModelCNN2D(pl.LightningModule):
         preds = torch.sigmoid(logits)
         y_int = y.long()
         
-        self.val_acc(preds, y_int)
-        self.val_precision(preds, y_int)
-        self.val_recall(preds, y_int)
-        self.val_f1(preds, y_int)
-        self.val_auc(preds, y_int)
-        self.val_pr_auc(preds, y_int)
+        self.val_metrics.update(preds, y_int)
 
         self._val_preds.append(preds.detach())
         self._val_targets.append(y_int.detach())
 
         self.log('val_loss', loss, prog_bar=False)
-        self.log('val_acc', self.val_acc, prog_bar=False)
-        self.log('val_f1', self.val_f1, prog_bar=False)
-        self.log('val_precision', self.val_precision, prog_bar=False)
-        self.log('val_recall', self.val_recall, prog_bar=False)
-        self.log('val_auc_roc', self.val_auc, prog_bar=False)
-        self.log('val_auc_pr', self.val_pr_auc, prog_bar=False)
 
         return loss
 
     def on_validation_epoch_end(self) -> None:
         """
         Computes the SP Index over the full validation set at the default 0.5 decision
-        boundary. Available for EarlyStopping/ModelCheckpoint to monitor, mirroring ModelMLP.
+        boundary. Available for EarlyStopping/ModelCheckpoint to monitor, mirroring ModelMLP,
+        and logs the accumulated validation metrics for the epoch.
         """
         if not self._val_preds:
             return
+
+        self.log_dict(self.val_metrics.compute())
+        self.val_metrics.reset()
 
         preds = torch.cat(self._val_preds)
         targets = torch.cat(self._val_targets)

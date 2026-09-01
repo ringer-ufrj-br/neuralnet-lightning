@@ -61,16 +61,35 @@ class DataLoader:
         logger.info(f"📂 Found {len(files)} valid parquet files.")
         return files
 
-    def load_dataset(self, files: List[str]) -> Optional[pd.DataFrame]:
+    def scan(self, files: List[str]) -> pl.LazyFrame:
+        """
+        Builds a single lazy polars scan over the given parquet files, with the originating
+        file path attached as a 'file_path' column (labels are derived from it downstream).
+
+        Nothing is read here: callers select the columns they need and filter rows before
+        collecting, so parquet column pruning and predicate pushdown keep peak memory bound
+        by the projected result rather than the full 300+ column dataset.
+
+        Args:
+            files (List[str]): List of file paths to scan.
+
+        Returns:
+            pl.LazyFrame: Lazy frame over all files, in the given file order.
+        """
+        return pl.scan_parquet(files, include_file_paths="file_path", low_memory=True)
+
+    def load_dataset(self, files: List[str], columns: Optional[List[str]] = None) -> Optional[pd.DataFrame]:
         """
         Reads and concatenates parquet files into a single DataFrame using polars as the
-        reading/concatenation engine (single lazy scan across all files, one Arrow-native
-        concat), which avoids the per-file Python object overhead and the N-way in-memory
-        duplication that pandas' read-then-concat loop incurs. Converted to pandas at the
-        end for compatibility with the rest of the pipeline (label generation, preprocessors).
+        reading/concatenation engine (single lazy scan across all files, streamed collect),
+        which avoids the per-file Python object overhead and the N-way in-memory duplication
+        that pandas' read-then-concat loop incurs. Converted to pandas at the end for
+        compatibility with the rest of the pipeline (label generation, preprocessors).
 
         Args:
             files (List[str]): List of file paths to load.
+            columns (Optional[List[str]]): Columns to read ('file_path' is always kept).
+                None loads every column.
 
         Returns:
             Optional[pd.DataFrame]: Combined pandas DataFrame or None if empty.
@@ -80,8 +99,13 @@ class DataLoader:
             return None
 
         logger.info(f"📥 Reading {len(files)} parquet files via polars...")
-        df = pl.scan_parquet(files, include_file_paths="file_path", low_memory=True).collect().to_pandas()
-        return df
+        lf = self.scan(files)
+        if columns is not None:
+            keep = list(dict.fromkeys(columns))
+            if "file_path" not in keep:
+                keep.append("file_path")
+            lf = lf.select(keep)
+        return lf.collect(engine="streaming").to_pandas()
 
     def execute(self) -> Optional[pd.DataFrame]:
         """

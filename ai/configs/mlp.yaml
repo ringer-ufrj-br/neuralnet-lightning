@@ -2,12 +2,14 @@ model: "MLP"
 data_path: data/parquet/
 label_col: "label"
 max_epochs: 50
-batch_size: 128
+batch_size: 1024            # mesmo batch do treino ringer legado em TF (share/legacy_code)
 learning_rate: 0.001
 patience: 8
 num_workers: 0
 threshold: 0.8
-use_kfold: true
+max_files: 100
 n_splits: 5
 test_size: 0.15
 accelerator: "auto"
+seed: 42                    # semente do holdout e da partição de folds; precisa ser a mesma
+                            # entre jobs paralelos de fold para todos verem o mesmo split

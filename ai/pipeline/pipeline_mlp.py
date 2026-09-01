@@ -1,241 +1,58 @@
-import os
-import sys
-import torch
-import numpy as np
 import logging
-from typing import Optional, Union, Tuple, List, Any
-from sklearn.model_selection import train_test_split
+from typing import Any, Dict, List
+
+import numpy as np
+
+from ai.pipeline.base import BasePipeline
+from ai.preprocess.mlp import PreprocessMLP
+from ai.models.mlp import ModelMLP
 
 logger = logging.getLogger(__name__)
 
-# Ensure root directory is in path for imports
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from ai.loader.loader import DataLoader
-from ai.label.label_generator import LabelGenerator
-from ai.preprocess.mlp import PreprocessMLP
-from ai.models.mlp import ModelMLP
-from ai.trainer.trainer import ModelTrainer
-from ai.evaluation.monitor import ModelMonitor
-from ai.evaluation.summary import ModelSummary
-from ai.binning.kinematics import et_bin_index, eta_bin_index, bin_label, bin_description, N_ET_BINS, N_ETA_BINS
-
-class PipelineMLP:
+class PipelineMLP(BasePipeline):
     """
-    End-to-end training and evaluation pipeline for MLP models using weighted loss.
+    Training and evaluation pipeline for the ring-based MLP.
+
+    Everything structural lives in BasePipeline; this class only declares which model and
+    preprocessor to use and how the architecture's input dimension is derived from the data.
     """
 
-    def __init__(
-        self, 
-        data_path: Optional[str] = None, 
-        max_files: Optional[int] = None, 
-        label_col: str = 'label', 
-        model_name: str = "MLP", 
-        max_epochs: int = 20, 
-        batch_size: int = 32, 
-        patience: int = 5,
-        num_workers: int = 0,
-        accelerator: str = "auto",
-        devices: Union[int, str, List[int]] = "auto",
-        et_bin: Optional[int] = None,
-        eta_bin: Optional[int] = None
-    ) -> None:
+    model_class = ModelMLP
+
+    def build_preprocessor(self) -> PreprocessMLP:
         """
-        Initializes PipelineMLP instance.
-
-        Args:
-            data_path (Optional[str]): Data folder or pattern path.
-            max_files (Optional[int]): Maximum number of files to process per folder.
-            label_col (str): Column name containing labels. Defaults to 'label'.
-            model_name (str): Model name for logging and results folder. Defaults to 'MLP'.
-            max_epochs (int): Maximum training epochs. Defaults to 20.
-            batch_size (int): Training batch size. Defaults to 32.
-            patience (int): Early stopping patience. Defaults to 5.
-            num_workers (int): Parallel worker subprocesses. Defaults to 0.
-            accelerator (str): PyTorch Lightning accelerator ('auto', 'cpu', 'cuda'). Defaults to 'auto'.
-            devices (Union[int, str, List[int]]): Devices specification. Defaults to 'auto'.
-            et_bin (Optional[int]): Et bin index (0-4, see ai.binning.kinematics). Trains on the
-                whole dataset when None (together with eta_bin) or on only that kinematic slice
-                when both are set - the standard 5x5=25-network Ringer scheme. Defaults to None.
-            eta_bin (Optional[int]): |eta| bin index (0-4). Defaults to None.
-        """
-        if (et_bin is None) != (eta_bin is None):
-            raise ValueError("❌ et_bin and eta_bin must be set together (or both left as None).")
-
-        self.model_name = model_name
-        self.label_col = label_col
-        self.et_bin = et_bin
-        self.eta_bin = eta_bin
-
-        self.results_dir = os.path.join("results", self.model_name)
-        if et_bin is not None:
-            self.results_dir = os.path.join(self.results_dir, bin_label(et_bin, eta_bin))
-            logger.info(f"🎯 Kinematic bin selected: {bin_description(et_bin, eta_bin)}")
-
-        self.loader = DataLoader(data_path=data_path, max_files=max_files)
-        self.preprocessor = PreprocessMLP()
-        
-        self.trainer = ModelTrainer(
-            max_epochs=max_epochs,
-            batch_size=batch_size,
-            patience=patience,
-            num_workers=num_workers,
-            log_dir=os.path.join(self.results_dir, "lightning_logs"),
-            accelerator=accelerator,
-            devices=devices,
-            monitor_metric="val_sp",
-            monitor_mode="max"
-        )
-        
-        self.monitor = ModelMonitor(output_dir=os.path.join(self.results_dir, "plots"))
-        self.summary = ModelSummary(output_dir=os.path.join(self.results_dir, "metrics"))
-
-    def evaluate_model(
-        self, 
-        model: torch.nn.Module, 
-        X_test: np.ndarray, 
-        Y_test: np.ndarray, 
-        threshold: float = 0.5, 
-        suffix: str = "",
-        loss_callback: Optional[Any] = None
-    ) -> None:
-        """
-        Evaluates trained model on unseen test dataset and generates metric reports/plots.
-
-        Args:
-            model (torch.nn.Module): Trained model module.
-            X_test (np.ndarray): Test feature matrix.
-            Y_test (np.ndarray): Test true labels array.
-            threshold (float): Classification decision threshold. Defaults to 0.5.
-            suffix (str): Filename suffix for evaluation reports. Defaults to ''.
-            loss_callback (Optional[Any]): Loss history callback. Defaults to None.
+        Builds the ring-selection + log1p + StandardScaler preprocessor.
 
         Returns:
-            None
+            PreprocessMLP: A fresh, unfitted preprocessor.
         """
-        suffix_print = f" ({suffix})" if suffix else ""
-        logger.info(f"📊 Step 4: Evaluating model {self.model_name} (Threshold={threshold}){suffix_print}...")
-        
-        model.eval()
-        with torch.no_grad():
-            X_tensor = torch.as_tensor(X_test, dtype=torch.float32)
-            logits = model(X_tensor)
-            y_prob = torch.sigmoid(logits).cpu().numpy().flatten()
-            
-        y_true = Y_test.flatten()
-        y_pred = (y_prob >= threshold).astype(int)
-        
-        file_suffix = f"_{suffix}" if suffix else ""
-        
-        pos_weight_val = None
-        if hasattr(model, 'pos_weight') and model.pos_weight is not None:
-            pos_weight_val = float(model.pos_weight.item())
-        
-        logger.info(f"📝 Saving CSV metrics to {self.summary.output_dir}...")
-        self.summary.save_metrics(
-            y_true, y_prob,
-            threshold=threshold,
-            pos_weight=pos_weight_val,
-            filename=f"test_metrics{file_suffix}.csv"
-        )
+        return PreprocessMLP()
 
-        logger.info("🎯 Computing operating points (Tight/Medium/Loose)...")
-        operating_points = self.summary.save_operating_points(
-            y_true, y_prob,
-            filename=f"operating_points{file_suffix}.csv"
-        )
-        for point in operating_points:
-            logger.info(
-                f"   {point['Operating_Point']:<7} PD={point['PD']:.4f} (target {point['Target_PD']:.2f}) "
-                f"-> FA={point['FA']:.4f}, SP={point['SP_Index']:.4f}, threshold={point['Threshold']:.4f}"
-            )
-
-        logger.info(f"🖼️ Saving evaluation plots to {self.monitor.output_dir}...")
-        self.monitor.plot_roc_curve(y_true, y_prob, filename=f"roc_curve{file_suffix}.pdf", operating_points=operating_points)
-        self.monitor.plot_pr_curve(y_true, y_prob, filename=f"pr_curve{file_suffix}.pdf")
-        self.monitor.plot_confusion_matrix(y_true, y_pred, filename=f"confusion_matrix{file_suffix}.pdf")
-        
-        if loss_callback is not None:
-            self.monitor.plot_loss(loss_callback.train_loss, loss_callback.val_loss, filename=f"loss_curve{file_suffix}.pdf")
-            
-        logger.info(f"✅ Evaluation complete{suffix_print}!")
-
-    def run(
-        self,
-        use_kfold: bool = False,
-        n_splits: int = 5,
-        test_size: float = 0.15,
-        learning_rate: float = 0.001,
-        threshold: float = 0.5,
-        target_fold: Optional[int] = None
-    ) -> Optional[Union[Tuple[ModelMLP, Any], Tuple[List[Any], List[ModelMLP]]]]:
+    def required_columns(self, available: List[str]) -> List[str]:
         """
-        Executes end-to-end pipeline (loading, preprocessing, split, training with weighted loss, evaluation).
+        Restricts the parquet scan to the 50 selected ring columns (resolving the
+        cl_ring_*/cl_truth_ring_* family up front from the schema), which is what keeps a
+        full-dataset MLP run within memory.
 
         Args:
-            use_kfold (bool): Whether to use K-Fold cross-validation. Defaults to False.
-            n_splits (int): Number of K-Fold splits. Defaults to 5.
-            test_size (float): Holdout test dataset ratio. Defaults to 0.15.
-            learning_rate (float): Model learning rate. Defaults to 0.001.
-            threshold (float): Decision threshold. Defaults to 0.5.
-            target_fold (Optional[int]): Target fold index for isolated fold run. Defaults to None.
+            available (List[str]): Column names present in the dataset files.
 
         Returns:
-            Optional[Union[Tuple[ModelMLP, Any], Tuple[List[Any], List[ModelMLP]]]]: Model and trainer objects or None if data loading fails.
+            List[str]: The ring columns this model trains on.
         """
-        logger.info(f"🚀 Starting Pipeline: {self.model_name}")
+        return self.preprocessor.resolve_from_available(available)
 
-        logger.info("📂 Step 1: Loading dataset...")
-        df = self.loader.execute()
+    def build_model_kwargs(self, X: np.ndarray) -> Dict[str, Any]:
+        """
+        Derives the MLP input dimension from the preprocessed feature matrix.
 
-        if df is None or df.empty:
-            logger.error("❌ No data was loaded.")
-            return None
+        Args:
+            X (np.ndarray): Preprocessed training features, shape (N, n_features).
 
-        logger.info("🏷️ Step 1.5: Generating labels...")
-        df = LabelGenerator.apply_label(df, file_path_col='file_path', label_col=self.label_col)
-        df.drop(columns=['file_path'], inplace=True)
-
-        if self.et_bin is not None:
-            logger.info(f"✂️ Step 1.6: Restricting to kinematic bin {bin_label(self.et_bin, self.eta_bin)} "
-                        f"({bin_description(self.et_bin, self.eta_bin)})...")
-            in_bin = (et_bin_index(df['cl_et'].values) == self.et_bin) & \
-                     (eta_bin_index(df['cl_eta'].values) == self.eta_bin)
-            df = df[in_bin]
-            logger.info(f"   {len(df)} rows remain in this bin.")
-            if df.empty:
-                logger.error("❌ No data remaining after kinematic binning.")
-                return None
-
-        logger.info("⚙️ Step 2: Preprocessing features...")
-        X = self.preprocessor.transform(df)
-        Y = self.preprocessor.get_labels(df, label_col=self.label_col)
-
-        if Y is None:
-            logger.error("❌ Labels column not found.")
-            return None
-
-        logger.info(f"✂️ Splitting {test_size * 100}% data for holdout testing...")
-        X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=test_size, random_state=42, shuffle=True)
-
-        input_dim = X.shape[1]
-        logger.info(f"🏋️ Step 3: Training (input_dim={input_dim}, K-Fold={use_kfold}, Weighted Loss Enabled)...")
-
-        if use_kfold:
-            model_kwargs = {'learning_rate': learning_rate, 'input_dim': input_dim}
-            fold_trainers, fold_models, fold_loss_callbacks = self.trainer.fit_kfold(
-                ModelMLP, model_kwargs, X_train, Y_train,
-                n_splits=n_splits, target_fold=target_fold
-            )
-            logger.info("📢 Generating visual evaluation per trained fold...")
-            for i, (model, loss_callback) in enumerate(zip(fold_models, fold_loss_callbacks)):
-                fold_idx = target_fold if target_fold is not None else (i + 1)
-                self.evaluate_model(model, X_test, Y_test, threshold=threshold, suffix=f"fold_{fold_idx}", loss_callback=loss_callback)
-            return fold_trainers, fold_models
-        else:
-            model = ModelMLP(learning_rate=learning_rate, input_dim=input_dim)
-            trained_trainer, loss_callback = self.trainer.fit(model, X_train, Y_train)
-
-            self.evaluate_model(model, X_test, Y_test, threshold=threshold, loss_callback=loss_callback)
-            return model, trained_trainer
-
+        Returns:
+            Dict[str, Any]: {'input_dim': n_features}.
+        """
+        input_dim = int(X.shape[1])
+        logger.info(f"📐 Model input dimension: {input_dim}")
+        return {"input_dim": input_dim}
