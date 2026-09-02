@@ -4,11 +4,20 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Callback
 import glob
 import numpy as np
 import os
+import sys
 import logging
 from typing import Iterator, Tuple, List, Dict, Any, Type, Optional, Union
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
 logger = logging.getLogger(__name__)
+
+# tqdm repaints its bar with a carriage return: a terminal overwrites the line in place, but a
+# redirected log keeps every repaint, and Lightning re-announces its banners on every fit. Off
+# the terminal both are dropped and LossHistoryCallback prints one line per epoch instead.
+_INTERACTIVE = sys.stderr.isatty()
+if not _INTERACTIVE:
+    for _noisy in ("pytorch_lightning", "lightning_fabric"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 class TensorBatchLoader:
@@ -107,9 +116,10 @@ def compute_pos_weight(y: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
 
 
 class LossHistoryCallback(Callback):
-    """Callback to store training and validation loss history."""
-    def __init__(self):
+    """Stores the loss history, and off the terminal logs the line replacing the progress bar."""
+    def __init__(self, monitor_metric: str = "val_sp"):
         super().__init__()
+        self.monitor_metric = monitor_metric
         self.train_loss = []
         self.val_loss = []
 
@@ -120,6 +130,12 @@ class LossHistoryCallback(Callback):
             loss = metrics.get('train_loss')
         if loss is not None:
             self.train_loss.append(loss.item())
+
+        # Runs after on_validation_epoch_end, so this epoch's validation metrics are in hand too.
+        if not _INTERACTIVE:
+            shown = ('train_loss_epoch', 'val_loss', self.monitor_metric)
+            logger.info(f"   epoch {trainer.current_epoch} | " + " | ".join(
+                f"{name}={metrics[name].item():.6f}" for name in shown if name in metrics))
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
@@ -258,7 +274,7 @@ class ModelTrainer:
             os.remove(stale)
             logger.info(f"🧹 Removed stale checkpoint from a previous run: {stale}")
 
-        loss_callback = LossHistoryCallback()
+        loss_callback = LossHistoryCallback(self.monitor_metric)
         trainer = pl.Trainer(
             max_epochs=self.max_epochs,
             callbacks=[
@@ -277,7 +293,9 @@ class ModelTrainer:
             accelerator=self.accelerator,
             devices=self.devices,
             default_root_dir=log_dir,
-            gradient_clip_val=self.gradient_clip_val
+            gradient_clip_val=self.gradient_clip_val,
+            enable_progress_bar=_INTERACTIVE,
+            enable_model_summary=_INTERACTIVE
         )
         return trainer, loss_callback
 
