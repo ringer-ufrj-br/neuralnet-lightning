@@ -1,4 +1,4 @@
-from typing import Tuple, TypeVar
+from typing import TypeVar
 
 import numpy as np
 import torch
@@ -29,28 +29,40 @@ def sp_index(pd: Number, fa: Number) -> Number:
     return ((pd * (1 - fa)) ** 0.5 * (pd + 1 - fa) / 2) ** 0.5
 
 
-def compute_pd_fa(preds: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5) -> Tuple[torch.Tensor, torch.Tensor]:
+def max_sp_index(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """
-    Computes PD (recall) and FA (false positive rate) from predicted probabilities and
-    binary targets at a fixed decision threshold. Shared by every LightningModule that
-    monitors the SP Index during validation (see ModelMLP/ModelCNN2D.on_validation_epoch_end).
+    Highest SP Index reachable over every decision threshold ("maximo do indice SP", the
+    NeuralRinger stopping criterion), rather than SP at one arbitrary cut: with the class
+    imbalance of this dataset and a pos_weight-weighted loss, the best operating point is
+    nowhere near 0.5, so a fixed cut ranks epochs by where their scores happen to sit instead
+    of by how separable the two classes are.
+
+    Sweeps the thresholds the ROC visits - one per distinct score, so a cut never splits a
+    group of equal scores - and returns the best SP among them.
 
     Args:
         preds (torch.Tensor): Predicted probabilities (post-sigmoid), any shape.
         targets (torch.Tensor): Binary ground-truth labels, same shape as preds.
-        threshold (float): Decision threshold applied to preds. Defaults to 0.5.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: (pd, fa) scalar tensors.
+        torch.Tensor: Scalar best SP Index, 0 when either class is absent.
     """
-    y_pred = (preds >= threshold).long()
-    y_true = targets.long()
+    scores = preds.flatten()
+    y = targets.flatten().long()
 
-    tp = ((y_pred == 1) & (y_true == 1)).sum().float()
-    fn = ((y_pred == 0) & (y_true == 1)).sum().float()
-    fp = ((y_pred == 1) & (y_true == 0)).sum().float()
-    tn = ((y_pred == 0) & (y_true == 0)).sum().float()
+    n_pos = int((y == 1).sum())
+    n_neg = y.numel() - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return torch.zeros((), dtype=torch.float32, device=preds.device)
 
-    pd_rate = tp / (tp + fn) if (tp + fn) > 0 else torch.zeros_like(tp)
-    fa_rate = fp / (fp + tn) if (fp + tn) > 0 else torch.zeros_like(fp)
-    return pd_rate, fa_rate
+    order = torch.argsort(scores, descending=True)
+    scores, y = scores[order], y[order]
+
+    pd_rate = torch.cumsum(y, 0).float() / n_pos
+    fa_rate = torch.cumsum(1 - y, 0).float() / n_neg
+
+    # Keep only the last row of each run of equal scores: those are the reachable cuts.
+    reachable = torch.ones_like(scores, dtype=torch.bool)
+    reachable[:-1] = scores[1:] != scores[:-1]
+
+    return sp_index(pd_rate[reachable], fa_rate[reachable]).max()

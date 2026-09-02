@@ -7,7 +7,7 @@ import pytorch_lightning as pl
 from torchmetrics import Accuracy, AUROC, MetricCollection, Precision, Recall, F1Score, AveragePrecision
 from typing import Tuple, Any, Dict, Optional, Union
 
-from ai.evaluation.metrics import compute_pd_fa, sp_index
+from ai.evaluation.metrics import max_sp_index
 
 
 class BaseBinaryClassifier(pl.LightningModule):
@@ -278,9 +278,9 @@ class BaseBinaryClassifier(pl.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         """
-        Logs the epoch's validation metrics and the SP Index
-        (sqrt(sqrt(pd*(1-fa)) * (pd+1-fa)/2)) over the full validation set at the 0.5 decision
-        boundary. `val_sp` is what EarlyStopping and ModelCheckpoint monitor.
+        Logs the epoch's validation metrics and the SP Index maximised over every decision
+        threshold on the full validation set. `val_sp` is what EarlyStopping and
+        ModelCheckpoint monitor.
         """
         if not self._val_preds:
             return
@@ -290,8 +290,7 @@ class BaseBinaryClassifier(pl.LightningModule):
 
         preds = torch.cat(self._val_preds)
         targets = torch.cat(self._val_targets)
-        pd_rate, fa_rate = compute_pd_fa(preds, targets)
-        self.log('val_sp', sp_index(pd_rate, fa_rate), prog_bar=True)
+        self.log('val_sp', max_sp_index(preds, targets), prog_bar=True)
 
         self._val_preds.clear()
         self._val_targets.clear()

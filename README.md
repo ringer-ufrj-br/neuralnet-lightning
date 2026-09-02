@@ -441,7 +441,7 @@ $$\text{pos\_weight} = \frac{N_{\text{negativos}}}{N_{\text{positivos}}}$$
 
 ### 2. Métricas para dados desbalanceados
 
-Precision/Recall/F1, AUC-ROC, AUC-PR e o **SP Index** (`sqrt(sqrt(pd*(1-fa)) * (pd+1-fa)/2)`), que é a métrica monitorada pelo Early Stopping e pelo ModelCheckpoint.
+Precision/Recall/F1, AUC-ROC, AUC-PR e o **SP Index** (`sqrt(sqrt(pd*(1-fa)) * (pd+1-fa)/2)`) maximizado sobre todos os limiares de decisão, que é a métrica monitorada pelo Early Stopping e pelo ModelCheckpoint.
 
 ### 3. Normalização da entrada
 

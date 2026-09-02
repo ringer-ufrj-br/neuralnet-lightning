@@ -159,7 +159,7 @@ class ModelTrainer:
         validation_split: float = 0.2, 
         patience: int = 5, 
         log_dir: str = "lightning_logs", 
-        gradient_clip_val: Optional[float] = 1.0,
+        gradient_clip_val: Optional[float] = None,
         accelerator: str = "auto",
         devices: Union[int, str, List[int]] = "auto",
         monitor_metric: str = "val_loss",
@@ -175,7 +175,8 @@ class ModelTrainer:
             validation_split (float): Fraction of dataset reserved for validation in holdout. Defaults to 0.2.
             patience (int): Number of epochs with no improvement on the monitored metric before stopping. Defaults to 5.
             log_dir (str): Output directory for model checkpoints and logs. Defaults to 'lightning_logs'.
-            gradient_clip_val (Optional[float]): Value for gradient clipping. Defaults to 1.0.
+            gradient_clip_val (Optional[float]): Value for gradient clipping. Defaults to None,
+                matching the reference training, which does not clip.
             accelerator (str): PyTorch Lightning accelerator ('auto', 'cpu', 'cuda', etc.). Defaults to 'auto'.
             devices (Union[int, str, List[int]]): Devices to use ('auto', 1, [0], etc.). Defaults to 'auto'.
             monitor_metric (str): Logged metric name used by EarlyStopping/ModelCheckpoint. Defaults to 'val_loss'.
