@@ -1,6 +1,6 @@
 import numpy as np
 import polars as pl
-from typing import List, Optional, Tuple
+from typing import List
 
 # Et bin edges in GeV (lower edge of each bin; the last bin is open-ended). `cl_et` in the
 # dataset is stored in MeV, so callers must convert (this module does it internally).
@@ -88,11 +88,6 @@ def bin_description(et_bin: int, eta_bin: int) -> str:
     eta_lo = ETA_BIN_EDGES[eta_bin]
     eta_hi = ETA_BIN_EDGES[eta_bin + 1]
     return f"Et in [{et_lo:g}, {et_hi:g}) GeV, |eta| in [{eta_lo:.2f}, {eta_hi:.2f})"
-
-
-def all_bins() -> List[Tuple[int, int]]:
-    """All 25 (et_bin, eta_bin) index pairs."""
-    return [(et, eta) for et in range(N_ET_BINS) for eta in range(N_ETA_BINS)]
 
 
 def et_range_str(et_bin: int, latex: bool = False) -> str:

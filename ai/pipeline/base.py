@@ -87,6 +87,9 @@ class BasePipeline:
     #: Preprocessor class for this architecture (a BasePreprocessor subclass).
     preprocessor_class: Type[Any]
 
+    #: Registry name, set by @register_pipeline. Also the results/<NAME>/ directory.
+    model_name: str = "Model"
+
     #: Metric monitored by EarlyStopping/ModelCheckpoint, and its improvement direction.
     monitor_metric: str = "val_sp"
     monitor_mode: str = "max"
@@ -96,11 +99,9 @@ class BasePipeline:
         data_path: Optional[str] = None,
         max_files: Optional[int] = None,
         label_col: str = 'label',
-        model_name: str = "Model",
         max_epochs: int = 20,
         batch_size: int = 32,
         patience: int = 5,
-        num_workers: int = 0,
         accelerator: str = "auto",
         devices: Union[int, str, List[int]] = "auto",
         et_bin: Optional[int] = None,
@@ -113,11 +114,9 @@ class BasePipeline:
             data_path (Optional[str]): Data folder or pattern path.
             max_files (Optional[int]): Maximum number of files to process per folder.
             label_col (str): Column name containing labels. Defaults to 'label'.
-            model_name (str): Model name for logging and results folder.
             max_epochs (int): Maximum training epochs. Defaults to 20.
             batch_size (int): Training batch size. Defaults to 32.
             patience (int): Early stopping patience. Defaults to 5.
-            num_workers (int): Parallel worker subprocesses. Defaults to 0.
             accelerator (str): PyTorch Lightning accelerator ('auto', 'cpu', 'cuda'). Defaults to 'auto'.
             devices (Union[int, str, List[int]]): Devices specification. Defaults to 'auto'.
             et_bin (Optional[int]): Et bin index (0-4, see ai.binning.kinematics). Trains on the
@@ -131,7 +130,6 @@ class BasePipeline:
         if (et_bin is None) != (eta_bin is None):
             raise ValueError("❌ et_bin and eta_bin must be set together (or both left as None).")
 
-        self.model_name = model_name
         self.label_col = label_col
         self.data_path = data_path
         self.max_files = max_files
@@ -157,7 +155,6 @@ class BasePipeline:
             max_epochs=max_epochs,
             batch_size=batch_size,
             patience=patience,
-            num_workers=num_workers,
             log_dir=os.path.join(self.results_dir, "lightning_logs"),
             checkpoint_dir=self.checkpoints_dir,
             accelerator=accelerator,

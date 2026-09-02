@@ -32,7 +32,6 @@ A separação existe para que **re-avaliar não exija retreinar**: recortar pont
   - `ai/models/`: as arquiteturas em si.
   - `ai/preprocess/base.py`: `BasePreprocessor`, a base dos preprocessadores.
   - `ai/preprocess/`: preprocessadores de cada arquitetura.
-  - `ai/_template_architecture.py`: esqueleto comentado para escrever uma arquitetura nova.
   - `ai/evaluation/`: métricas, gráficos e o construtor do tabelão (`tabelao.py`).
   - `ai/binning/kinematics.py`: bins de $E_T$ e $|\eta|$ (grade 5×5 = 25 redes).
 - **`ai/configs/*.yaml`**: configurações e hiperparâmetros de cada experimento.
@@ -197,7 +196,7 @@ Saída em `results/<MODEL>/tabelao/` para um modelo só, e em `results/compariso
 quando há mais de um.
 
 > Para a comparação ser justa, os YAMLs dos modelos comparados precisam concordar em
-> `data_path`, `max_files`, `test_size` e `seed` — é isso que garante que todos foram
+> `data_path`, `max_files`, `n_splits` e `seed` — é isso que garante que todos foram
 > avaliados exatamente sobre as mesmas linhas de teste. O `report` compara as contagens de
 > sinal/ruído das linhas avaliadas de cada modelo por região e avisa se elas divergirem.
 
@@ -281,9 +280,7 @@ Uma arquitetura nova são **três arquivos curtos**. Todo o resto — k-fold, bi
 cinemático, batching, métricas, índice SP, EarlyStopping, checkpoints, scoring, gráficos,
 tabelão e a grade SLURM — já vem pronto e funciona igual para qualquer modelo.
 
-Use [`ai/_template_architecture.py`](ai/_template_architecture.py) como ponto de partida: ele
-traz as três classes comentadas, indicando em qual arquivo cada uma vai. O exemplo abaixo cria
-uma rede chamada `MinhaRede`.
+O exemplo abaixo cria uma rede chamada `MinhaRede`.
 
 ### 1. O modelo — `ai/models/minha_rede.py`
 

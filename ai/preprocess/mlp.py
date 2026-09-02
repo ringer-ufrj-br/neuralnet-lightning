@@ -1,8 +1,6 @@
-import os
 import numpy as np
 import pandas as pd
 import logging
-import joblib
 from typing import Optional, List
 
 from ai.preprocess.base import BasePreprocessor
@@ -184,7 +182,7 @@ class PreprocessMLP(BasePreprocessor):
             return df[label_col].values.astype(np.float32)
 
         # Fallback check for common label column names
-        for fallback in ['label', 'has_truth_clus', 'target']:
+        for fallback in ['has_truth_clus', 'target']:
             if fallback in df.columns:
                 logger.info(f"ℹ️ Label column '{label_col}' not found, using fallback column '{fallback}'.")
                 return df[fallback].values.astype(np.float32)

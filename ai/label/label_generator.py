@@ -1,6 +1,5 @@
 import pandas as pd
 import polars as pl
-import os
 import logging
 from typing import List
 

@@ -132,8 +132,8 @@ class LossHistoryCallback(Callback):
 
 class ModelTrainer:
     """
-    Generic PyTorch Lightning Trainer manager supporting single-holdout and K-Fold cross-validation
-    with dynamic positive class weighting (weighted loss).
+    Runs stratified K-Fold cross-validation, recomputing the positive class weight
+    (weighted loss) from each fold's own training split.
     """
 
     def __init__(
@@ -143,7 +143,6 @@ class ModelTrainer:
         validation_split: float = 0.2, 
         patience: int = 5, 
         log_dir: str = "lightning_logs", 
-        num_workers: int = 0,
         gradient_clip_val: Optional[float] = 1.0,
         accelerator: str = "auto",
         devices: Union[int, str, List[int]] = "auto",
@@ -160,8 +159,6 @@ class ModelTrainer:
             validation_split (float): Fraction of dataset reserved for validation in holdout. Defaults to 0.2.
             patience (int): Number of epochs with no improvement on the monitored metric before stopping. Defaults to 5.
             log_dir (str): Output directory for model checkpoints and logs. Defaults to 'lightning_logs'.
-            num_workers (int): Accepted for config compatibility; unused now that batches are
-                sliced from in-memory tensors instead of assembled by worker processes. Defaults to 0.
             gradient_clip_val (Optional[float]): Value for gradient clipping. Defaults to 1.0.
             accelerator (str): PyTorch Lightning accelerator ('auto', 'cpu', 'cuda', etc.). Defaults to 'auto'.
             devices (Union[int, str, List[int]]): Devices to use ('auto', 1, [0], etc.). Defaults to 'auto'.
@@ -175,7 +172,6 @@ class ModelTrainer:
         self.validation_split = validation_split
         self.patience = patience
         self.log_dir = log_dir
-        self.num_workers = num_workers
         self.gradient_clip_val = gradient_clip_val
         self.accelerator = accelerator
         self.devices = devices
@@ -233,141 +229,56 @@ class ModelTrainer:
 
     def _build_trainer(
         self,
-        model: pl.LightningModule,
         log_dir: str,
-        checkpoint_dir: Optional[str] = None,
-        checkpoint_name: Optional[str] = None,
-        extra_callbacks: Optional[List[Callback]] = None
+        checkpoint_dir: str,
+        checkpoint_name: str
     ) -> Tuple[pl.Trainer, LossHistoryCallback]:
         """
         Builds a pl.Trainer with the standard EarlyStopping/ModelCheckpoint/loss-history
-        callbacks, monitoring self.monitor_metric. Shared by all fit*/fit_kfold* variants.
+        callbacks, monitoring self.monitor_metric.
 
-        When `checkpoint_name` is given, the best checkpoint is written to a **fixed** path
-        (`<checkpoint_dir>/<checkpoint_name>.ckpt`) instead of one carrying the epoch and the
-        metric value. save_top_k=1 only prunes within a single run, so metric-in-the-name files
-        from earlier runs used to pile up in the same directory with no way for a later
-        evaluation step to tell which one was current.
+        The best checkpoint is written to the fixed path `<checkpoint_dir>/<checkpoint_name>.ckpt`
+        rather than one carrying the epoch and the metric value: save_top_k=1 only prunes within
+        a single run, so metric-in-the-name files from earlier runs used to pile up in the same
+        directory with no way for a later evaluation step to tell which one was current.
 
         Args:
-            model (pl.LightningModule): Model instance (used for checkpoint filename prefix).
             log_dir (str): Directory for logs.
-            checkpoint_dir (Optional[str]): Directory for the checkpoint. Defaults to log_dir.
-            checkpoint_name (Optional[str]): Stem of the checkpoint file, without extension.
-            extra_callbacks (Optional[List[Callback]]): Additional callbacks to append (e.g. SetEpochCallback).
+            checkpoint_dir (str): Directory for the checkpoint.
+            checkpoint_name (str): Stem of the checkpoint file, without extension.
 
         Returns:
             Tuple[pl.Trainer, LossHistoryCallback]: The configured trainer and its loss-history callback.
         """
         os.makedirs(log_dir, exist_ok=True)
-        checkpoint_dir = checkpoint_dir or log_dir
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-        if checkpoint_name is not None:
-            filename = checkpoint_name
-            stale = os.path.join(checkpoint_dir, f"{checkpoint_name}.ckpt")
-            if os.path.exists(stale):
-                os.remove(stale)
-                logger.info(f"🧹 Removed stale checkpoint from a previous run: {stale}")
-        else:
-            filename = f"{model.__class__.__name__}-{{epoch:02d}}-{{{self.monitor_metric}:.4f}}"
+        stale = os.path.join(checkpoint_dir, f"{checkpoint_name}.ckpt")
+        if os.path.exists(stale):
+            os.remove(stale)
+            logger.info(f"🧹 Removed stale checkpoint from a previous run: {stale}")
 
         loss_callback = LossHistoryCallback()
-        callbacks = [
-            EarlyStopping(monitor=self.monitor_metric, patience=self.patience, mode=self.monitor_mode, verbose=True),
-            ModelCheckpoint(
-                dirpath=checkpoint_dir,
-                monitor=self.monitor_metric,
-                save_top_k=1,
-                mode=self.monitor_mode,
-                filename=filename,
-                auto_insert_metric_name=checkpoint_name is None
-            ),
-            loss_callback
-        ]
-        callbacks.extend(extra_callbacks or [])
-
         trainer = pl.Trainer(
             max_epochs=self.max_epochs,
-            callbacks=callbacks,
+            callbacks=[
+                EarlyStopping(monitor=self.monitor_metric, patience=self.patience,
+                              mode=self.monitor_mode, verbose=True),
+                ModelCheckpoint(
+                    dirpath=checkpoint_dir,
+                    monitor=self.monitor_metric,
+                    save_top_k=1,
+                    mode=self.monitor_mode,
+                    filename=checkpoint_name,
+                    auto_insert_metric_name=False
+                ),
+                loss_callback
+            ],
             accelerator=self.accelerator,
             devices=self.devices,
             default_root_dir=log_dir,
             gradient_clip_val=self.gradient_clip_val
         )
-        return trainer, loss_callback
-
-    def prepare_data(
-        self,
-        X: Union[np.ndarray, torch.Tensor],
-        Y: Union[np.ndarray, torch.Tensor]
-    ) -> Tuple[TensorBatchLoader, TensorBatchLoader, torch.Tensor]:
-        """
-        Converts feature/label inputs into batch loaders split into train and validation sets
-        (same seeded permutation split random_split used to produce), calculating positive
-        class weight strictly from the training split.
-
-        Args:
-            X (Union[np.ndarray, torch.Tensor]): Input features.
-            Y (Union[np.ndarray, torch.Tensor]): Target labels.
-
-        Returns:
-            Tuple[TensorBatchLoader, TensorBatchLoader, torch.Tensor]: (train_loader, val_loader, pos_weight).
-        """
-        if isinstance(X, np.ndarray):
-            X = torch.as_tensor(X, dtype=torch.float32)
-        if isinstance(Y, np.ndarray):
-            Y = torch.as_tensor(Y, dtype=torch.float32)
-
-        X, Y = self._stage_dataset(X, Y)
-
-        val_size = int(len(X) * self.validation_split)
-        train_size = len(X) - val_size
-        permutation = torch.randperm(len(X), generator=torch.Generator().manual_seed(42))
-        train_indices = permutation[:train_size]
-        val_indices = permutation[train_size:]
-
-        # Calculate pos_weight strictly on the training subset
-        pos_weight = compute_pos_weight(Y[train_indices.to(Y.device)])
-
-        train_loader = TensorBatchLoader(X, Y, train_indices, batch_size=self.batch_size, shuffle=True)
-        val_loader = TensorBatchLoader(X, Y, val_indices, batch_size=self.batch_size, shuffle=False)
-
-        return train_loader, val_loader, pos_weight
-
-    def fit(
-        self, 
-        model: pl.LightningModule, 
-        X: Union[np.ndarray, torch.Tensor], 
-        Y: Union[np.ndarray, torch.Tensor]
-    ) -> Tuple[pl.Trainer, LossHistoryCallback]:
-        """
-        Trains a PyTorch Lightning module using simple train/validation holdout.
-
-        Args:
-            model (pl.LightningModule): The PyTorch Lightning model instance.
-            X (Union[np.ndarray, torch.Tensor]): Input features.
-            Y (Union[np.ndarray, torch.Tensor]): Target labels.
-
-        Returns:
-            Tuple[pl.Trainer, LossHistoryCallback]: The trained PyTorch Lightning Trainer instance and the loss history callback.
-        """
-        logger.info("📦 Preparing DataLoaders for Holdout...")
-        train_loader, val_loader, pos_weight = self.prepare_data(X, Y)
-        
-        if hasattr(model, 'set_pos_weight'):
-            model.set_pos_weight(pos_weight)
-
-        trainer, loss_callback = self._build_trainer(
-            model, self.log_dir,
-            checkpoint_dir=self.checkpoint_dir,
-            checkpoint_name="holdout"
-        )
-
-        logger.info(f"🚀 Starting training for model {model.__class__.__name__}...")
-        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-        
-        logger.info(f"✅ Training completed! Best model saved at: {trainer.checkpoint_callback.best_model_path}")
         return trainer, loss_callback
 
     def _is_better(self, score: Optional[float], reference: Optional[float]) -> bool:
@@ -499,9 +410,7 @@ class ModelTrainer:
                 init_name = f"fold_{fold_number}" if n_inits == 1 else f"fold_{fold_number}_init_{init}"
                 init_log_dir = os.path.join(self.log_dir, init_name)
                 trainer, loss_callback = self._build_trainer(
-                    model, init_log_dir,
-                    checkpoint_dir=self.checkpoint_dir,
-                    checkpoint_name=init_name
+                    init_log_dir, self.checkpoint_dir, init_name
                 )
 
                 if n_inits > 1:
