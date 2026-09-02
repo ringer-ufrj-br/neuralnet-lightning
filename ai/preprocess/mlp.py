@@ -6,6 +6,8 @@ import joblib
 from typing import Optional, List
 from sklearn.preprocessing import StandardScaler
 
+from ai.preprocess.base import BasePreprocessor
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,7 +60,7 @@ def _selected_ring_columns(prefix: str) -> List[str]:
     return presample + em1 + em2 + em3 + had1 + had2 + had3
 
 
-class PreprocessMLP:
+class PreprocessMLP(BasePreprocessor):
     """
     Preprocessor for MLP pipeline extracting the leading half of each calorimeter layer's
     ring features (50 of 100 rings, see _selected_ring_columns) from a DataFrame, applying
@@ -88,6 +90,19 @@ class PreprocessMLP:
         self.scaler = StandardScaler() if use_scaler else None
         self.fitted_columns: Optional[List[str]] = None
         self.is_fitted = False
+
+    def required_columns(self, available: List[str]) -> List[str]:
+        """
+        The 50 selected ring columns, resolved against the dataset schema. Restricting the
+        parquet scan to these is what keeps a full-dataset MLP run within memory.
+
+        Args:
+            available (List[str]): Column names present in the dataset files.
+
+        Returns:
+            List[str]: The ring columns this model trains on.
+        """
+        return self.resolve_from_available(available)
 
     def resolve_from_available(self, available: List[str]) -> List[str]:
         """
@@ -212,52 +227,10 @@ class PreprocessMLP:
 
         return X
 
-    def fit_transform(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Fits on the given rows and transforms them in one call.
-
-        Args:
-            df (pd.DataFrame): Training rows only.
-
-        Returns:
-            np.ndarray: Processed float32 feature array.
-        """
-        return self.fit(df).transform(df)
-
-    def save(self, filepath: str) -> str:
-        """
-        Persists the fitted preprocessor so a later evaluation run reproduces the exact
-        same input transformation without touching the training data again.
-
-        Args:
-            filepath (str): Destination path (.joblib).
-
-        Returns:
-            str: The written path.
-        """
-        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-        joblib.dump(self, filepath)
-        logger.info(f"💾 Saved fitted preprocessor to: {filepath}")
-        return filepath
-
-    @staticmethod
-    def load(filepath: str) -> "PreprocessMLP":
-        """
-        Loads a preprocessor previously written by save().
-
-        Args:
-            filepath (str): Path to the .joblib file.
-
-        Returns:
-            PreprocessMLP: The restored instance.
-        """
-        preprocessor = joblib.load(filepath)
-        logger.info(f"📂 Loaded fitted preprocessor from: {filepath}")
-        return preprocessor
-
     def get_labels(self, df: pd.DataFrame, label_col: str = 'label') -> Optional[np.ndarray]:
         """
-        Extracts target labels from DataFrame.
+        Extracts target labels from DataFrame. Overrides the base only to keep the historical
+        fallback column names; everything else about persistence and labelling is inherited.
 
         Args:
             df (pd.DataFrame): Input DataFrame.

@@ -54,18 +54,16 @@ def build_pipeline(config: Dict[str, Any], args: argparse.Namespace) -> Any:
     Raises:
         ValueError: If the configured model has no pipeline.
     """
+    from ai.pipeline.registry import get_pipeline
+
     accelerator = args.accelerator or config.get("accelerator", "auto")
     devices = args.devices or config.get("devices", "auto")
     model_type = config.get("model", "CNN2D")
 
-    if model_type == "CNN2D":
-        from ai.pipeline.pipeline_cnn2d import PipelineCNN2D
-        pipeline_class = PipelineCNN2D
-    elif model_type == "MLP":
-        from ai.pipeline.pipeline_mlp import PipelineMLP
-        pipeline_class = PipelineMLP
-    else:
-        raise ValueError(f"❌ Model '{model_type}' is not supported or not implemented in pipeline.")
+    # Resolved through the registry, so adding an architecture never means editing this file:
+    # drop ai/pipeline/pipeline_<name>.py in with a @register_pipeline decorator and it is
+    # picked up automatically.
+    pipeline_class = get_pipeline(model_type)
 
     return pipeline_class(
         data_path=config.get("data_path"),

@@ -82,8 +82,11 @@ class BasePipeline:
     holdout split, cross-validation, artefact persistence, scoring and reporting - is common.
     """
 
-    #: LightningModule subclass this pipeline trains.
+    #: LightningModule subclass this pipeline trains (a BaseBinaryClassifier subclass).
     model_class: Type[pl.LightningModule]
+
+    #: Preprocessor class for this architecture (a BasePreprocessor subclass).
+    preprocessor_class: Type[Any]
 
     #: Metric monitored by EarlyStopping/ModelCheckpoint, and its improvement direction.
     monitor_metric: str = "val_sp"
@@ -172,13 +175,23 @@ class BasePipeline:
 
     def build_preprocessor(self) -> Any:
         """
-        Builds the preprocessor for this architecture. Must honour the
-        fit/transform/fit_transform/save/load/get_labels contract.
+        Builds the preprocessor for this architecture. The default instantiates
+        `preprocessor_class` with no arguments; override only if it needs constructor
+        arguments.
 
         Returns:
-            Any: A preprocessor instance.
+            Any: A fresh, unfitted preprocessor instance.
+
+        Raises:
+            NotImplementedError: If the subclass declares neither preprocessor_class nor an
+                override.
         """
-        raise NotImplementedError
+        if getattr(self, "preprocessor_class", None) is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} must set preprocessor_class or override "
+                f"build_preprocessor()."
+            )
+        return self.preprocessor_class()
 
     def build_model_kwargs(self, X: np.ndarray) -> Dict[str, Any]:
         """
@@ -206,7 +219,7 @@ class BasePipeline:
         Returns:
             Optional[List[str]]: Columns to load, or None to load every column.
         """
-        return None
+        return self.preprocessor.required_columns(available)
 
     # ------------------------------------------------------------------ data
 

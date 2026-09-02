@@ -4,10 +4,11 @@ import logging
 from typing import Tuple, Optional, List
 
 from .cnn2d import PreprocessCNN2D
+from .base import BasePreprocessor
 
 logger = logging.getLogger(__name__)
 
-class PreprocessFused:
+class PreprocessFused(BasePreprocessor):
     """
     Preprocessor for the Fused pipeline, combining ring features and calorimeter
     cell images into a single feature array.
@@ -97,3 +98,20 @@ class PreprocessFused:
             Optional[np.ndarray]: Float32 numpy array of labels or None if column not found.
         """
         return self.cells_pp.get_labels(df, label_col=label_col)
+
+    def required_columns(self, available: List[str]) -> List[str]:
+        """
+        Both branches' columns: the ring columns this model reads plus the 7 cell-image
+        columns the CNN branch needs.
+
+        Args:
+            available (List[str]): Column names present in the dataset files.
+
+        Returns:
+            List[str]: Ring columns present in the schema, plus the cell columns.
+        """
+        rings = [c for c in self.ring_columns if c in available]
+        if not rings:
+            rings = [c for c in (f"cl_truth_ring_{i}" for i in range(self.num_rings))
+                     if c in available]
+        return rings + self.cells_pp.required_columns(available)

@@ -25,9 +25,14 @@ A separação existe para que **re-avaliar não exija retreinar**: recortar pont
 - **`ai/`**: módulos de inteligência artificial.
   - `ai/run.py`: entrypoint com os subcomandos `train` / `evaluate` / `report`.
   - `ai/pipeline/base.py`: pipeline compartilhado (treino, avaliação, persistência de artefatos).
-  - `ai/pipeline/pipeline_mlp.py`, `pipeline_cnn2d.py`: só declaram modelo e preprocessador.
-  - `ai/models/`: arquiteturas das redes.
-  - `ai/preprocess/`: preprocessadores (contrato `fit`/`transform`/`save`/`load`).
+  - `ai/pipeline/registry.py`: mapeia o nome em `model:` do YAML para o pipeline correspondente.
+  - `ai/pipeline/pipeline_*.py`: ligam um modelo ao seu preprocessador.
+  - `ai/models/base.py`: `BaseBinaryClassifier`, a base de todas as arquiteturas (loss ponderada,
+    métricas, índice SP, otimizador).
+  - `ai/models/`: as arquiteturas em si.
+  - `ai/preprocess/base.py`: `BasePreprocessor`, a base dos preprocessadores.
+  - `ai/preprocess/`: preprocessadores de cada arquitetura.
+  - `ai/_template_architecture.py`: esqueleto comentado para escrever uma arquitetura nova.
   - `ai/evaluation/`: métricas, gráficos e o construtor do tabelão (`tabelao.py`).
   - `ai/binning/kinematics.py`: bins de $E_T$ e $|\eta|$ (grade 5×5 = 25 redes).
 - **`ai/configs/*.yaml`**: configurações e hiperparâmetros de cada experimento.
@@ -242,6 +247,105 @@ Cancelar a grade inteira é `scancel <id-do-array>`; uma região só é `scancel
 
 O tabelão encadeia com `--dependency=afterok`, então só dispara quando todas as tarefas do
 array terminam com sucesso.
+
+---
+
+## 🧩 Adicionando uma arquitetura
+
+Uma arquitetura nova são **três arquivos curtos**. Todo o resto — k-fold, holdout, binning
+cinemático, batching, métricas, índice SP, EarlyStopping, checkpoints, scoring, gráficos,
+tabelão e a grade SLURM — já vem pronto e funciona igual para qualquer modelo.
+
+Use [`ai/_template_architecture.py`](ai/_template_architecture.py) como ponto de partida: ele
+traz as três classes comentadas, indicando em qual arquivo cada uma vai. O exemplo abaixo cria
+uma rede chamada `MinhaRede`.
+
+### 1. O modelo — `ai/models/minha_rede.py`
+
+Herde de `BaseBinaryClassifier` e escreva apenas `build_network`, devolvendo as camadas:
+
+```python
+import torch.nn as nn
+from ai.models.base import BaseBinaryClassifier
+
+
+class ModelMinhaRede(BaseBinaryClassifier):
+    def build_network(self, input_dim: int = 100, hidden: int = 16) -> nn.Module:
+        return nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+```
+
+Não escreva `__init__` — a base monta a loss ponderada, as métricas, o índice SP e o otimizador.
+Cada argumento de `build_network` vira hiperparâmetro salvo, disponível como `self.hparams.hidden`
+e restaurado do checkpoint. A rede devolve **logits crus**: a loss aplica o sigmoid.
+
+### 2. O preprocessador — `ai/preprocess/minha_rede.py`
+
+Herde de `BasePreprocessor` e escreva `required_columns` (quais colunas ler do parquet, entre as
+300+ disponíveis) e `transform` (DataFrame → array float32):
+
+```python
+class PreprocessMinhaRede(BasePreprocessor):
+    def required_columns(self, available):
+        return [c for c in available if c.startswith("cl_ring_")]
+
+    def transform(self, df):
+        return df[self.required_columns(list(df.columns))].to_numpy(dtype=np.float32)
+```
+
+`save`, `load`, `fit_transform` e `get_labels` já vêm da base. Escreva `fit` apenas se houver
+estado a aprender do treino (um scaler, uma média) — e nesse caso só o ajuste sobre o treino,
+nunca sobre o holdout.
+
+### 3. O pipeline — `ai/pipeline/pipeline_minha_rede.py`
+
+O nome do arquivo **precisa começar com `pipeline_`**: é assim que o registro o encontra.
+
+```python
+@register_pipeline("MinhaRede")     # o valor que vai em `model:` no YAML
+class PipelineMinhaRede(BasePipeline):
+    model_class = ModelMinhaRede
+    preprocessor_class = PreprocessMinhaRede
+```
+
+Se a arquitetura precisa de um valor que só se conhece depois do preprocessamento — tipicamente
+a dimensão de entrada — acrescente:
+
+```python
+    def build_model_kwargs(self, X):
+        return {"input_dim": int(X.shape[1])}
+```
+
+### 4. Rodar
+
+Aponte `model: "MinhaRede"` no YAML e use os mesmos comandos de sempre:
+
+```bash
+python ai/run.py train    --config ai/configs/minha_rede.yaml
+python ai/run.py evaluate --config ai/configs/minha_rede.yaml
+python ai/run.py report   --config ai/configs/minha_rede.yaml
+```
+
+Para conferir que a arquitetura foi reconhecida:
+
+```bash
+python -c "from ai.pipeline.registry import available_pipelines; print(available_pipelines())"
+```
+
+### Ganchos opcionais
+
+Sobrescreva apenas se precisar; nenhum é obrigatório:
+
+| Gancho | Quando usar |
+|---|---|
+| `forward` | a rede não é um único módulo chamável (ex.: dois ramos — veja `ai/models/fused.py`) |
+| `compute_loss` | losses auxiliares, além da principal |
+| `build_metrics` | acrescentar ou remover métricas |
+| `configure_optimizers` | outro otimizador ou um scheduler |
+| `build_preprocessor` | o preprocessador precisa de argumentos de construção |
 
 ---
 

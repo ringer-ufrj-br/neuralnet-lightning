@@ -3,13 +3,15 @@ import numpy as np
 import pandas as pd
 import logging
 import joblib
-from typing import Tuple, Optional
+from typing import List, Tuple, Optional
 from tqdm import tqdm
+
+from ai.preprocess.base import BasePreprocessor
 
 logger = logging.getLogger(__name__)
 tqdm.pandas(desc="Processing Samples")
 
-class PreprocessCNN2D:
+class PreprocessCNN2D(BasePreprocessor):
     """
     Preprocessor for 2D Convolutional Neural Networks (CNN2D) that formats calorimeter cell energies into multi-channel 2D image tensors.
     """
@@ -105,60 +107,14 @@ class PreprocessCNN2D:
         """
         return self
 
-    def fit_transform(self, df: pd.DataFrame) -> np.ndarray:
+    def required_columns(self, available: List[str]) -> List[str]:
         """
-        Fits on the given rows and transforms them in one call.
+        The 7 calorimeter cell-image columns, leaving the 300 ring/shower-shape columns unread.
 
         Args:
-            df (pd.DataFrame): Training rows only.
+            available (List[str]): Column names present in the dataset files.
 
         Returns:
-            np.ndarray: Multi-channel tensor array of shape (N, 7, 7, 15).
+            List[str]: The cell columns the image tensors are built from.
         """
-        return self.fit(df).transform(df)
-
-    def save(self, filepath: str) -> str:
-        """
-        Persists the preprocessor configuration alongside the trained checkpoints.
-
-        Args:
-            filepath (str): Destination path (.joblib).
-
-        Returns:
-            str: The written path.
-        """
-        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-        joblib.dump(self, filepath)
-        logger.info(f"💾 Saved preprocessor to: {filepath}")
-        return filepath
-
-    @staticmethod
-    def load(filepath: str) -> "PreprocessCNN2D":
-        """
-        Loads a preprocessor previously written by save().
-
-        Args:
-            filepath (str): Path to the .joblib file.
-
-        Returns:
-            PreprocessCNN2D: The restored instance.
-        """
-        preprocessor = joblib.load(filepath)
-        logger.info(f"📂 Loaded preprocessor from: {filepath}")
-        return preprocessor
-
-    def get_labels(self, df: pd.DataFrame, label_col: str = 'label') -> Optional[np.ndarray]:
-        """
-        Extracts target labels from DataFrame.
-
-        Args:
-            df (pd.DataFrame): Input DataFrame.
-            label_col (str): Label column name. Defaults to 'label'.
-
-        Returns:
-            Optional[np.ndarray]: Float32 numpy array of labels or None if column not found.
-        """
-        if label_col in df.columns:
-            return df[label_col].values.astype(np.float32)
-        logger.warning(f"⚠️ Label column '{label_col}' not found in DataFrame.")
-        return None
+        return list(self.cell_columns)

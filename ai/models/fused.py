@@ -1,42 +1,61 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import pytorch_lightning as pl
-from torchmetrics import Accuracy, AUROC
-from typing import Tuple, Any, Union, Optional
+from typing import Tuple, Union
 
-class ModelFused(pl.LightningModule):
+from ai.models.base import BaseBinaryClassifier
+
+
+class ModelFused(BaseBinaryClassifier):
     """
-    Fused PyTorch Lightning module for binary classification.
-    Combines a MLP branch (rings) and a CNN2D branch (cells) into a final decision MLP.
+    Two-branch model: an MLP over the rings and a CNN over the calorimeter cells, joined by a
+    fusion head. Each branch also carries an auxiliary classification head, because without
+    auxiliary supervision the weaker branch receives almost no gradient.
+
+    This is the example of an architecture that needs more than build_network: it overrides
+    `forward` (two branches, not one callable) and `compute_loss` (the auxiliary terms).
+    Everything else - metrics, SP index, logging, optimizer - still comes from the base.
     """
 
-    def __init__(self, learning_rate: float = 0.001, n_rings: int = 100, cell_shape: Tuple[int, int, int] = (7, 7, 15), rings_embed_dim: int = 32, cells_embed_dim: int = 64, fusion_source: str = "embedding", aux_loss_weight: float = 0.3, dropout: float = 0.5, pos_weight: Optional[float] = None) -> None:
+    def build_network(
+        self,
+        n_rings: int = 100,
+        cell_shape: Tuple[int, int, int] = (7, 7, 15),
+        rings_embed_dim: int = 32,
+        cells_embed_dim: int = 64,
+        fusion_source: str = "embedding",
+        aux_loss_weight: float = 0.3,
+        dropout: float = 0.5
+    ) -> nn.Module:
         """
-        Initializes ModelFused architecture and evaluation metrics.
-        Expected input shape: (Batch, n_rings + C*H*W).
-        """
-        super().__init__()
-        self.save_hyperparameters()
-        self.learning_rate = learning_rate
+        Builds both branches, their auxiliary heads and the fusion head.
 
+        Args:
+            n_rings (int): Ring features in the flattened input. Defaults to 100.
+            cell_shape (Tuple[int, int, int]): (channels, height, width) of the cell image.
+            rings_embed_dim (int): Ring branch embedding width. Defaults to 32.
+            cells_embed_dim (int): Cell branch embedding width. Defaults to 64.
+            fusion_source (str): 'embedding' concatenates the two embeddings; anything else
+                concatenates the two auxiliary logits. Defaults to 'embedding'.
+            aux_loss_weight (float): Weight of each auxiliary loss. 0 disables them.
+            dropout (float): Dropout probability in both branches. Defaults to 0.5.
+
+        Returns:
+            nn.Module: A ModuleDict holding every submodule; forward() wires them together.
+        """
         c, h, w = cell_shape
         self.n_rings = n_rings
         self.cell_shape = cell_shape
         self.n_cells = c * h * w
 
-        # Rings Branch (same architecture as ModelMLP)
-        self.rings_branch = nn.Sequential(
+        rings_branch = nn.Sequential(
             nn.Linear(n_rings, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(64, rings_embed_dim),
             nn.ReLU()
         )
-        self.rings_head = nn.Linear(rings_embed_dim, 1)
 
-        # Cells Branch (same architecture as ModelCNN2D)
-        self.cells_features = nn.Sequential(
+        cells_features = nn.Sequential(
             nn.Conv2d(in_channels=c, out_channels=32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
@@ -45,12 +64,10 @@ class ModelFused(pl.LightningModule):
             nn.BatchNorm2d(64),
             nn.ReLU(),
         )
-
-        # Flatten size computed dynamically
         with torch.no_grad():
-            flat_dim = self.cells_features(torch.zeros(1, c, h, w)).flatten(1).shape[1]
+            flat_dim = cells_features(torch.zeros(1, c, h, w)).flatten(1).shape[1]
 
-        self.cells_branch = nn.Sequential(
+        cells_branch = nn.Sequential(
             nn.Flatten(),
             nn.Linear(flat_dim, 128),
             nn.ReLU(),
@@ -58,30 +75,41 @@ class ModelFused(pl.LightningModule):
             nn.Linear(128, cells_embed_dim),
             nn.ReLU()
         )
-        self.cells_head = nn.Linear(cells_embed_dim, 1)
 
-        # Fusion Head
         fusion_in = (rings_embed_dim + cells_embed_dim) if fusion_source == "embedding" else 2
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_in, 32),
-            nn.ReLU(),
-            nn.Dropout(dropout / 2),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1)
-        )
 
-        # Binary Classification Metrics
-        self.train_acc = Accuracy(task="binary")
-        self.val_acc = Accuracy(task="binary")
-        self.train_auc = AUROC(task="binary")
-        self.val_auc = AUROC(task="binary")
+        return nn.ModuleDict({
+            "rings_branch": rings_branch,
+            "rings_head": nn.Linear(rings_embed_dim, 1),
+            "cells_features": cells_features,
+            "cells_branch": cells_branch,
+            "cells_head": nn.Linear(cells_embed_dim, 1),
+            "fusion": nn.Sequential(
+                nn.Linear(fusion_in, 32),
+                nn.ReLU(),
+                nn.Dropout(dropout / 2),
+                nn.Linear(32, 16),
+                nn.ReLU(),
+                nn.Linear(16, 1)
+            ),
+        })
 
-        pw = None if pos_weight is None else torch.tensor(float(pos_weight))
-        self.criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
+    def _split_inputs(
+        self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Splits a flat input vector back into the rings and cells branches.
 
-    def _split_inputs(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Splits the input vector into the rings and cells branches."""
+        Args:
+            x (Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]): Either the concatenated
+                (rings | flattened cells) tensor or an explicit (rings, cells) pair.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: (rings, cells) with cells shaped (B, C, H, W).
+
+        Raises:
+            ValueError: If a concatenated tensor has the wrong width.
+        """
         if isinstance(x, (tuple, list)):
             rings, cells = x
         else:
@@ -95,69 +123,66 @@ class ModelFused(pl.LightningModule):
             cells = cells.view(-1, *self.cell_shape)
         return rings, cells
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the Fused module. Returns the fusion logits only."""
-        logits, _, _ = self._forward_all(x)
-        return logits
-
     def _forward_all(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Forward pass returning the fusion logits and the auxiliary branch logits."""
+        """
+        Runs both branches and the fusion head.
+
+        Args:
+            x (torch.Tensor): Input batch.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (fusion logits, rings logits,
+                cells logits).
+        """
         rings, cells = self._split_inputs(x)
+        net = self.network
 
-        z_rings = self.rings_branch(rings)
-        z_cells = self.cells_branch(self.cells_features(cells))
+        z_rings = net["rings_branch"](rings)
+        z_cells = net["cells_branch"](net["cells_features"](cells))
 
-        logit_rings = self.rings_head(z_rings)
-        logit_cells = self.cells_head(z_cells)
+        logit_rings = net["rings_head"](z_rings)
+        logit_cells = net["cells_head"](z_cells)
 
         if self.hparams.fusion_source == "embedding":
             fused = torch.cat([z_rings, z_cells], dim=1)
         else:
             fused = torch.cat([logit_rings, logit_cells], dim=1)
 
-        return self.fusion(fused), logit_rings, logit_cells
+        return net["fusion"](fused), logit_rings, logit_cells
 
-    def _shared_step(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Computes the fusion loss plus the auxiliary supervision of each branch."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass returning the fusion logits only - the auxiliary heads exist for training.
+
+        Args:
+            x (torch.Tensor): Input batch.
+
+        Returns:
+            torch.Tensor: Fusion logits of shape (Batch, 1).
+        """
+        return self._forward_all(x)[0]
+
+    def compute_loss(
+        self, batch: Tuple[torch.Tensor, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Fusion loss plus the weighted auxiliary supervision of each branch.
+
+        Args:
+            batch (Tuple[torch.Tensor, torch.Tensor]): (features, targets).
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (loss, fusion probabilities,
+                integer targets).
+        """
         x, y = batch
         y = y.unsqueeze(1).float()
 
         logits, logit_rings, logit_cells = self._forward_all(x)
         loss = self.criterion(logits, y)
 
-        # Without the auxiliary loss the weaker branch gets almost no gradient
-        wgt = self.hparams.aux_loss_weight
-        if wgt > 0:
-            loss = loss + wgt * (self.criterion(logit_rings, y) + self.criterion(logit_cells, y))
+        weight = self.hparams.aux_loss_weight
+        if weight > 0:
+            loss = loss + weight * (self.criterion(logit_rings, y) + self.criterion(logit_cells, y))
 
-        return loss, torch.sigmoid(logits), y
-
-    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """Training step executed on batch."""
-        loss, preds, y = self._shared_step(batch)
-
-        self.train_acc(preds, y)
-        self.train_auc(preds, y)
-
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train_acc', self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('train_auc', self.train_auc, on_step=False, on_epoch=True, prog_bar=False)
-
-        return loss
-
-    def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """Validation step executed on batch."""
-        loss, preds, y = self._shared_step(batch)
-
-        self.val_acc(preds, y)
-        self.val_auc(preds, y)
-
-        self.log('val_loss', loss, prog_bar=True)
-        self.log('val_acc', self.val_acc, prog_bar=True)
-        self.log('val_auc', self.val_auc, prog_bar=True)
-
-        return loss
-
-    def configure_optimizers(self) -> Any:
-        """Configures model optimizer."""
-        return optim.Adam(self.parameters(), lr=self.learning_rate)
+        return loss, torch.sigmoid(logits), y.long()
