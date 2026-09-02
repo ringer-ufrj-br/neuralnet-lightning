@@ -6,9 +6,9 @@ commands, on different machines and at different times:
 
 * `train`    - loads data, fits the preprocessor on the training rows only, runs the K-Fold
                cross-validation and persists everything an evaluation needs: one checkpoint
-               per fold under a fixed name, the fitted preprocessor, the holdout indices and
+               per fold under a fixed name, the preprocessor, each fold's validation indices and
                a manifest describing the dataset the split was derived from.
-* `evaluate` - reloads those artefacts, re-runs inference over the holdout for every fold,
+* `evaluate` - reloads those artefacts, re-runs inference over the whole region for every fold,
                persists the raw scores and produces the per-fold metrics, the plots and the
                region's slice of the cross-validation table.
 
@@ -28,7 +28,6 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-from sklearn.model_selection import train_test_split
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +78,7 @@ class BasePipeline:
 
     Subclasses declare the model class and the preprocessor, plus whatever model kwargs are
     derived from the feature array; everything else - data loading, kinematic binning, the
-    holdout split, cross-validation, artefact persistence, scoring and reporting - is common.
+    cross-validation, artefact persistence, scoring and reporting - is common.
     """
 
     #: LightningModule subclass this pipeline trains (a BaseBinaryClassifier subclass).
@@ -150,7 +149,6 @@ class BasePipeline:
         self.scores_dir = os.path.join(self.results_dir, "scores")
         self.manifest_path = os.path.join(self.artifacts_dir, "manifest.json")
         self.preprocessor_path = os.path.join(self.artifacts_dir, "preprocessor.joblib")
-        self.test_indices_path = os.path.join(self.artifacts_dir, "test_indices.npy")
 
         self.loader = DataLoader(data_path=data_path, max_files=max_files)
         self.preprocessor = self.build_preprocessor()
@@ -284,11 +282,11 @@ class BasePipeline:
 
     def dataset_fingerprint(self, df: pd.DataFrame, Y: np.ndarray) -> Dict[str, Any]:
         """
-        Describes the exact dataset the holdout indices were drawn from, so `evaluate` can
+        Describes the exact dataset the fold indices were drawn from, so `evaluate` can
         refuse to run against a different one.
 
         The parquet rows carry no stable physical key - (run_number, event_number, cl_idx)
-        repeats heavily across files - so the holdout can only be referenced positionally.
+        repeats heavily across files - so rows can only be referenced positionally.
         That makes this fingerprint the guard rail: it pins the file list, the row/class
         counts and an order-sensitive row digest; a mismatch means the positional indices no
         longer point at the same rows.
@@ -328,7 +326,7 @@ class BasePipeline:
     def _check_fingerprint(stored: Dict[str, Any], current: Dict[str, Any]) -> None:
         """
         Compares two dataset fingerprints and raises on any difference that would invalidate
-        the stored positional holdout indices.
+        the stored positional fold indices.
 
         Args:
             stored (Dict[str, Any]): Fingerprint recorded at training time.
@@ -345,7 +343,7 @@ class BasePipeline:
         ]
         if differences:
             raise RuntimeError(
-                "❌ The dataset changed since training, so the stored holdout indices no longer "
+                "❌ The dataset changed since training, so the stored fold indices no longer "
                 "identify the same rows:\n  - " + "\n  - ".join(differences) +
                 "\n   Re-run `train` for this region before evaluating."
             )
@@ -355,10 +353,10 @@ class BasePipeline:
     def train(
         self,
         n_splits: int = 5,
-        test_size: float = 0.15,
         learning_rate: float = 0.001,
         target_fold: Optional[int] = None,
-        seed: int = 42
+        seed: int = 42,
+        n_inits: int = 1
     ) -> List[Dict[str, Any]]:
         """
         Trains the cross-validation folds and persists every artefact `evaluate` will need.
@@ -370,10 +368,10 @@ class BasePipeline:
 
         Args:
             n_splits (int): Number of K-Fold splits. Defaults to 5.
-            test_size (float): Holdout test dataset ratio. Defaults to 0.15.
             learning_rate (float): Model learning rate. Defaults to 0.001.
             target_fold (Optional[int]): Train only this fold (1-indexed), for SLURM parallelism.
-            seed (int): Seed for the holdout split and the fold partition. Defaults to 42.
+            seed (int): Seed for the fold partition. Defaults to 42.
+            n_inits (int): Independent initialisations per fold; the best is kept. Defaults to 1.
 
         Returns:
             List[Dict[str, Any]]: The fold records returned by ModelTrainer.fit_kfold.
@@ -389,21 +387,14 @@ class BasePipeline:
             logger.error("❌ Labels column not found.")
             return []
 
-        logger.info(f"✂️ Splitting {test_size * 100:g}% of the data into a stratified holdout...")
-        train_idx, test_idx = train_test_split(
-            np.arange(len(df)), test_size=test_size, random_state=seed, shuffle=True, stratify=Y
-        )
-        train_idx = np.sort(train_idx)
-        test_idx = np.sort(test_idx)
-
-        logger.info("⚙️ Fitting preprocessor on the training rows only...")
-        X_train = self.preprocessor.fit_transform(df.iloc[train_idx])
-        Y_train = Y[train_idx]
+        # The k-fold partition is the whole scheme: k-1 partitions train and 1 validates, which
+        # is what drives early stopping and the choice between initialisations. There is no
+        # separate holdout, because `evaluate` scores every fold over the full region anyway.
+        logger.info(f"✂️ Stratified {n_splits}-fold partition over {len(df)} rows.")
+        X_all = self.preprocessor.fit_transform(df)
 
         os.makedirs(self.artifacts_dir, exist_ok=True)
         self.preprocessor.save(self.preprocessor_path)
-        np.save(self.test_indices_path, test_idx)
-        logger.info(f"💾 Saved {len(test_idx)} holdout indices to: {self.test_indices_path}")
 
         _atomic_write_json({
             "manifest_version": MANIFEST_VERSION,
@@ -414,24 +405,22 @@ class BasePipeline:
             "region": self.region_label(),
             "label_col": self.label_col,
             "seed": seed,
-            "test_size": test_size,
             "n_splits": n_splits,
+            "n_inits": n_inits,
             "learning_rate": learning_rate,
             "monitor_metric": self.monitor_metric,
-            "n_train": int(len(train_idx)),
-            "n_test": int(len(test_idx)),
+            "n_rows": int(len(df)),
             "dataset": self.dataset_fingerprint(df, Y),
             "preprocessor": os.path.relpath(self.preprocessor_path, self.results_dir),
-            "test_indices": os.path.relpath(self.test_indices_path, self.results_dir),
         }, self.manifest_path)
         logger.info(f"📄 Wrote manifest: {self.manifest_path}")
 
-        model_kwargs = {'learning_rate': learning_rate, **self.build_model_kwargs(X_train)}
+        model_kwargs = {'learning_rate': learning_rate, **self.build_model_kwargs(X_all)}
         logger.info(f"🏋️ Training {n_splits} folds (kwargs={model_kwargs}, weighted loss enabled)...")
 
         fold_records = self.trainer.fit_kfold(
-            self.model_class, model_kwargs, X_train, Y_train,
-            n_splits=n_splits, target_fold=target_fold, seed=seed
+            self.model_class, model_kwargs, X_all, Y,
+            n_splits=n_splits, target_fold=target_fold, seed=seed, n_inits=n_inits
         )
 
         os.makedirs(self.history_dir, exist_ok=True)
@@ -446,9 +435,20 @@ class BasePipeline:
                 "val_loss": pd.Series(loss_callback.val_loss),
             }).to_csv(history_path, index=False)
 
+            # The rows this fold validated on rather than trained on. Evaluation scores every
+            # row regardless, so these only mark which predictions are out of sample.
+            val_rel = None
+            if record.get("val_ids") is not None:
+                val_path = os.path.join(self.artifacts_dir, f"val_indices_fold_{fold}.npy")
+                np.save(val_path, np.sort(record["val_ids"]))
+                val_rel = os.path.relpath(val_path, self.results_dir)
+
             _atomic_write_json({
                 "fold": fold,
                 "checkpoint": os.path.relpath(record["checkpoint"], self.results_dir),
+                "val_indices": val_rel,
+                "n_inits": record.get("n_inits", 1),
+                "best_init": record.get("best_init", 1),
                 "pos_weight": record["pos_weight"],
                 "best_score": record["best_score"],
                 "monitor_metric": self.monitor_metric,
@@ -473,7 +473,7 @@ class BasePipeline:
         make_plots: bool = True
     ) -> pd.DataFrame:
         """
-        Scores every trained fold on the holdout and writes this region's metrics, plots and
+        Scores every trained fold over the whole region and writes its metrics, plots and
         its slice of the cross-validation table.
 
         Args:
@@ -557,7 +557,7 @@ class BasePipeline:
     ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
         """
         Produces (y_true, y_prob) for every fold, either by reloading cached score files or by
-        running inference from each fold's checkpoint over the holdout.
+        running each fold's checkpoint over the full region (in-sample rows included).
 
         Args:
             manifest (Dict[str, Any]): The training manifest.
@@ -585,22 +585,46 @@ class BasePipeline:
         Y = self.preprocessor.get_labels(df, label_col=self.label_col)
         self._check_fingerprint(manifest.get("dataset", {}), self.dataset_fingerprint(df, Y))
 
-        test_idx = np.load(os.path.join(self.results_dir, manifest["test_indices"]))
-        df_test = df.iloc[test_idx]
-        y_true = Y[test_idx].flatten()
-
         preprocessor = type(self.preprocessor).load(os.path.join(self.results_dir, manifest["preprocessor"]))
         self.preprocessor = preprocessor
-        X_test = preprocessor.transform(df_test)
-        logger.info(f"🧾 Holdout: {len(y_true)} rows "
+
+        # Every fold is scored over the WHOLE region, in-sample rows included. Train and
+        # validation are separated during training - that is what drives early stopping and
+        # model selection - but the reported efficiencies deliberately cover the full phase
+        # space rather than only each fold's held-out partition. The `in_sample` column below
+        # records which rows the fold trained on, so an out-of-sample-only cut stays available
+        # to anyone who wants it.
+        y_true = Y.flatten()
+        X_all = preprocessor.transform(df)
+        logger.info(f"🧾 Scoring the full region: {len(y_true)} rows "
                     f"({int((y_true == 1).sum())} signal, {int((y_true == 0).sum())} background).")
 
         # Kept alongside the scores so the table can be re-cut per kinematic region later
         # without re-running inference.
         kinematics = {
-            column: df_test[column].to_numpy()
-            for column in ("cl_et", "cl_eta") if column in df_test.columns
+            column: df[column].to_numpy()
+            for column in ("cl_et", "cl_eta") if column in df.columns
         }
+
+        def out_of_sample_mask(fold: int) -> Optional[np.ndarray]:
+            """
+            Boolean mask of the rows this fold did NOT train on, or None when unknown.
+
+            Args:
+                fold (int): Fold number.
+
+            Returns:
+                Optional[np.ndarray]: True where the row was held out from this fold's training.
+            """
+            rel = fold_infos[fold].get("val_indices")
+            if not rel:
+                return None
+            path = os.path.join(self.results_dir, rel)
+            if not os.path.exists(path):
+                return None
+            mask = np.zeros(len(y_true), dtype=bool)
+            mask[np.load(path)] = True
+            return mask
 
         os.makedirs(self.scores_dir, exist_ok=True)
         scores = {}
@@ -617,11 +641,17 @@ class BasePipeline:
             model = self.model_class.load_from_checkpoint(
                 checkpoint, map_location="cpu", pos_weight=fold_infos[fold]["pos_weight"]
             )
-            y_prob = self._predict(model, X_test)
+            y_prob = self._predict(model, X_all)
             scores[fold] = (y_true, y_prob)
 
+            held_out = out_of_sample_mask(fold)
+            columns = {"y_true": y_true, "y_prob": y_prob, **kinematics}
+            if held_out is not None:
+                columns["in_sample"] = ~held_out
+                logger.info(f"   fold {fold}: {int(held_out.sum())} of {len(y_true)} rows were out of sample")
+
             path = os.path.join(self.scores_dir, f"fold_{fold}.parquet")
-            pd.DataFrame({"y_true": y_true, "y_prob": y_prob, **kinematics}).to_parquet(path, index=False)
+            pd.DataFrame(columns).to_parquet(path, index=False)
             logger.info(f"💾 Saved scores for fold {fold} to: {path}")
 
         return scores
@@ -630,7 +660,7 @@ class BasePipeline:
         """
         Runs batched inference and returns post-sigmoid probabilities.
 
-        Batched rather than in one shot because the holdout can be tens of millions of rows,
+        Batched rather than in one shot because a region can be tens of millions of rows,
         which would not fit in memory as a single forward pass.
 
         Args:

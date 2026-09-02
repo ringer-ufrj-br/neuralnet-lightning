@@ -8,7 +8,6 @@ learning_rate: 0.001
 patience: 20
 threshold: 0.8
 n_splits: 5
-test_size: 0.15
 accelerator: "auto"
 seed: 42                    # semente do holdout e da partição de folds; precisa ser a mesma
                             # entre jobs paralelos de fold para todos verem o mesmo split

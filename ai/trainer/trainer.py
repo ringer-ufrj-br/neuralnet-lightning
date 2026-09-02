@@ -1,6 +1,7 @@
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Callback
+import glob
 import numpy as np
 import os
 import logging
@@ -61,6 +62,21 @@ class TensorBatchLoader:
             else:
                 sel = order[start:start + self.batch_size]
                 yield self.X[sel], self.Y[sel]
+
+def _discard_checkpoint(path: Optional[str]) -> None:
+    """
+    Deletes a losing initialisation's checkpoint. Only the winning initialisation of each fold
+    is kept, otherwise n_inits would multiply the checkpoints on disk by n_inits.
+
+    Args:
+        path (Optional[str]): Checkpoint path, possibly empty or already gone.
+    """
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError as exc:
+            logger.warning(f"⚠️ Could not remove checkpoint '{path}': {exc}")
+
 
 def compute_pos_weight(y: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
     """
@@ -354,6 +370,24 @@ class ModelTrainer:
         logger.info(f"✅ Training completed! Best model saved at: {trainer.checkpoint_callback.best_model_path}")
         return trainer, loss_callback
 
+    def _is_better(self, score: Optional[float], reference: Optional[float]) -> bool:
+        """
+        Compares two monitored scores according to monitor_mode.
+
+        Args:
+            score (Optional[float]): Candidate score.
+            reference (Optional[float]): Incumbent score.
+
+        Returns:
+            bool: True when `score` should replace `reference`. A None candidate never wins;
+                any real score beats a None incumbent.
+        """
+        if score is None:
+            return False
+        if reference is None:
+            return True
+        return score > reference if self.monitor_mode == "max" else score < reference
+
     def fit_kfold(
         self, 
         model_class: Type[pl.LightningModule], 
@@ -362,7 +396,8 @@ class ModelTrainer:
         Y: Union[np.ndarray, torch.Tensor], 
         n_splits: int = 5, 
         target_fold: Optional[int] = None,
-        seed: int = 42
+        seed: int = 42,
+        n_inits: int = 1
     ) -> List[Dict[str, Any]]:
         """
         Executes K-Fold cross-validation, creating a fresh model instance per fold with
@@ -383,6 +418,9 @@ class ModelTrainer:
             target_fold (Optional[int]): Target fold number (1-indexed) to train individually. Defaults to None.
             seed (int): Seed for the fold partition. Must match across parallel per-fold jobs
                 so they all see the same partition. Defaults to 42.
+            n_inits (int): Independent weight initialisations to train per fold, keeping the one
+                with the best monitored score. More than one mitigates the influence of local
+                minima. Defaults to 1.
 
         Returns:
             List[Dict[str, Any]]: One record per trained fold with keys 'fold', 'model',
@@ -440,33 +478,87 @@ class ModelTrainer:
             current_model_kwargs = dict(model_kwargs)
             current_model_kwargs['pos_weight'] = pos_weight_fold
 
-            model = model_class(**current_model_kwargs)
+            # A job killed mid-fold (a SLURM timeout, a Ctrl-C) leaves its per-init checkpoints
+            # behind, and those would otherwise sit next to the fold's real checkpoint for ever.
+            # Clear them before starting, so a rerun always begins from a clean slate.
+            for stale in glob.glob(os.path.join(self.checkpoint_dir, f"fold_{fold_number}_init_*.ckpt")):
+                logger.info(f"🧹 Removing checkpoint left by an interrupted run: {stale}")
+                _discard_checkpoint(stale)
 
-            fold_log_dir = os.path.join(self.log_dir, f"fold_{fold_number}")
-            trainer, loss_callback = self._build_trainer(
-                model, fold_log_dir,
-                checkpoint_dir=self.checkpoint_dir,
-                checkpoint_name=f"fold_{fold_number}"
-            )
+            # Each initialisation is a full training run from different random weights; the
+            # fold keeps only the one that scored best on the monitored metric, which is how
+            # the reference method mitigates the influence of local minima.
+            best_init: Optional[Dict[str, Any]] = None
+            for init in range(1, n_inits + 1):
+                # Distinct but reproducible weights per (seed, fold, init). The data partition
+                # is untouched by this - it was already fixed by `seed` above.
+                pl.seed_everything(seed * 100_000 + fold_number * 1_000 + init, workers=True)
 
-            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+                model = model_class(**current_model_kwargs)
 
-            checkpoint_callback = trainer.checkpoint_callback
-            best_score = checkpoint_callback.best_model_score
+                init_name = f"fold_{fold_number}" if n_inits == 1 else f"fold_{fold_number}_init_{init}"
+                init_log_dir = os.path.join(self.log_dir, init_name)
+                trainer, loss_callback = self._build_trainer(
+                    model, init_log_dir,
+                    checkpoint_dir=self.checkpoint_dir,
+                    checkpoint_name=init_name
+                )
+
+                if n_inits > 1:
+                    logger.info(f"🎲 Fold {fold_number}: initialisation {init}/{n_inits}")
+
+                trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+                checkpoint_callback = trainer.checkpoint_callback
+                best_score = checkpoint_callback.best_model_score
+                score = float(best_score) if best_score is not None else None
+
+                candidate = {
+                    "init": init,
+                    "model": model,
+                    "trainer": trainer,
+                    "loss_callback": loss_callback,
+                    "checkpoint": checkpoint_callback.best_model_path,
+                    "best_score": score,
+                    "epochs": int(trainer.current_epoch),
+                }
+
+                if best_init is None or self._is_better(score, best_init["best_score"]):
+                    if best_init is not None:
+                        _discard_checkpoint(best_init["checkpoint"])
+                    best_init = candidate
+                else:
+                    _discard_checkpoint(candidate["checkpoint"])
+
+                if n_inits > 1 and score is not None:
+                    logger.info(f"   init {init}: {self.monitor_metric}={score:.6f}")
+
+            # Settle the winner under the plain fold_N name the rest of the pipeline expects.
+            final_path = os.path.join(self.checkpoint_dir, f"fold_{fold_number}.ckpt")
+            if best_init["checkpoint"] and best_init["checkpoint"] != final_path:
+                os.replace(best_init["checkpoint"], final_path)
+                best_init["checkpoint"] = final_path
+
             fold_records.append({
                 "fold": fold_number,
-                "model": model,
-                "trainer": trainer,
-                "loss_callback": loss_callback,
+                "model": best_init["model"],
+                "trainer": best_init["trainer"],
+                "loss_callback": best_init["loss_callback"],
                 "pos_weight": float(pos_weight_fold.item()),
-                "checkpoint": checkpoint_callback.best_model_path,
-                "best_score": float(best_score) if best_score is not None else None,
-                "epochs": int(trainer.current_epoch),
+                "checkpoint": best_init["checkpoint"],
+                "best_score": best_init["best_score"],
+                "epochs": best_init["epochs"],
                 "n_train": int(len(train_ids)),
                 "n_val": int(len(val_ids)),
+                "val_ids": np.asarray(val_ids, dtype=np.int64),
+                "n_inits": n_inits,
+                "best_init": best_init["init"],
             })
 
-            logger.info(f"✅ Fold {fold_number} best model saved at: {checkpoint_callback.best_model_path}")
+            if n_inits > 1:
+                logger.info(f"🏆 Fold {fold_number}: kept initialisation {best_init['init']}/{n_inits} "
+                            f"({self.monitor_metric}={best_init['best_score']})")
+            logger.info(f"✅ Fold {fold_number} best model saved at: {best_init['checkpoint']}")
 
         logger.info(f"🎉 Training of {len(fold_records)} fold(s) completed!")
         return fold_records

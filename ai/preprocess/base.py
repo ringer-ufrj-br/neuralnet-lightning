@@ -17,7 +17,8 @@ class BasePreprocessor:
     A new preprocessor implements TWO methods:
 
         required_columns(available) - which dataset columns to read from the parquet files
-        transform(df)               - DataFrame -> float32 feature array
+        transform(df)               - DataFrame -> float32 feature array, ending with
+                                      `return self.normalize(...)`
 
     and, only if it has state to learn from the training split (a scaler, a mean, ...),
     overrides `fit`. The default `fit` is a no-op, which is correct for a stateless
@@ -26,6 +27,30 @@ class BasePreprocessor:
     Persistence is joblib pickling of the whole instance, so anything stored on `self` in
     `fit` is restored by `load` - no per-preprocessor save/load code is needed.
     """
+
+    def normalize(self, X: np.ndarray) -> np.ndarray:
+        """
+        Normalises each sample by the absolute sum of its own features, so the network sees the
+        shape of the energy deposition and not its absolute scale (the Et binning already
+        accounts for scale). This is the NeuralRinger reference normalisation,
+        r'_i = r_i / |sum_j r_j|.
+
+        Call this as the last step of `transform`. It is done here, once per dataset, rather
+        than inside the model, where it would be recomputed for every batch of every epoch on
+        data that never changes.
+
+        Args:
+            X (np.ndarray): Feature array, first dimension being the batch.
+
+        Returns:
+            np.ndarray: Float32 array of the same shape, each sample scaled by its own total.
+                Samples summing to zero are left as they are rather than turned into NaNs.
+        """
+        axes = tuple(range(1, X.ndim))
+        if not axes:
+            return X.astype(np.float32)
+        total = np.abs(X.sum(axis=axes, keepdims=True))
+        return (X / np.where(total == 0.0, 1.0, total)).astype(np.float32)
 
     def required_columns(self, available: List[str]) -> Optional[List[str]]:
         """
@@ -45,8 +70,6 @@ class BasePreprocessor:
         """
         Learns whatever state this preprocessor needs from the training split. The default is
         a no-op, for preprocessors that are pure functions of their input.
-
-        IMPORTANT: only ever call this on training data. Fitting on the holdout leaks it.
 
         Args:
             df (pd.DataFrame): Training rows.

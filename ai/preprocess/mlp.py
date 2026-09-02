@@ -4,7 +4,6 @@ import pandas as pd
 import logging
 import joblib
 from typing import Optional, List
-from sklearn.preprocessing import StandardScaler
 
 from ai.preprocess.base import BasePreprocessor
 
@@ -62,34 +61,19 @@ def _selected_ring_columns(prefix: str) -> List[str]:
 
 class PreprocessMLP(BasePreprocessor):
     """
-    Preprocessor for MLP pipeline extracting the leading half of each calorimeter layer's
-    ring features (50 of 100 rings, see _selected_ring_columns) from a DataFrame, applying
-    cleaning, optional log-scale transformations, and StandardScaler normalization.
+    Preprocessor for the MLP pipeline: extracts the leading half of each calorimeter layer's
+    ring features (50 of 100 rings, see _selected_ring_columns), cleans sensor anomalies and
+    normalises each event by its own total ring energy.
 
-    Follows the scikit-learn fit/transform contract: `fit` must see the **training rows only**
-    and `transform` is then applied to train and test alike. The previous single-method version
-    called `fit_transform` on the full dataset, which both leaked holdout statistics into the
-    normalisation and made the fitted state impossible to reuse in a separate evaluation run.
+    Stateless: it selects, cleans and normalises each event by its own total ring energy, all
+    pure functions of the input, so there is nothing to fit.
     """
 
-    def __init__(
-        self,
-        use_scaler: bool = True,
-        apply_log1p: bool = True
-    ) -> None:
+    def __init__(self) -> None:
         """
         Initializes PreprocessMLP instance.
-
-        Args:
-            use_scaler (bool): Whether to apply StandardScaler normalization. Defaults to True.
-            apply_log1p (bool): Whether to apply log1p transformation to energy values. Defaults to True.
         """
-        self.use_scaler = use_scaler
-        self.apply_log1p = apply_log1p
         self.ring_columns = _selected_ring_columns("cl_ring_%i")
-        self.scaler = StandardScaler() if use_scaler else None
-        self.fitted_columns: Optional[List[str]] = None
-        self.is_fitted = False
 
     def required_columns(self, available: List[str]) -> List[str]:
         """
@@ -107,10 +91,10 @@ class PreprocessMLP(BasePreprocessor):
     def resolve_from_available(self, available: List[str]) -> List[str]:
         """
         Determines which ring column family to use given the available column names:
-        'cl_ring_*' with a fallback to 'cl_truth_ring_*'. Once fitted, the resolved family
-        is pinned so that evaluation cannot silently switch to the other one. Works from
-        names alone so the pipeline can project the parquet scan down to these columns
-        before any data is read.
+        'cl_ring_*' with a fallback to 'cl_truth_ring_*'. Works from names alone, so the
+        pipeline can project the parquet scan down to these columns before any data is read.
+        The choice is a deterministic function of the schema, so training and evaluation on
+        the same dataset always resolve to the same family.
 
         Args:
             available (List[str]): Column names present in the dataset.
@@ -122,12 +106,6 @@ class PreprocessMLP(BasePreprocessor):
             ValueError: If neither column family is fully present.
         """
         present = set(available)
-
-        if self.fitted_columns is not None:
-            missing = [col for col in self.fitted_columns if col not in present]
-            if missing:
-                raise ValueError(f"❌ DataFrame is missing the columns this preprocessor was fitted on: {missing}")
-            return self.fitted_columns
 
         if all(col in present for col in self.ring_columns):
             return self.ring_columns
@@ -143,13 +121,13 @@ class PreprocessMLP(BasePreprocessor):
 
     def resolve_columns(self, df: pd.DataFrame) -> List[str]:
         """
-        Determines which ring column family this DataFrame carries (see resolve_from_available).
+        Resolves the ring columns against a DataFrame's schema.
 
         Args:
-            df (pd.DataFrame): Input DataFrame.
+            df (pd.DataFrame): DataFrame to resolve against.
 
         Returns:
-            List[str]: The 50 ring column names to use.
+            List[str]: The resolved ring column names, in ring order.
 
         Raises:
             ValueError: If neither column family is fully present.
@@ -158,9 +136,8 @@ class PreprocessMLP(BasePreprocessor):
 
     def _extract(self, df: pd.DataFrame, cols: List[str]) -> np.ndarray:
         """
-        Extracts and cleans the ring matrix: sensor anomalies removed, negative noise clipped
-        and (optionally) log1p-compressed. Deterministic and stateless - everything that has to
-        be learned from the training set lives in the scaler.
+        Extracts and cleans the ring matrix: NaNs and the -999 sensor-anomaly marker are
+        zeroed. Deterministic and stateless.
 
         Args:
             df (pd.DataFrame): Input DataFrame.
@@ -175,57 +152,21 @@ class PreprocessMLP(BasePreprocessor):
         X = np.nan_to_num(X, nan=0.0)
         X = np.where(X == -999, 0.0, X)
 
-        # Clip negative energy noise values and apply log1p transformation to compress tails
-        if self.apply_log1p:
-            X = np.log1p(np.clip(X, 0, None))
-
         return X
-
-    def fit(self, df: pd.DataFrame) -> "PreprocessMLP":
-        """
-        Fits the normalization statistics on the given (training) rows.
-
-        Args:
-            df (pd.DataFrame): Training rows only.
-
-        Returns:
-            PreprocessMLP: self, for chaining.
-        """
-        cols = self.resolve_columns(df)
-        X = self._extract(df, cols)
-
-        if self.scaler is not None:
-            logger.info(f"📐 Fitting StandardScaler on {len(X)} training rows...")
-            self.scaler.fit(X)
-
-        self.fitted_columns = cols
-        self.is_fitted = True
-        return self
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Transforms input DataFrame into processed numpy feature matrix.
+        Transforms input DataFrame into the normalised feature matrix.
 
         Args:
             df (pd.DataFrame): Input DataFrame containing ring feature columns.
 
         Returns:
-            np.ndarray: Processed float32 feature array.
-
-        Raises:
-            RuntimeError: If a scaler is configured but has not been fitted yet.
+            np.ndarray: Float32 ring matrix, each event normalised by its own total.
         """
-        if self.use_scaler and not self.is_fitted:
-            raise RuntimeError("❌ PreprocessMLP.transform called before fit(). Call fit() or fit_transform() first.")
-
         cols = self.resolve_columns(df)
         logger.info(f"🧪 Extracting {len(cols)} ring features ({cols[0]} ... {cols[-1]})...")
-        X = self._extract(df, cols)
-
-        if self.scaler is not None:
-            X = self.scaler.transform(X).astype(np.float32)
-
-        return X
+        return self.normalize(self._extract(df, cols))
 
     def get_labels(self, df: pd.DataFrame, label_col: str = 'label') -> Optional[np.ndarray]:
         """

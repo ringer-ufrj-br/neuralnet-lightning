@@ -12,8 +12,8 @@ O fluxo é dividido em **três comandos independentes**:
 
 | Comando | O que faz | O que produz |
 |---|---|---|
-| `train` | Treina os folds da validação cruzada | Checkpoints, preprocessador ajustado, índices do holdout, manifesto |
-| `evaluate` | Reinferência dos folds sobre o holdout | Scores, métricas por fold, gráficos, fatia do tabelão daquela região |
+| `train` | Treina os folds da validação cruzada | Checkpoints, preprocessador, índices de validação por fold, manifesto |
+| `evaluate` | Reinferência dos folds sobre a região inteira | Scores, métricas por fold, gráficos, fatia do tabelão daquela região |
 | `report` | Agrega todas as regiões avaliadas, de um ou vários modelos | Tabelão em `.tex`, figura da tabela e o CSV longo canônico |
 
 A separação existe para que **re-avaliar não exija retreinar**: recortar pontos de operação, refazer gráficos ou remontar a tabela lê apenas artefatos em disco.
@@ -87,19 +87,44 @@ GB — apontando `data_path` do YAML direto para o caminho compartilhado.
 ## ⚙️ Configuração (`ai/configs/*.yaml`)
 
 ```yaml
-model: "MLP"                       # Modelo a ser utilizado (MLP | CNN2D)
+model: "MLP"                       # Modelo a ser utilizado (MLP | CNN2D | Fused)
 data_path: data/parquet/           # Caminho para os dados
-max_files: 100                     # Quantidade máxima de arquivos por pasta
+max_files: 100                     # Quantidade máxima de arquivos por pasta (omita para todos)
 label_col: "label"                 # Coluna de rótulo
-max_epochs: 50                     # Número máximo de épocas
-batch_size: 128                    # Tamanho do batch
+max_epochs: 5000                   # Teto de épocas; quem para o treino é o Early Stopping
+batch_size: 1024                   # Tamanho do batch
 learning_rate: 0.001               # Taxa de aprendizado
-patience: 8                        # Paciência do Early Stopping
-n_splits: 5                        # Folds da validação cruzada (1 = sem validação cruzada)
-test_size: 0.15                    # Proporção do holdout de teste
+patience: 50                       # Épocas sem melhora de val_sp antes de parar
+n_splits: 10                       # Folds da validação cruzada (1 = sem validação cruzada)
+n_inits: 5                         # Inicializações independentes por fold; a melhor é mantida
 threshold: 0.8                     # Limiar fixo das métricas globais
-seed: 42                           # Semente do holdout e da partição de folds
+seed: 42                           # Semente da partição de folds
 ```
+
+### Partição e o que a avaliação cobre
+
+A partição estratificada de `n_splits` folds separa treino de validação **durante o treino**: é
+ela que alimenta o Early Stopping e a escolha entre as inicializações. Não há holdout separado.
+
+O `evaluate` roda cada fold sobre a **região inteira**, incluindo as linhas em que aquele fold
+treinou. As eficiências relatadas, portanto, não são estritamente fora de amostra — é uma
+escolha deliberada, para que os números cubram todo o espaço de fase.
+
+Cada `scores/fold_N.parquet` traz a coluna booleana `in_sample`, marcando as linhas em que
+aquele fold treinou. Quem quiser o recorte estritamente fora de amostra tem os dados à mão:
+
+```python
+d = pd.read_parquet("results/MLP/et2_eta0/scores/fold_1.parquet")
+fora = d[~d.in_sample]
+```
+
+### Inicializações (`n_inits`)
+
+Cada fold é treinado `n_inits` vezes a partir de pesos aleatórios diferentes (a partição dos
+dados não muda), e fica apenas a inicialização com melhor `val_sp`. Serve para reduzir a
+influência de mínimos locais. Os checkpoints perdedores são apagados, então o disco guarda um
+checkpoint por fold independentemente de `n_inits`. Com `n_inits: 1` o comportamento é o de
+sempre.
 
 Os pontos de operação do tabelão são **tight 90% / medium 95% / loose 99%** por padrão, sem
 precisar declarar nada. Para usar outros, sobrescreva no YAML (nome → $P_D$ alvo):
@@ -174,7 +199,7 @@ quando há mais de um.
 > Para a comparação ser justa, os YAMLs dos modelos comparados precisam concordar em
 > `data_path`, `max_files`, `test_size` e `seed` — é isso que garante que todos foram
 > avaliados exatamente sobre as mesmas linhas de teste. O `report` compara as contagens de
-> sinal/ruído do holdout de cada modelo por região e avisa se elas divergirem.
+> sinal/ruído das linhas avaliadas de cada modelo por região e avisa se elas divergirem.
 
 #### Como o `report` acha os modelos
 
@@ -252,7 +277,7 @@ array terminam com sucesso.
 
 ## 🧩 Adicionando uma arquitetura
 
-Uma arquitetura nova são **três arquivos curtos**. Todo o resto — k-fold, holdout, binning
+Uma arquitetura nova são **três arquivos curtos**. Todo o resto — k-fold, binning
 cinemático, batching, métricas, índice SP, EarlyStopping, checkpoints, scoring, gráficos,
 tabelão e a grade SLURM — já vem pronto e funciona igual para qualquer modelo.
 
@@ -285,7 +310,7 @@ e restaurado do checkpoint. A rede devolve **logits crus**: a loss aplica o sigm
 ### 2. O preprocessador — `ai/preprocess/minha_rede.py`
 
 Herde de `BasePreprocessor` e escreva `required_columns` (quais colunas ler do parquet, entre as
-300+ disponíveis) e `transform` (DataFrame → array float32):
+300+ disponíveis) e `transform` (DataFrame → array float32), terminando com `self.normalize(...)`:
 
 ```python
 class PreprocessMinhaRede(BasePreprocessor):
@@ -293,12 +318,13 @@ class PreprocessMinhaRede(BasePreprocessor):
         return [c for c in available if c.startswith("cl_ring_")]
 
     def transform(self, df):
-        return df[self.required_columns(list(df.columns))].to_numpy(dtype=np.float32)
+        X = df[self.required_columns(list(df.columns))].to_numpy(dtype=np.float32)
+        return self.normalize(X)
 ```
 
 `save`, `load`, `fit_transform` e `get_labels` já vêm da base. Escreva `fit` apenas se houver
-estado a aprender do treino (um scaler, uma média) — e nesse caso só o ajuste sobre o treino,
-nunca sobre o holdout.
+estado a aprender dos dados (um scaler, uma média); o `fit` padrão é no-op, que é o certo para
+um preprocessador sem estado como o da MLP.
 
 ### 3. O pipeline — `ai/pipeline/pipeline_minha_rede.py`
 
@@ -356,12 +382,12 @@ results/<MODEL>[/et<i>_eta<j>]/
 ├── artifacts/
 │   ├── manifest.json          # dataset, split, seed, hiperparâmetros
 │   ├── preprocessor.joblib    # preprocessador ajustado SÓ no treino
-│   └── test_indices.npy       # índices do holdout
+│   └── val_indices_fold_N.npy # linhas que o fold N validou (fora de amostra)
 ├── checkpoints/
 │   ├── fold_N.ckpt            # melhor checkpoint do fold (nome fixo)
 │   └── fold_N.json            # pos_weight, melhor métrica, épocas, kwargs
 ├── history/fold_N.csv         # loss de treino/validação por época
-├── scores/fold_N.parquet      # y_true, y_prob, cl_et, cl_eta do holdout
+├── scores/fold_N.parquet      # y_true, y_prob, cl_et, cl_eta, in_sample (região inteira)
 ├── metrics/
 │   ├── per_fold.csv           # métricas globais por fold
 │   ├── operating_points.csv   # PD/SP/FA por (fold, ponto de operação)
@@ -397,7 +423,7 @@ O `.tex` gerado precisa dos pacotes:
 
 **Ajuste ao ponto de operação.** Para cada $P_D$ alvo, o limiar é o quantil $(1 - P_D)$ da distribuição de scores de sinal — ou seja, toda rede é ajustada para entregar exatamente aquele $P_D$ (coluna destacada em verde). O que efetivamente distingue os modelos é o $SP$ e o $F_A$ resultantes, e é por isso que a comparação entre arquiteturas se lê direto na vertical dessas duas colunas.
 
-**Convenção do desvio.** Todos os folds são avaliados no **mesmo** holdout estratificado. Logo o ± reportado é a variância *do modelo* entre folds, não a variância amostral do conjunto de teste.
+**Convenção do desvio.** Todos os folds são avaliados sobre o **mesmo** conjunto de linhas (a região inteira). Logo o ± reportado é a variância *do modelo* entre folds, não a variância amostral do conjunto avaliado.
 
 **Sem linha de referência.** O dataset não traz coluna de decisão do T2Calo, então a tabela hoje só tem as linhas de `Cross Validation`, com alvos fixos de $P_D$ (90/95/99% por padrão). Uma linha de referência exigiria um arquivo externo de eficiências por região.
 
@@ -420,9 +446,16 @@ $$\text{pos\_weight} = \frac{N_{\text{negativos}}}{N_{\text{positivos}}}$$
 
 Precision/Recall/F1, AUC-ROC, AUC-PR e o **SP Index** (`sqrt(sqrt(pd*(1-fa)) * (pd+1-fa)/2)`), que é a métrica monitorada pelo Early Stopping e pelo ModelCheckpoint.
 
-### 3. Vazamento de normalização
+### 3. Normalização da entrada
 
-O `StandardScaler` é ajustado **apenas nas linhas de treino** (`PreprocessMLP.fit`) e persistido em `artifacts/preprocessor.joblib`, para que a avaliação reproduza exatamente a mesma transformação.
+Cada evento é normalizado pela soma absoluta das suas próprias features,
+$r^{\prime}_i = r_i / |\sum_j r_j|$, de modo que a rede enxerga apenas o **formato** da
+deposição de energia e não a escala absoluta — que já é tratada pelo binning em $E_T$.
+
+Isso vive no preprocessador (`BasePreprocessor.normalize`, chamado no fim de cada `transform`),
+e não no modelo: é uma propriedade da representação de entrada, não da arquitetura. Também é
+mais barato — a normalização é calculada uma vez por conjunto, e não a cada batelada de cada
+época. O array persistido é exatamente o que a rede enxerga.
 
 ---
 

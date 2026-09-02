@@ -238,10 +238,10 @@ def main() -> None:
     if args.command == "train":
         pipeline.train(
             n_splits=config.get("n_splits", 5),
-            test_size=config.get("test_size", 0.15),
             learning_rate=config.get("learning_rate", 0.001),
             target_fold=args.fold,
-            seed=config.get("seed", 42)
+            seed=config.get("seed", 42),
+            n_inits=config.get("n_inits", 1)
         )
     elif args.command == "evaluate":
         try:
@@ -253,7 +253,7 @@ def main() -> None:
             )
         except (FileNotFoundError, RuntimeError) as exc:
             # These are the expected "you are holding it wrong" failures - region not trained,
-            # or the data moved under the stored holdout indices. A stack trace adds nothing.
+            # or the data moved under the stored fold indices. A stack trace adds nothing.
             logger.error(str(exc))
             sys.exit(1)
 

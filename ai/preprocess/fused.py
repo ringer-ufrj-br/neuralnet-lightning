@@ -71,7 +71,7 @@ class PreprocessFused(BasePreprocessor):
         Returns:
             Tuple[np.ndarray, np.ndarray]: Rings of shape (N, num_rings) and cells of shape (N, 7, 7, 15).
         """
-        return self.process_rings(df), self.cells_pp.transform(df)
+        return self.process_rings(df), self.cells_pp.build_images(df)
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         """
@@ -86,7 +86,7 @@ class PreprocessFused(BasePreprocessor):
 
         X = np.concatenate([X_rings, X_cells_flat], axis=1).astype(np.float32)
         logger.info(f"🔗 Fused features: {X.shape} ({X_rings.shape[1]} rings + {X_cells_flat.shape[1]} cells)")
-        return X
+        return self.normalize(X)
 
     def get_labels(self, df: pd.DataFrame, label_col: str = 'label') -> Optional[np.ndarray]:
         """

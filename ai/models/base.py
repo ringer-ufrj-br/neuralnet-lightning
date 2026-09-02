@@ -160,7 +160,7 @@ class BaseBinaryClassifier(pl.LightningModule):
         when the architecture needs more than a single callable (e.g. multiple branches).
 
         Args:
-            x (torch.Tensor): Input batch.
+            x (torch.Tensor): Input batch, already normalised by the preprocessor.
 
         Returns:
             torch.Tensor: Raw logits of shape (Batch, 1).

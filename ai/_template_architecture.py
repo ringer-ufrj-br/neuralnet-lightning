@@ -17,9 +17,9 @@ Then set `model: "<Name>"` in your YAML config and run:
     python ai/run.py evaluate --config ai/configs/<name>.yaml
     python ai/run.py report   --config ai/configs/<name>.yaml
 
-Everything else - k-fold splitting, the holdout, kinematic binning, GPU staging, batching,
-metrics, the SP index, EarlyStopping, checkpointing, scoring, plots, the tabelao and the
-SLURM grid - already works for your architecture without you touching it.
+Everything else - k-fold splitting, kinematic binning, GPU staging, batching, metrics, the SP
+index, EarlyStopping, checkpointing, scoring, plots, the tabelao and the SLURM grid - already
+works for your architecture without you touching it.
 
 To check your architecture is registered:
 
@@ -64,7 +64,8 @@ class ModelTemplate(BaseBinaryClassifier):
 
         Returns:
             nn.Module: Maps (Batch, input_dim) to (Batch, 1) RAW LOGITS.
-                Do not apply a sigmoid - the loss does it.
+                Do not apply a sigmoid - the loss does it. The input arrives already
+                normalised by the preprocessor.
         """
         return nn.Sequential(
             nn.Linear(input_dim, hidden),
@@ -111,7 +112,7 @@ class PreprocessTemplate(BasePreprocessor):
         method entirely if your preprocessing is stateless - the base's no-op fit is correct.
 
         Args:
-            df (pd.DataFrame): Training rows only. Never fit on the holdout.
+            df (pd.DataFrame): The rows the pipeline fits on.
 
         Returns:
             PreprocessTemplate: self.
@@ -121,7 +122,8 @@ class PreprocessTemplate(BasePreprocessor):
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Builds the feature array.
+        Builds the feature array. End with `self.normalize(...)`, which scales each event by
+        its own total so the network sees the shape of the deposition and not its scale.
 
         Args:
             df (pd.DataFrame): Rows to transform.
@@ -130,7 +132,7 @@ class PreprocessTemplate(BasePreprocessor):
             np.ndarray: Float32, first dimension is the batch. The shape here must match what
                 your build_network expects.
         """
-        return df[self.columns_].to_numpy(dtype=np.float32)
+        return self.normalize(df[self.columns_].to_numpy(dtype=np.float32))
 
 
 # =============================================================================

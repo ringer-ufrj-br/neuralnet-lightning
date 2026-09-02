@@ -992,7 +992,7 @@ def check_comparable(long_df: pd.DataFrame) -> List[str]:
     Checks that, within each kinematic region, every model was scored on the same holdout.
 
     The comparison is only meaningful if the models saw identical test rows, which happens
-    when their configs agree on data_path, max_files, test_size and seed. The holdout's
+    when their configs agree on data_path, max_files, n_splits and seed. The scored rows'
     signal/background counts are a cheap proxy for that: if they differ between two models in
     the same region, the configs drifted apart and the rows are not comparable.
 
@@ -1085,7 +1085,7 @@ def build_report(
             logger.warning(
                 f"⚠️ Models were scored on different holdouts in {problem}. "
                 "Their rows are not directly comparable — align data_path, max_files, "
-                "test_size and seed across the configs and re-run `evaluate`."
+                "n_splits and seed across the configs and re-run `evaluate`."
             )
 
     output_dir = output_dir or default_output_dir(results_root, model_names)

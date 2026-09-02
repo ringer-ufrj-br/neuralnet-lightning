@@ -67,13 +67,27 @@ class PreprocessCNN2D(BasePreprocessor):
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Transforms DataFrame cell energy columns into multi-channel 2D image tensors.
+        Builds the cell images and normalises each one by its own total.
 
         Args:
             df (pd.DataFrame): Input DataFrame containing calorimeter cell columns.
 
         Returns:
             np.ndarray: Multi-channel tensor array of shape (N, 7, 7, 15).
+        """
+        return self.normalize(self.build_images(df))
+
+    def build_images(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Transforms DataFrame cell energy columns into multi-channel 2D image tensors, without
+        normalising. Separate from `transform` so PreprocessFused can take the raw images and
+        normalise once over the concatenated rings+cells vector instead of twice.
+
+        Args:
+            df (pd.DataFrame): Input DataFrame containing calorimeter cell columns.
+
+        Returns:
+            np.ndarray: Multi-channel tensor array of shape (N, 7, 7, 15), unnormalised.
         """
         missing = [col for col in self.cell_columns if col not in df.columns]
         if missing:
