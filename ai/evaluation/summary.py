@@ -30,7 +30,7 @@ def compute_operating_points(
     working points. For each target PD, the threshold is set to the (1 - PD) quantile of the
     signal-class score distribution, guaranteeing that exactly that fraction of signal is kept.
 
-    This is the mechanism behind the cross-validation table ("tabelao"): every network is
+    This is the mechanism behind the cross-validation table ("pd_table"): every network is
     tuned to deliver the same PD, so the columns that actually differ between models are
     SP and FA.
 
@@ -211,7 +211,7 @@ class ModelSummary:
         """
         Saves the canonical tidy table for this kinematic region: one purely numeric row per
         (fold, operating point). This is the single source of truth the cross-validation table
-        builder (ai.evaluation.tabelao) reads back; the LaTeX/figure renders are derived from it.
+        builder (ai.evaluation.pd_table) reads back; the LaTeX/figure renders are derived from it.
 
         Args:
             records (List[Dict[str, Any]]): One dict per (fold, operating point).

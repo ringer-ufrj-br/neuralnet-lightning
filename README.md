@@ -32,7 +32,7 @@ A separação existe para que **re-avaliar não exija retreinar**: recortar pont
   - `ai/models/`: as arquiteturas em si.
   - `ai/preprocess/base.py`: `BasePreprocessor`, a base dos preprocessadores.
   - `ai/preprocess/`: preprocessadores de cada arquitetura.
-  - `ai/evaluation/`: métricas, gráficos e o construtor do tabelão (`tabelao.py`).
+  - `ai/evaluation/`: métricas, gráficos e o construtor do tabelão (`pd_table.py`).
   - `ai/binning/kinematics.py`: bins de $E_T$ e $|\eta|$ (grade 5×5 = 25 redes).
 - **`ai/configs/*.yaml`**: configurações e hiperparâmetros de cada experimento.
 - **`data/`**: conjuntos de dados (Parquet/ROOT).
@@ -192,7 +192,7 @@ python ai/run.py report --config ai/configs/mlp.yaml     # o modelo nomeado no Y
 python ai/run.py report --models MLP,CNN2D               # esses, nessa ordem de linhas
 ```
 
-Saída em `results/<MODEL>/tabelao/` para um modelo só, e em `results/comparison/tabelao/`
+Saída em `results/<MODEL>/pd_table/` para um modelo só, e em `results/comparison/pd_table/`
 quando há mais de um.
 
 > Para a comparação ser justa, os YAMLs dos modelos comparados precisam concordar em
@@ -230,8 +230,8 @@ O `--config` é sempre dispensável: o `report` lê a árvore de resultados, nã
 #### Tabela integrada (arquivo separado)
 
 Além de uma tabela por ponto de operação com a grade por região, o `report` salva a **tabela
-integrada** em arquivos próprios: `tabelao_integrated.tex`, `.pdf`/`.png` e o
-`tabelao_integrated_long.csv`. Ela pooleia todas as regiões e traz uma linha por modelo, com
+integrada** em arquivos próprios: `pd_table_integrated.tex`, `.pdf`/`.png` e o
+`pd_table_integrated_long.csv`. Ela pooleia todas as regiões e traz uma linha por modelo, com
 um grupo de colunas por ponto de operação — o resultado inteiro numa linha por modelo.
 
 A integração é ponderada pela população, não pela média das taxas: cada região tem seu próprio
@@ -391,13 +391,13 @@ results/<MODEL>[/et<i>_eta<j>]/
 │   └── folds_long.csv         # tabela canônica desta região
 └── plots/                     # ROC, PR, matriz de confusão, loss, ROC dos folds
 
-results/<MODEL>/tabelao/               # ou results/comparison/tabelao/ ao comparar modelos
-├── tabelao_long.csv                   # tabela canônica agregada (fonte da verdade)
-├── tabelao_<ponto>.tex                # por região: fragmento LaTeX para \input{}
-├── tabelao_<ponto>.pdf                # por região: render sem precisar de LaTeX
-├── tabelao_integrated_long.csv        # integrado: números poolados por fold
-├── tabelao_integrated.tex             # integrado: fragmento LaTeX
-└── tabelao_integrated.pdf             # integrado: render
+results/<MODEL>/pd_table/               # ou results/comparison/pd_table/ ao comparar modelos
+├── pd_table_long.csv                   # tabela canônica agregada (fonte da verdade)
+├── pd_table_<ponto>.tex                # por região: fragmento LaTeX para \input{}
+├── pd_table_<ponto>.pdf                # por região: render sem precisar de LaTeX
+├── pd_table_integrated_long.csv        # integrado: números poolados por fold
+├── pd_table_integrated.tex             # integrado: fragmento LaTeX
+└── pd_table_integrated.pdf             # integrado: render
 ```
 
 Todos os CSVs são **sobrescritos** a cada execução (antes eram anexados, o que fazia execuções antigas se acumularem como se fossem folds extras).
@@ -408,7 +408,7 @@ Todos os CSVs são **sobrescritos** a cada execução (antes eram anexados, o qu
 
 Tabela no formato ATLAS/Ringer: linhas são regiões de $|\eta|$, grupos de colunas são regiões de $E_T$, e cada grupo traz $P_D$ / $SP$ / $F_A$ como média ± desvio entre os folds. Quando mais de um modelo foi avaliado, cada região ganha **uma linha por modelo** (coluna `Model`), no lugar das linhas `Reference` / `Cross Validation` do formato original.
 
-A fonte da verdade é o CSV **longo** (`tabelao_long.csv`): uma linha puramente numérica por `(model, et_bin, eta_bin, fold, operating_point)`. O `.tex` e a figura são derivados dele, então existe um único lugar onde os números são produzidos e vários onde são formatados.
+A fonte da verdade é o CSV **longo** (`pd_table_long.csv`): uma linha puramente numérica por `(model, et_bin, eta_bin, fold, operating_point)`. O `.tex` e a figura são derivados dele, então existe um único lugar onde os números são produzidos e vários onde são formatados.
 
 O `.tex` gerado precisa dos pacotes:
 

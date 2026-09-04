@@ -9,7 +9,7 @@ Three subcommands, deliberately separate:
 
 `train` only produces models and the artefacts needed to reload them; `evaluate` turns those
 models into scores, metrics and plots for one kinematic region; `report` aggregates every
-evaluated region into the cross-validation table ("tabelao") as LaTeX and as a figure.
+evaluated region into the cross-validation table ("pd_table") as LaTeX and as a figure.
 """
 
 import argparse
@@ -166,7 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser = subparsers.add_parser("report", help="Aggregate every evaluated region into the cross-validation table.")
     add_common_arguments(report_parser, config_default=None)
     report_parser.add_argument('--results-root', type=str, default='results', help="Root results directory to scan. Defaults to 'results'.")
-    report_parser.add_argument('--output-dir', type=str, default=None, help="Where to write the table. Defaults to results/<MODEL>/tabelao, or results/comparison/tabelao when comparing models.")
+    report_parser.add_argument('--output-dir', type=str, default=None, help="Where to write the table. Defaults to results/<MODEL>/pd_table, or results/comparison/pd_table when comparing models.")
     report_parser.add_argument('--models', type=str, default=None, help="Comma-separated models to compare, in row order (e.g. 'MLP,CNN2D'). Alternative to --config; without either, every evaluated model is included.")
     report_parser.add_argument('--no-integrated', action='store_false', dest='integrated', help="Skip the separate integrated table (phase-space total), leaving only the per-region tables.")
     report_parser.add_argument('--formats', type=str, default='tex,pdf', help="Comma-separated render formats: 'tex' plus image extensions such as pdf/png. Defaults to 'tex,pdf'.")
@@ -205,7 +205,7 @@ def main() -> None:
         sys.exit(1)
 
     if args.command == "report":
-        from ai.evaluation.tabelao import build_report, discover_regions, log_inventory
+        from ai.evaluation.pd_table import build_report, discover_regions, log_inventory
 
         model_names = resolve_report_models(config, args.models)
 

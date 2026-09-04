@@ -98,4 +98,4 @@ echo "Use 'squeue -u \$USER' para monitorar e 'scancel ${ARRAY_JOB_ID}' para can
 echo "Uma tarefa isolada: 'scancel ${ARRAY_JOB_ID}_<indice>'."
 echo "====================================================================="
 echo "Resultados por região em 'results/<MODEL>/et<N>_eta<M>/', tabelão em"
-echo "'results/<MODEL>/tabelao/' e logs em '${LOG_DIR}/'."
+echo "'results/<MODEL>/pd_table/' e logs em '${LOG_DIR}/'."

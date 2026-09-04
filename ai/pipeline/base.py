@@ -483,7 +483,7 @@ class BasePipeline:
             make_plots (bool): Whether to render the ROC/PR/confusion/loss figures. Defaults to True.
 
         Returns:
-            pd.DataFrame: This region's long-format table (see ai.evaluation.tabelao.LONG_COLUMNS).
+            pd.DataFrame: This region's long-format table (see ai.evaluation.pd_table.LONG_COLUMNS).
 
         Raises:
             FileNotFoundError: If the region has not been trained yet.
