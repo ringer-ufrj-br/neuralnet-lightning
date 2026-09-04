@@ -14,19 +14,25 @@ class BasePreprocessor:
     The contract every preprocessor honours, plus the parts that are the same for all of them
     (persistence, label extraction, fit_transform).
 
-    A new preprocessor implements TWO methods:
+    The baseline preprocessor is a column selection: set `feature_columns` and the inherited
+    `required_columns` / `transform` do the rest - extract those columns, zero the sensor
+    anomalies, normalise each event by its own total. PreprocessMLP is exactly this.
 
-        required_columns(available) - which dataset columns to read from the parquet files
-        transform(df)               - DataFrame -> float32 feature array, ending with
-                                      `return self.normalize(...)`
+    A preprocessor whose input is not a flat slice of dataset columns (the CNN2D image
+    builder, the Fused rings+cells concatenation) instead overrides `transform`, and usually
+    `required_columns`, and leaves `feature_columns` as None.
 
-    and, only if it has state to learn from the training split (a scaler, a mean, ...),
-    overrides `fit`. The default `fit` is a no-op, which is correct for a stateless
-    preprocessor such as the CNN2D image builder.
+    Either kind overrides `fit` only if it has state to learn from the training split (a
+    scaler, a mean, ...). The default `fit` is a no-op.
 
     Persistence is joblib pickling of the whole instance, so anything stored on `self` in
     `fit` is restored by `load` - no per-preprocessor save/load code is needed.
     """
+
+    #: Dataset columns this preprocessor consumes, in feature order. When set, it drives the
+    #: default `required_columns` and `transform`. Left None by preprocessors that build their
+    #: input some other way and override `transform`.
+    feature_columns: Optional[List[str]] = None
 
     def normalize(self, X: np.ndarray) -> np.ndarray:
         """
@@ -58,13 +64,32 @@ class BasePreprocessor:
         rest during the parquet scan. The raw files carry 300+ columns, most of them nested
         calorimeter images; reading them all is what used to exhaust memory.
 
+        The default returns `feature_columns` (None when unset, i.e. load everything).
+
         Args:
             available (List[str]): Column names present in the dataset files.
 
         Returns:
             Optional[List[str]]: Columns to load, or None to load everything.
         """
-        return None
+        return self.feature_columns
+
+    def extract(self, df: pd.DataFrame, cols: List[str]) -> np.ndarray:
+        """
+        Pulls `cols` out of `df` as a clean float32 matrix: NaNs and the -999 sensor-anomaly
+        marker are zeroed. A missing column raises KeyError here rather than being silently
+        worked around - a wrong column set is a bug, not something to recover from.
+
+        Args:
+            df (pd.DataFrame): Input rows.
+            cols (List[str]): Column names to extract, in order.
+
+        Returns:
+            np.ndarray: Cleaned float32 array, first dimension being the batch. Not normalised.
+        """
+        X = df[cols].values.astype(np.float32)
+        X = np.nan_to_num(X, nan=0.0)
+        return np.where(X == -999, 0.0, X)
 
     def fit(self, df: pd.DataFrame) -> "BasePreprocessor":
         """
@@ -81,7 +106,11 @@ class BasePreprocessor:
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Turns a DataFrame into the model's input array. MUST be implemented.
+        Turns a DataFrame into the model's input array.
+
+        The default is the baseline path: extract `feature_columns`, clean sensor anomalies
+        and normalise each event by its own total. Preprocessors that build their input some
+        other way override this; those must leave `feature_columns` as None.
 
         Args:
             df (pd.DataFrame): Rows to transform.
@@ -89,9 +118,13 @@ class BasePreprocessor:
         Returns:
             np.ndarray: Float32 features, first dimension being the batch.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} must implement transform() and return a float32 array."
-        )
+        if self.feature_columns is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} must set feature_columns or override transform()."
+            )
+        cols = self.feature_columns
+        logger.info(f"🧪 Extracting {len(cols)} features ({cols[0]} ... {cols[-1]})...")
+        return self.normalize(self.extract(df, cols))
 
     def fit_transform(self, df: pd.DataFrame) -> np.ndarray:
         """

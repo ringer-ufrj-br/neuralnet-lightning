@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import logging
-from typing import Tuple, Optional, List
+from typing import Tuple, List
 
 from .cnn2d import PreprocessCNN2D
 from .base import BasePreprocessor
@@ -34,24 +34,9 @@ class PreprocessFused(BasePreprocessor):
         Returns:
             np.ndarray: Processed float32 array of shape (N, num_rings).
         """
-        # Determine ring columns: check cl_ring_i first, with fallback to cl_truth_ring_i
         cols = self.ring_columns
-        if not all(col in df.columns for col in cols):
-            fallback_cols = [f"cl_truth_ring_{i}" for i in range(self.num_rings)]
-            if all(col in df.columns for col in fallback_cols):
-                logger.info("ℹ️ Ring columns 'cl_ring_*' not found; using fallback 'cl_truth_ring_*'.")
-                cols = fallback_cols
-            else:
-                missing = [col for col in cols if col not in df.columns]
-                logger.error(f"❌ Missing ring columns in DataFrame: {missing}")
-                raise ValueError(f"❌ Missing ring columns in DataFrame: {missing}")
-
         logger.info(f"🧪 Extracting {len(cols)} ring features ({cols[0]} ... {cols[-1]})...")
-        X = df[cols].values.astype(np.float32)
-
-        # Handle sensor anomalies represented as -999 or NaNs
-        X = np.nan_to_num(X, nan=0.0)
-        X = np.where(X == -999, 0.0, X)
+        X = self.extract(df, cols)
 
         if self.ring_norm == 'norm1':
             # Ringer standard: divide by the total ring energy, removing the
@@ -88,17 +73,6 @@ class PreprocessFused(BasePreprocessor):
         logger.info(f"🔗 Fused features: {X.shape} ({X_rings.shape[1]} rings + {X_cells_flat.shape[1]} cells)")
         return self.normalize(X)
 
-    def get_labels(self, df: pd.DataFrame, label_col: str = 'label') -> Optional[np.ndarray]:
-        """
-        Extracts target labels from DataFrame.
-        Args:
-            df (pd.DataFrame): Input DataFrame.
-            label_col (str): Label column name. Defaults to 'label'.
-        Returns:
-            Optional[np.ndarray]: Float32 numpy array of labels or None if column not found.
-        """
-        return self.cells_pp.get_labels(df, label_col=label_col)
-
     def required_columns(self, available: List[str]) -> List[str]:
         """
         Both branches' columns: the ring columns this model reads plus the 7 cell-image
@@ -108,10 +82,6 @@ class PreprocessFused(BasePreprocessor):
             available (List[str]): Column names present in the dataset files.
 
         Returns:
-            List[str]: Ring columns present in the schema, plus the cell columns.
+            List[str]: Ring columns plus the cell columns.
         """
-        rings = [c for c in self.ring_columns if c in available]
-        if not rings:
-            rings = [c for c in (f"cl_truth_ring_{i}" for i in range(self.num_rings))
-                     if c in available]
-        return rings + self.cells_pp.required_columns(available)
+        return list(self.ring_columns) + self.cells_pp.required_columns(available)
