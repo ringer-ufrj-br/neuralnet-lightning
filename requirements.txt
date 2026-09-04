@@ -1,7 +1,13 @@
 pandas
 pyarrow
+polars
 numpy
-torch
+# Os nos de GPU rodam driver 550.x (CUDA 12.4). O wheel padrao do PyPI ('torch' puro) hoje
+# e a build cu130, que exige driver 580+ e quebra no no com "The NVIDIA driver on your system
+# is too old (found version 12040)". A build cu126 roda no driver 12.4 (compatibilidade de
+# minor version do CUDA 12.x) e traz kernels sm_75 pre-compilados para as RTX 2080 Ti.
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.13.0+cu126
 pytorch-lightning
 torchmetrics
 scikit-learn

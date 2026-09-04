@@ -1,13 +1,15 @@
 import numpy as np
 import pandas as pd
 import logging
-from typing import Tuple, Optional
+from typing import List, Tuple
 from tqdm import tqdm
+
+from ai.preprocess.base import BasePreprocessor
 
 logger = logging.getLogger(__name__)
 tqdm.pandas(desc="Processing Samples")
 
-class PreprocessCNN2D:
+class PreprocessCNN2D(BasePreprocessor):
     """
     Preprocessor for 2D Convolutional Neural Networks (CNN2D) that formats calorimeter cell energies into multi-channel 2D image tensors.
     """
@@ -63,13 +65,27 @@ class PreprocessCNN2D:
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Transforms DataFrame cell energy columns into multi-channel 2D image tensors.
+        Builds the cell images and normalises each one by its own total.
 
         Args:
             df (pd.DataFrame): Input DataFrame containing calorimeter cell columns.
 
         Returns:
             np.ndarray: Multi-channel tensor array of shape (N, 7, 7, 15).
+        """
+        return self.normalize(self.build_images(df))
+
+    def build_images(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Transforms DataFrame cell energy columns into multi-channel 2D image tensors, without
+        normalising. Separate from `transform` so PreprocessFused can take the raw images and
+        normalise once over the concatenated rings+cells vector instead of twice.
+
+        Args:
+            df (pd.DataFrame): Input DataFrame containing calorimeter cell columns.
+
+        Returns:
+            np.ndarray: Multi-channel tensor array of shape (N, 7, 7, 15), unnormalised.
         """
         missing = [col for col in self.cell_columns if col not in df.columns]
         if missing:
@@ -89,18 +105,28 @@ class PreprocessCNN2D:
             
         return X
 
-    def get_labels(self, df: pd.DataFrame, label_col: str = 'label') -> Optional[np.ndarray]:
+    def fit(self, df: pd.DataFrame) -> "PreprocessCNN2D":
         """
-        Extracts target labels from DataFrame.
+        No-op fit, present so this preprocessor honours the same fit/transform/save/load
+        contract as PreprocessMLP and can be driven by the shared pipeline. The cell-to-image
+        conversion is fully deterministic (padding + log1p), with nothing learned from data.
 
         Args:
-            df (pd.DataFrame): Input DataFrame.
-            label_col (str): Label column name. Defaults to 'label'.
+            df (pd.DataFrame): Training rows only (unused).
 
         Returns:
-            Optional[np.ndarray]: Float32 numpy array of labels or None if column not found.
+            PreprocessCNN2D: self, for chaining.
         """
-        if label_col in df.columns:
-            return df[label_col].values.astype(np.float32)
-        logger.warning(f"⚠️ Label column '{label_col}' not found in DataFrame.")
-        return None
+        return self
+
+    def required_columns(self, available: List[str]) -> List[str]:
+        """
+        The 7 calorimeter cell-image columns, leaving the 300 ring/shower-shape columns unread.
+
+        Args:
+            available (List[str]): Column names present in the dataset files.
+
+        Returns:
+            List[str]: The cell columns the image tensors are built from.
+        """
+        return list(self.cell_columns)

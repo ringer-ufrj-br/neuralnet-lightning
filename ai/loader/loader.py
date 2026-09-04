@@ -1,9 +1,9 @@
 import pandas as pd
+import polars as pl
 import glob
 import os
 import logging
 from typing import List, Optional
-from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +61,38 @@ class DataLoader:
         logger.info(f"📂 Found {len(files)} valid parquet files.")
         return files
 
-    def load_dataset(self, files: List[str]) -> Optional[pd.DataFrame]:
+    def scan(self, files: List[str]) -> pl.LazyFrame:
         """
-        Reads parquet files and concatenates them into a single DataFrame.
+        Builds a single lazy polars scan over the given parquet files, with the originating
+        file path attached as a 'file_path' column (labels are derived from it downstream).
+
+        Nothing is read here: callers select the columns they need and filter rows before
+        collecting, so parquet column pruning and predicate pushdown keep peak memory bound
+        by the projected result rather than the full 300+ column dataset.
+
+        Args:
+            files (List[str]): List of file paths to scan.
+
+        Returns:
+            pl.LazyFrame: Lazy frame over all files, in the given file order.
+        """
+        return pl.scan_parquet(files, include_file_paths="file_path", low_memory=True)
+
+    def load_dataset(self, files: List[str], columns: List[str]) -> Optional[pd.DataFrame]:
+        """
+        Reads and concatenates parquet files into a single DataFrame using polars as the
+        reading/concatenation engine (single lazy scan across all files, streamed collect),
+        which avoids the per-file Python object overhead and the N-way in-memory duplication
+        that pandas' read-then-concat loop incurs. Converted to pandas at the end for
+        compatibility with the rest of the pipeline (label generation, preprocessors).
+
+        `columns` is deliberately required: the raw files carry 300+ columns including the
+        nested calorimeter images, and collecting them all is what used to exhaust memory on
+        full-dataset runs. The pipeline itself composes scan() directly instead.
 
         Args:
             files (List[str]): List of file paths to load.
+            columns (List[str]): Columns to read ('file_path' is always kept).
 
         Returns:
             Optional[pd.DataFrame]: Combined pandas DataFrame or None if empty.
@@ -74,30 +100,9 @@ class DataLoader:
         if not files:
             logger.warning("⚠️ No files found to load.")
             return None
-        
-        dfs = []
-        for f in tqdm(files, desc="📥 Loading Parquets", unit="file"):
-            df_temp = pd.read_parquet(f)
-            df_temp['file_path'] = f
-            dfs.append(df_temp)
-            
-        df = pd.concat(dfs, ignore_index=True)
-        return df
 
-    def execute(self) -> Optional[pd.DataFrame]:
-        """
-        Executes complete data loading pipeline (find files and read dataset).
-
-        Args:
-            None
-
-        Returns:
-            Optional[pd.DataFrame]: Concatenated dataset DataFrame.
-        """
-        files = self.get_files()
-        df = self.load_dataset(files)
-        return df
-
-if __name__ == "__main__":
-    loader = DataLoader()
-    loader.execute()
+        logger.info(f"📥 Reading {len(files)} parquet files via polars...")
+        keep = list(dict.fromkeys(columns))
+        if "file_path" not in keep:
+            keep.append("file_path")
+        return self.scan(files).select(keep).collect(engine="streaming").to_pandas()

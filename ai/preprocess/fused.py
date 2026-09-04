@@ -1,13 +1,14 @@
 import numpy as np
 import pandas as pd
 import logging
-from typing import Tuple, Optional, List
+from typing import Tuple, List
 
 from .cnn2d import PreprocessCNN2D
+from .base import BasePreprocessor
 
 logger = logging.getLogger(__name__)
 
-class PreprocessFused:
+class PreprocessFused(BasePreprocessor):
     """
     Preprocessor for the Fused pipeline, combining ring features and calorimeter
     cell images into a single feature array.
@@ -33,24 +34,9 @@ class PreprocessFused:
         Returns:
             np.ndarray: Processed float32 array of shape (N, num_rings).
         """
-        # Determine ring columns: check cl_ring_i first, with fallback to cl_truth_ring_i
         cols = self.ring_columns
-        if not all(col in df.columns for col in cols):
-            fallback_cols = [f"cl_truth_ring_{i}" for i in range(self.num_rings)]
-            if all(col in df.columns for col in fallback_cols):
-                logger.info("ℹ️ Ring columns 'cl_ring_*' not found; using fallback 'cl_truth_ring_*'.")
-                cols = fallback_cols
-            else:
-                missing = [col for col in cols if col not in df.columns]
-                logger.error(f"❌ Missing ring columns in DataFrame: {missing}")
-                raise ValueError(f"❌ Missing ring columns in DataFrame: {missing}")
-
         logger.info(f"🧪 Extracting {len(cols)} ring features ({cols[0]} ... {cols[-1]})...")
-        X = df[cols].values.astype(np.float32)
-
-        # Handle sensor anomalies represented as -999 or NaNs
-        X = np.nan_to_num(X, nan=0.0)
-        X = np.where(X == -999, 0.0, X)
+        X = self.extract(df, cols)
 
         if self.ring_norm == 'norm1':
             # Ringer standard: divide by the total ring energy, removing the
@@ -70,7 +56,7 @@ class PreprocessFused:
         Returns:
             Tuple[np.ndarray, np.ndarray]: Rings of shape (N, num_rings) and cells of shape (N, 7, 7, 15).
         """
-        return self.process_rings(df), self.cells_pp.transform(df)
+        return self.process_rings(df), self.cells_pp.build_images(df)
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         """
@@ -85,15 +71,17 @@ class PreprocessFused:
 
         X = np.concatenate([X_rings, X_cells_flat], axis=1).astype(np.float32)
         logger.info(f"🔗 Fused features: {X.shape} ({X_rings.shape[1]} rings + {X_cells_flat.shape[1]} cells)")
-        return X
+        return self.normalize(X)
 
-    def get_labels(self, df: pd.DataFrame, label_col: str = 'label') -> Optional[np.ndarray]:
+    def required_columns(self, available: List[str]) -> List[str]:
         """
-        Extracts target labels from DataFrame.
+        Both branches' columns: the ring columns this model reads plus the 7 cell-image
+        columns the CNN branch needs.
+
         Args:
-            df (pd.DataFrame): Input DataFrame.
-            label_col (str): Label column name. Defaults to 'label'.
+            available (List[str]): Column names present in the dataset files.
+
         Returns:
-            Optional[np.ndarray]: Float32 numpy array of labels or None if column not found.
+            List[str]: Ring columns plus the cell columns.
         """
-        return self.cells_pp.get_labels(df, label_col=label_col)
+        return list(self.ring_columns) + self.cells_pp.required_columns(available)

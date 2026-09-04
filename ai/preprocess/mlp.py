@@ -1,97 +1,135 @@
+import logging
+from typing import List
+
 import numpy as np
 import pandas as pd
-import logging
-from typing import Optional, List
 from sklearn.preprocessing import StandardScaler
+
+from ai.preprocess.base import BasePreprocessor
 
 logger = logging.getLogger(__name__)
 
-class PreprocessMLP:
+
+def _selected_ring_columns(prefix: str) -> List[str]:
     """
-    Preprocessor for MLP pipeline extracting ring features from DataFrame,
-    applying cleaning, optional log-scale transformations, and StandardScaler normalization.
+    Selected ring columns for MLP training - we selected 1/2 of rings in each layer (fixed,
+    not parameterized). Mirrors the reference selection from prior Ringer trainings:
+
+    pre-sample - 8 rings
+    EM1 - 64 rings
+    EM2 - 8 rings
+    EM3 - 8 rings
+    Had1 - 4 rings
+    Had2 - 4 rings
+    Had3 - 4 rings
+
+    Args:
+        prefix (str): printf-style column name template with one '%i' placeholder, e.g. 'cl_ring_%i'.
+
+    Returns:
+        List[str]: The 50 selected column names, in ring order.
+    """
+    # rings presample
+    presample = [prefix % iring for iring in range(8 // 2)]
+
+    # EM1 list
+    sum_rings = 8
+    em1 = [prefix % iring for iring in range(sum_rings, sum_rings + (64 // 2))]
+
+    # EM2 list
+    sum_rings = 8 + 64
+    em2 = [prefix % iring for iring in range(sum_rings, sum_rings + (8 // 2))]
+
+    # EM3 list
+    sum_rings = 8 + 64 + 8
+    em3 = [prefix % iring for iring in range(sum_rings, sum_rings + (8 // 2))]
+
+    # HAD1 list
+    sum_rings = 8 + 64 + 8 + 8
+    had1 = [prefix % iring for iring in range(sum_rings, sum_rings + (4 // 2))]
+
+    # HAD2 list
+    sum_rings = 8 + 64 + 8 + 8 + 4
+    had2 = [prefix % iring for iring in range(sum_rings, sum_rings + (4 // 2))]
+
+    # HAD3 list
+    sum_rings = 8 + 64 + 8 + 8 + 4 + 4
+    had3 = [prefix % iring for iring in range(sum_rings, sum_rings + (4 // 2))]
+
+    return presample + em1 + em2 + em3 + had1 + had2 + had3
+
+
+class PreprocessMLP(BasePreprocessor):
+    """
+    Baseline Ringer preprocessor: the leading half of every calorimeter layer's ring
+    features (50 of 100, see _selected_ring_columns).
+
+    Column selection and sensor-anomaly cleaning are the inherited BasePreprocessor
+    defaults. It replaces the per-event norm1 with the NeuralRinger reference MLP scaling:
+    log1p of the ring energies (negative noise clipped to zero), then a per-feature
+    StandardScaler fitted on the training rows only. The scaler lives on the instance, so
+    joblib persistence restores it for evaluation with no extra code.
+
+    A ring column that is absent from the dataset raises KeyError during extraction rather
+    than being silently substituted.
     """
 
-    def __init__(
-        self, 
-        num_rings: int = 100, 
-        use_scaler: bool = True,
-        apply_log1p: bool = True
-    ) -> None:
+    def __init__(self) -> None:
         """
         Initializes PreprocessMLP instance.
+        """
+        self.feature_columns = _selected_ring_columns("cl_ring_%i")
+        self.scaler = StandardScaler()
+        self.is_fitted = False
+
+    @staticmethod
+    def _log_energies(X: np.ndarray) -> np.ndarray:
+        """
+        log1p of the ring energies with negative noise clipped to zero. The pre-scaler half
+        of the normalisation, shared by `fit` and `normalize`.
 
         Args:
-            num_rings (int): Number of ring features to extract. Defaults to 100.
-            use_scaler (bool): Whether to apply StandardScaler normalization. Defaults to True.
-            apply_log1p (bool): Whether to apply log1p transformation to energy values. Defaults to True.
-        """
-        self.num_rings = num_rings
-        self.use_scaler = use_scaler
-        self.apply_log1p = apply_log1p
-        self.ring_columns = [f"cl_ring_{i}" for i in range(self.num_rings)]
-        self.scaler = StandardScaler() if use_scaler else None
-
-    def transform(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Transforms input DataFrame into processed numpy feature matrix.
-
-        Args:
-            df (pd.DataFrame): Input DataFrame containing ring feature columns.
+            X (np.ndarray): Cleaned ring matrix, first dimension being the batch.
 
         Returns:
-            np.ndarray: Processed float32 feature array.
+            np.ndarray: Float32 array of the same shape, log1p(max(X, 0)).
         """
-        # Determine ring columns: check cl_ring_i first, with fallback to cl_truth_ring_i
-        cols = self.ring_columns
-        if not all(col in df.columns for col in cols):
-            fallback_cols = [f"cl_truth_ring_{i}" for i in range(self.num_rings)]
-            if all(col in df.columns for col in fallback_cols):
-                logger.info("ℹ️ Ring columns 'cl_ring_*' not found; using fallback 'cl_truth_ring_*'.")
-                cols = fallback_cols
-            else:
-                missing = [col for col in cols if col not in df.columns]
-                logger.error(f"❌ Missing ring columns in DataFrame: {missing}")
-                raise ValueError(f"❌ Missing ring columns in DataFrame: {missing}")
+        return np.log1p(np.clip(X, 0.0, None)).astype(np.float32)
 
-        logger.info(f"🧪 Extracting {len(cols)} ring features ({cols[0]} ... {cols[-1]})...")
-        X = df[cols].values.astype(np.float32)
-
-        # Handle sensor anomalies represented as -999 or NaNs
-        X = np.nan_to_num(X, nan=0.0)
-        X = np.where(X == -999, 0.0, X)
-
-        # Clip negative energy noise values and apply log1p transformation to compress tails
-        if self.apply_log1p:
-            X = np.log1p(np.clip(X, 0, None))
-
-        # Apply StandardScaler normalization across features
-        if self.scaler is not None:
-            logger.info("📐 Applying StandardScaler normalization...")
-            X = self.scaler.fit_transform(X).astype(np.float32)
-
-        return X
-
-    def get_labels(self, df: pd.DataFrame, label_col: str = 'label') -> Optional[np.ndarray]:
+    def fit(self, df: pd.DataFrame) -> "PreprocessMLP":
         """
-        Extracts target labels from DataFrame.
+        Fits the StandardScaler on the log1p-compressed training rings. MUST see the training
+        split only - the pipeline calls this via fit_transform on the train rows and then
+        reuses the fitted instance for evaluation.
 
         Args:
-            df (pd.DataFrame): Input DataFrame.
-            label_col (str): Label column name. Defaults to 'label'.
+            df (pd.DataFrame): Training rows.
 
         Returns:
-            Optional[np.ndarray]: Float32 numpy array of labels or None if column not found.
+            PreprocessMLP: self, for chaining.
         """
-        if label_col in df.columns:
-            return df[label_col].values.astype(np.float32)
+        X = self._log_energies(self.extract(df, self.feature_columns))
+        logger.info(f"📐 Fitting StandardScaler on {len(X)} training rows...")
+        self.scaler.fit(X)
+        self.is_fitted = True
+        return self
 
-        # Fallback check for common label column names
-        for fallback in ['label', 'has_truth_clus', 'target']:
-            if fallback in df.columns:
-                logger.info(f"ℹ️ Label column '{label_col}' not found, using fallback column '{fallback}'.")
-                return df[fallback].values.astype(np.float32)
+    def normalize(self, X: np.ndarray) -> np.ndarray:
+        """
+        Applies the fitted normalisation: log1p of the clipped ring energies, then the
+        per-feature StandardScaler learned in `fit`. Replaces the base norm1.
 
-        logger.warning(f"⚠️ Label column '{label_col}' not found in DataFrame.")
-        return None
+        Args:
+            X (np.ndarray): Cleaned ring matrix, first dimension being the batch.
 
+        Returns:
+            np.ndarray: Float32 array of the same shape, standardised per feature.
+
+        Raises:
+            RuntimeError: If called before `fit` (directly or via fit_transform).
+        """
+        if not self.is_fitted:
+            raise RuntimeError(
+                "❌ PreprocessMLP used before fit(). Call fit_transform() on the training rows first."
+            )
+        return self.scaler.transform(self._log_energies(X)).astype(np.float32)

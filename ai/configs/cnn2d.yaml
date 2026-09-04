@@ -6,9 +6,8 @@ max_epochs: 200
 batch_size: 64
 learning_rate: 0.001
 patience: 20
-num_workers: 0
 threshold: 0.8
-use_kfold: true
-n_splits: 3
-test_size: 0.15
+n_splits: 5
 accelerator: "auto"
+seed: 42                    # semente do holdout e da partição de folds; precisa ser a mesma
+                            # entre jobs paralelos de fold para todos verem o mesmo split
