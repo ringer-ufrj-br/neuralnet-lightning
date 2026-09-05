@@ -327,7 +327,8 @@ class ModelTrainer:
         n_splits: int = 5, 
         target_fold: Optional[int] = None,
         seed: int = 42,
-        n_inits: int = 1
+        n_inits: int = 1,
+        target_init: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
         Executes K-Fold cross-validation, creating a fresh model instance per fold with
@@ -351,6 +352,11 @@ class ModelTrainer:
             n_inits (int): Independent weight initialisations to train per fold, keeping the one
                 with the best monitored score. More than one mitigates the influence of local
                 minima. Defaults to 1.
+            target_init (Optional[int]): Train only this initialisation (1-indexed), for one
+                training per scheduler job. The checkpoint is left under its own
+                `fold_N_init_M` name and nothing is promoted or discarded - selecting the
+                winner is then a separate step (`run.py select`), because the sibling
+                initialisations are running in other jobs and may not exist yet.
 
         Returns:
             List[Dict[str, Any]]: One record per trained fold with keys 'fold', 'model',
@@ -411,7 +417,9 @@ class ModelTrainer:
             # A job killed mid-fold (a SLURM timeout, a Ctrl-C) leaves its per-init checkpoints
             # behind, and those would otherwise sit next to the fold's real checkpoint for ever.
             # Clear them before starting, so a rerun always begins from a clean slate.
-            for stale in glob.glob(os.path.join(self.checkpoint_dir, f"fold_{fold_number}_init_*.ckpt")):
+            init_glob = (f"fold_{fold_number}_init_{target_init}.ckpt" if target_init
+                         else f"fold_{fold_number}_init_*.ckpt")
+            for stale in glob.glob(os.path.join(self.checkpoint_dir, init_glob)):
                 logger.info(f"🧹 Removing checkpoint left by an interrupted run: {stale}")
                 _discard_checkpoint(stale)
 
@@ -419,14 +427,17 @@ class ModelTrainer:
             # fold keeps only the one that scored best on the monitored metric, which is how
             # the reference method mitigates the influence of local minima.
             best_init: Optional[Dict[str, Any]] = None
-            for init in range(1, n_inits + 1):
+            inits = [target_init] if target_init is not None else range(1, n_inits + 1)
+            for init in inits:
                 # Distinct but reproducible weights per (seed, fold, init). The data partition
                 # is untouched by this - it was already fixed by `seed` above.
                 pl.seed_everything(seed * 100_000 + fold_number * 1_000 + init, workers=True)
 
                 model = model_class(**current_model_kwargs)
 
-                init_name = f"fold_{fold_number}" if n_inits == 1 else f"fold_{fold_number}_init_{init}"
+                init_name = (f"fold_{fold_number}_init_{init}"
+                             if target_init is not None or n_inits > 1
+                             else f"fold_{fold_number}")
                 init_log_dir = os.path.join(self.log_dir, init_name)
                 trainer, loss_callback = self._build_trainer(
                     init_log_dir, self.checkpoint_dir, init_name
@@ -451,7 +462,11 @@ class ModelTrainer:
                     "epochs": int(trainer.current_epoch),
                 }
 
-                if best_init is None or self._is_better(score, best_init["best_score"]):
+                if target_init is not None:
+                    # One training per job: the siblings live in other jobs, so there is
+                    # nothing to compare against and nothing of theirs to delete.
+                    best_init = candidate
+                elif best_init is None or self._is_better(score, best_init["best_score"]):
                     if best_init is not None:
                         _discard_checkpoint(best_init["checkpoint"])
                     best_init = candidate
@@ -462,10 +477,13 @@ class ModelTrainer:
                     logger.info(f"   init {init}: {self.monitor_metric}={score:.6f}")
 
             # Settle the winner under the plain fold_N name the rest of the pipeline expects.
-            final_path = os.path.join(self.checkpoint_dir, f"fold_{fold_number}.ckpt")
-            if best_init["checkpoint"] and best_init["checkpoint"] != final_path:
-                os.replace(best_init["checkpoint"], final_path)
-                best_init["checkpoint"] = final_path
+            # Skipped when this job trained a single initialisation: `run.py select` promotes
+            # the winner once every sibling job has finished.
+            if target_init is None:
+                final_path = os.path.join(self.checkpoint_dir, f"fold_{fold_number}.ckpt")
+                if best_init["checkpoint"] and best_init["checkpoint"] != final_path:
+                    os.replace(best_init["checkpoint"], final_path)
+                    best_init["checkpoint"] = final_path
 
             fold_records.append({
                 "fold": fold_number,
@@ -481,6 +499,7 @@ class ModelTrainer:
                 "val_ids": np.asarray(val_ids, dtype=np.int64),
                 "n_inits": n_inits,
                 "best_init": best_init["init"],
+                "target_init": target_init,
             })
 
             if n_inits > 1:

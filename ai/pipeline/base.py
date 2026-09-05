@@ -17,6 +17,7 @@ requires retraining, and the numbers that end up in the table always come from a
 that is on disk and addressable.
 """
 
+import glob
 import hashlib
 import json
 import logging
@@ -378,7 +379,8 @@ class BasePipeline:
         learning_rate: float = 0.001,
         target_fold: Optional[int] = None,
         seed: int = 42,
-        n_inits: int = 1
+        n_inits: int = 1,
+        target_init: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
         Trains the cross-validation folds and persists every artefact `evaluate` will need.
@@ -394,6 +396,9 @@ class BasePipeline:
             target_fold (Optional[int]): Train only this fold (1-indexed), for SLURM parallelism.
             seed (int): Seed for the fold partition. Defaults to 42.
             n_inits (int): Independent initialisations per fold; the best is kept. Defaults to 1.
+            target_init (Optional[int]): Train only this initialisation (1-indexed), leaving the
+                checkpoint under its own name and the winner unpicked. One training per
+                scheduler job; `select_best_inits` finishes the job afterwards.
 
         Returns:
             List[Dict[str, Any]]: The fold records returned by ModelTrainer.fit_kfold.
@@ -442,14 +447,18 @@ class BasePipeline:
 
         fold_records = self.trainer.fit_kfold(
             self.model_class, model_kwargs, X_all, Y,
-            n_splits=n_splits, target_fold=target_fold, seed=seed, n_inits=n_inits
+            n_splits=n_splits, target_fold=target_fold, seed=seed, n_inits=n_inits,
+            target_init=target_init
         )
 
         os.makedirs(self.history_dir, exist_ok=True)
         for record in fold_records:
             fold = record["fold"]
+            # One training per job: this job owns only its own initialisation's artefacts.
+            # `select_best_inits` renames the winner's to the plain fold_N names afterwards.
+            stem = f"fold_{fold}" if target_init is None else f"fold_{fold}_init_{target_init}"
 
-            history_path = os.path.join(self.history_dir, f"fold_{fold}.csv")
+            history_path = os.path.join(self.history_dir, f"{stem}.csv")
             loss_callback = record["loss_callback"]
             pd.DataFrame({
                 "epoch": range(max(len(loss_callback.train_loss), len(loss_callback.val_loss))),
@@ -467,6 +476,7 @@ class BasePipeline:
 
             _atomic_write_json({
                 "fold": fold,
+                "init": target_init,
                 "checkpoint": os.path.relpath(record["checkpoint"], self.results_dir),
                 "val_indices": val_rel,
                 "n_inits": record.get("n_inits", 1),
@@ -479,11 +489,88 @@ class BasePipeline:
                 "n_val": record["n_val"],
                 "model_kwargs": {k: v for k, v in model_kwargs.items()},
                 "history": os.path.relpath(history_path, self.results_dir),
-            }, os.path.join(self.checkpoints_dir, f"fold_{fold}.json"))
+            }, os.path.join(self.checkpoints_dir, f"{stem}.json"))
 
         logger.info(f"✅ Training complete. Artefacts under: {self.results_dir}")
-        logger.info(f"   Next: python ai/run.py evaluate {self.cli_region_args()}")
+        if target_init is None:
+            logger.info(f"   Next: python ai/run.py evaluate {self.cli_region_args()}")
+        else:
+            logger.info(f"   Next, once every initialisation of this region has finished: "
+                        f"python ai/run.py select {self.cli_region_args()}")
         return fold_records
+
+    def select_best_inits(self) -> Dict[int, Dict[str, Any]]:
+        """
+        Picks each fold's best initialisation and promotes it to the plain `fold_N` names the
+        rest of the pipeline expects.
+
+        This is the join point of the one-training-per-job layout: every (fold, init) job wrote
+        `fold_N_init_M.ckpt` plus a sidecar with its monitored score, and nothing compared them
+        because the siblings were still running elsewhere. Here they are all on disk, so the
+        winner per fold is renamed to `fold_N.ckpt` / `fold_N.json` / `history/fold_N.csv` and
+        the losing checkpoints are deleted - otherwise n_inits would multiply the checkpoints
+        on disk.
+
+        Idempotent: a region whose folds are already settled is left alone, so re-running a
+        failed scheduler step is safe.
+
+        Returns:
+            Dict[int, Dict[str, Any]]: The winning sidecar per fold.
+
+        Raises:
+            FileNotFoundError: If no per-initialisation sidecar exists for this region.
+        """
+        pattern = os.path.join(self.checkpoints_dir, "fold_*_init_*.json")
+        per_init: Dict[int, List[Dict[str, Any]]] = {}
+        for path in sorted(glob.glob(pattern)):
+            with open(path) as handle:
+                info = json.load(handle)
+            info["_sidecar"] = path
+            per_init.setdefault(int(info["fold"]), []).append(info)
+
+        if not per_init:
+            settled = self.load_fold_infos()
+            if settled:
+                logger.info(f"✔️ {self.region_label()}: already settled ({len(settled)} fold(s)).")
+                return settled
+            raise FileNotFoundError(
+                f"❌ No per-initialisation sidecars in '{self.checkpoints_dir}'. Run `train` first."
+            )
+
+        better = max if self.monitor_mode == "max" else min
+        winners: Dict[int, Dict[str, Any]] = {}
+        for fold, candidates in sorted(per_init.items()):
+            scored = [c for c in candidates if c.get("best_score") is not None]
+            winner = better(scored or candidates, key=lambda c: c.get("best_score") or 0.0)
+            logger.info(f"🏆 Fold {fold}: kept initialisation {winner['init']} of "
+                        f"{len(candidates)} ({self.monitor_metric}={winner.get('best_score')})")
+
+            for name, key in (("ckpt", "checkpoint"), ("csv", "history")):
+                source = os.path.join(self.results_dir, winner[key])
+                target = os.path.join(os.path.dirname(source), f"fold_{fold}.{name}")
+                if os.path.exists(source):
+                    os.replace(source, target)
+                winner[key] = os.path.relpath(target, self.results_dir)
+
+            winner.pop("init", None)
+            winner["n_inits"] = len(candidates)
+            _atomic_write_json({k: v for k, v in winner.items() if k != "_sidecar"},
+                               os.path.join(self.checkpoints_dir, f"fold_{fold}.json"))
+            winners[fold] = winner
+
+            for loser in candidates:
+                if loser is winner:
+                    continue
+                for key in ("checkpoint", "history"):
+                    path = os.path.join(self.results_dir, loser[key])
+                    if os.path.exists(path):
+                        os.remove(path)
+            for entry in candidates:
+                os.remove(entry["_sidecar"])
+
+        logger.info(f"✅ {self.region_label()}: {len(winners)} fold(s) settled.")
+        logger.info(f"   Next: python ai/run.py evaluate {self.cli_region_args()}")
+        return winners
 
     # --------------------------------------------------------------- evaluate
 

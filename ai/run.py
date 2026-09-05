@@ -4,11 +4,15 @@ Entrypoint for the ATLAS/CERN neural network experiments.
 Three subcommands, deliberately separate:
 
     python ai/run.py train    --config ai/configs/mlp.yaml [--fold N] [--et-bin i --eta-bin j]
+    python ai/run.py train    --config ai/configs/mlp.yaml --et-bin i --eta-bin j --fold N --init M
+    python ai/run.py select   --config ai/configs/mlp.yaml [--et-bin i --eta-bin j]
     python ai/run.py evaluate --config ai/configs/mlp.yaml [--et-bin i --eta-bin j]
     python ai/run.py report   --config ai/configs/mlp.yaml
     python ai/run.py grid     --config ai/configs/mlp.yaml [--format shape|pairs|describe]
 
-`train` only produces models and the artefacts needed to reload them; `evaluate` turns those
+`train` only produces models and the artefacts needed to reload them - with `--fold`/`--init`
+it trains exactly one model, which is what lets a scheduler run one training per job, and
+`select` then promotes each fold's best initialisation; `evaluate` turns those
 models into scores, metrics and plots for one kinematic region; `report` aggregates every
 evaluated region into the cross-validation table ("pd_table") as LaTeX and as a figure; `grid`
 just prints the Et x |eta| regions the config defines, so a launcher can fan out over them
@@ -166,6 +170,10 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser = subparsers.add_parser("train", help="Train the cross-validation folds and persist the models.")
     add_common_arguments(train_parser)
     train_parser.add_argument('--fold', type=int, default=None, help="Train a specific fold only (1-indexed; useful for SLURM parallelism).")
+    train_parser.add_argument('--init', type=int, default=None, help="Train a specific initialisation only (1-indexed; requires --fold). One training per job: the checkpoint keeps its fold_N_init_M name and `select` picks the winner afterwards.")
+
+    select_parser = subparsers.add_parser("select", help="Pick each fold's best initialisation and promote it, after one-training-per-job runs.")
+    add_common_arguments(select_parser)
 
     evaluate_parser = subparsers.add_parser("evaluate", help="Score the trained folds and produce metrics and plots for one region.")
     add_common_arguments(evaluate_parser)
@@ -261,13 +269,23 @@ def main() -> None:
     pipeline = build_pipeline(config, args)
 
     if args.command == "train":
+        if args.init is not None and args.fold is None:
+            logger.error("❌ --init needs --fold too: one training is one (fold, init) pair.")
+            sys.exit(1)
         pipeline.train(
             n_splits=config.get("n_splits", 5),
             learning_rate=config.get("learning_rate", 0.001),
             target_fold=args.fold,
             seed=config.get("seed", 42),
-            n_inits=config.get("n_inits", 1)
+            n_inits=config.get("n_inits", 1),
+            target_init=args.init
         )
+    elif args.command == "select":
+        try:
+            pipeline.select_best_inits()
+        except FileNotFoundError as exc:
+            logger.error(str(exc))
+            sys.exit(1)
     elif args.command == "evaluate":
         try:
             pipeline.evaluate(
