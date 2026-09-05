@@ -1,12 +1,211 @@
+"""
+Preprocessing: raw parquet columns in, model input out.
+
+Two halves, in the order the data flows through them:
+
+* `DatasetSchema` maps a *particular* dataset's columns onto a fixed canonical vocabulary -
+  `label`, `et`, `eta`, `ring_0 ... ring_99`, `row_id` - as polars expressions applied inside
+  the lazy scan. A ring stored as element `i` of a nested list therefore costs the same to
+  read as one in its own column, and columns nobody asked for are never touched. Only what
+  differs between datasets is configurable, so the block is flat:
+
+      dataset:
+        data_path: .../electron_ringer.parquet
+        rings_col: "TrigEMClusterContainer.ringsE"
+        et_col:    "TrigEMClusterContainer.et"
+        eta_col:   "TrigEMClusterContainer.eta"
+        label_col: target
+
+  The defaults describe the mc25 layout, so a config that declares no `dataset:` block
+  describes those tables.
+
+* `BasePreprocessor` turns those canonical columns into the array a model consumes. The same
+  architecture on a different dataset is a different model: it gets its own config, and its
+  own preprocessor module when the transform differs too.
+"""
+
+from dataclasses import asdict, dataclass
 import os
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import joblib
 import numpy as np
 import pandas as pd
+import polars as pl
 
 logger = logging.getLogger(__name__)
+
+
+#: Canonical names. Et and eta keep the source column's unit (MeV / signed), matching the
+#: edges in ai.binning.kinematics. Rings are addressed by index, never by the source dataset's
+#: naming, which is what makes the preprocessors dataset agnostic.
+LABEL, ET, ETA, RING, ROW_ID = "label", "et", "eta", "ring_%i", "row_id"
+
+#: Stable per-row key, where a dataset has one. A dataset without it simply has no column of
+#: this name, and ROW_ID is then never offered - the fingerprint falls back to Et.
+ROW_ID_COL = "id"
+
+#: The Ringer layout: 100 rings across pre-sample, EM1-3 and HAD1-3. The per-layer split is
+#: spelled out in ai/preprocess/mlp.py, where the feature selection needs it.
+N_RINGS: int = 100
+
+
+def ring_name(index: int) -> str:
+    """Canonical name of a ring feature, e.g. 'ring_37'."""
+    return RING % index
+
+
+@dataclass(frozen=True)
+class DatasetSchema:
+    """
+    One dataset's on-disk layout. Defaults describe the mc25 tables.
+
+    `rings_col` covers both storage shapes, told apart by the placeholder: a name containing
+    '%i' is a printf template for one scalar column per ring ('cl_ring_%i'), anything else is
+    a single nested list column holding all 100.
+
+    `label_col` names the column holding the 0/1 target. Left unset, the dataset has no such
+    column and the label is read off the source file name instead (see ai.label.label_generator).
+    """
+
+    data_path: Optional[str] = None
+    max_files: Optional[int] = None
+    rings_col: str = "cl_ring_%i"
+    et_col: str = "cl_et"
+    eta_col: str = "cl_eta"
+    label_col: Optional[str] = None
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "DatasetSchema":
+        """
+        Builds a schema from a config's `dataset:` block. `data_path` and `max_files` are
+        also accepted at the top level of the config, and every field defaults to the mc25
+        layout, so a config that declares no `dataset:` block describes those tables.
+        """
+        block = dict(config.get("dataset") or {})
+        return cls(
+            data_path=block.get("data_path", config.get("data_path")),
+            max_files=block.get("max_files", config.get("max_files")),
+            rings_col=str(block.get("rings_col", "cl_ring_%i")),
+            et_col=str(block.get("et_col", "cl_et")),
+            eta_col=str(block.get("eta_col", "cl_eta")),
+            label_col=block.get("label_col"),
+        )
+
+    def describe(self) -> Dict[str, Any]:
+        """JSON form, recorded in the manifest so a run's layout is recoverable."""
+        return asdict(self)
+
+    @property
+    def rings_are_listed(self) -> bool:
+        """Whether all rings live in one nested list column, rather than one column each."""
+        return "%i" not in self.rings_col and "%d" not in self.rings_col
+
+    @property
+    def needs_file_paths(self) -> bool:
+        """Whether the label can only be recovered from the originating file name."""
+        return self.label_col is None
+
+    def ring_source_columns(self) -> List[str]:
+        """The source columns the rings live in."""
+        if self.rings_are_listed:
+            return [self.rings_col]
+        return [self.rings_col % i for i in range(N_RINGS)]
+
+    # ------------------------------------------------------------------ names
+
+    def canonical_columns(self, source_names: Sequence[str]) -> List[str]:
+        """
+        The canonical vocabulary available over a scanned frame: the rings, the kinematics, the
+        label, plus any source column exposed under its own name (the cell images).
+
+        This is what a preprocessor's `required_columns` is handed, so preprocessors never see
+        - and never have to recognise - a source column name.
+        """
+        available = set(source_names)
+        names: List[str] = []
+        if self.rings_are_listed:
+            if self.rings_col in available:
+                names += [ring_name(i) for i in range(N_RINGS)]
+        else:
+            names += [ring_name(i) for i in range(N_RINGS) if self.rings_col % i in available]
+        if self.et_col in available:
+            names.append(ET)
+        if self.eta_col in available:
+            names.append(ETA)
+        if ROW_ID_COL in available:
+            names.append(ROW_ID)
+        names.append(LABEL)
+
+        hidden = self._aliased_columns() | set(names)
+        names += [name for name in source_names if name not in hidden]
+        return list(dict.fromkeys(names))
+
+    def _aliased_columns(self) -> set:
+        """
+        Columns of the scanned frame reachable only through a canonical alias, plus the scan's
+        own bookkeeping - never offered as features.
+        """
+        hidden = set(self.ring_source_columns())
+        hidden |= {self.et_col, self.eta_col, ROW_ID_COL, "file_path"}
+        if self.label_col:
+            hidden.add(self.label_col)
+        return hidden
+
+    # ------------------------------------------------------------------ exprs
+
+    def select_expr(self, name: str) -> pl.Expr:
+        """The expression producing one canonical column."""
+        if name == ET:
+            return pl.col(self.et_col).alias(ET)
+        if name == ETA:
+            return pl.col(self.eta_col).alias(ETA)
+        if name == ROW_ID:
+            return pl.col(ROW_ID_COL).alias(ROW_ID)
+        if name == LABEL:
+            return self.label_expr()
+
+        prefix = RING.split("%")[0]
+        if name.startswith(prefix) and name[len(prefix):].isdigit():
+            return self.ring_expr(int(name[len(prefix):]))
+        return pl.col(name)
+
+    def ring_expr(self, index: int) -> pl.Expr:
+        """
+        Ring `index` under its canonical name, from either storage shape.
+
+        Raises:
+            IndexError: If the index is outside the Ringer layout.
+        """
+        if not 0 <= index < N_RINGS:
+            raise IndexError(f"❌ Ring {index} is out of range for {N_RINGS} rings.")
+        alias = ring_name(index)
+        if self.rings_are_listed:
+            return pl.col(self.rings_col).list.get(index).alias(alias)
+        return pl.col(self.rings_col % index).alias(alias)
+
+    def label_expr(self) -> pl.Expr:
+        """The canonical Int8 label, from `label_col` or from the file path."""
+        if self.label_col:
+            return pl.col(self.label_col).cast(pl.Int8).alias(LABEL)
+
+        from ai.label.label_generator import label_expr
+
+        return label_expr(label_col=LABEL)
+
+    # ------------------------------------------------------------------- scan
+
+    def scan(self, files: Sequence[str]) -> pl.LazyFrame:
+        """Opens the lazy scan over the data files. Nothing is read here."""
+        return pl.scan_parquet(list(files), include_file_paths="file_path", low_memory=True)
+
+    def project(self, frame: pl.LazyFrame, columns: Sequence[str]) -> pl.LazyFrame:
+        """
+        Rewrites a scanned frame down to the requested canonical columns. Pruning happens here,
+        inside the scan: the raw files carry hundreds of columns, most of them nested images.
+        """
+        return frame.select([self.select_expr(name) for name in dict.fromkeys(columns)])
 
 
 class BasePreprocessor:

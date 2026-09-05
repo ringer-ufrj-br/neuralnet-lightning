@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from ai.loader.loader import DataLoader
-from ai.label.label_generator import LabelGenerator
+from ai.label.label_generator import validate_files
 from ai.trainer.trainer import ModelTrainer
 from ai.evaluation.monitor import ModelMonitor
 from ai.evaluation.summary import (
@@ -44,9 +44,8 @@ from ai.evaluation.summary import (
     compute_metrics,
     compute_operating_points,
 )
-from ai.binning.kinematics import bin_filter_expr, bin_label, bin_description
-
-MANIFEST_VERSION = 1
+from ai.binning.kinematics import GRID
+from ai.preprocess.base import ET, ETA, LABEL, ROW_ID, DatasetSchema
 
 
 def _atomic_write_json(payload: Dict[str, Any], filepath: str) -> str:
@@ -96,9 +95,8 @@ class BasePipeline:
 
     def __init__(
         self,
-        data_path: Optional[str] = None,
-        max_files: Optional[int] = None,
-        label_col: str = 'label',
+        schema: Optional[DatasetSchema] = None,
+        results_root: str = "results",
         max_epochs: int = 20,
         batch_size: int = 32,
         patience: int = 5,
@@ -110,36 +108,47 @@ class BasePipeline:
         """
         Initializes the pipeline and resolves the results directory for this kinematic region.
 
+        Nothing here knows the dataset's column names: the schema translates whatever is on
+        disk into the canonical `label` / `et` / `eta` / `ring_i` vocabulary every stage below
+        works in, and the binning carries the region edges the dataset was defined against.
+
         Args:
-            data_path (Optional[str]): Data folder or pattern path.
-            max_files (Optional[int]): Maximum number of files to process per folder.
-            label_col (str): Column name containing labels. Defaults to 'label'.
+            schema (Optional[DatasetSchema]): Dataset layout. Defaults to the mc25 layout.
+            results_root (str): Root the artefacts are written under, as
+                `<results_root>/<model>/<region>`. Give each dataset its own root: the region
+                directories are named after bin *indices*, so two datasets sharing a root
+                would silently overwrite each other's identically-named regions. Defaults to
+                'results'.
             max_epochs (int): Maximum training epochs. Defaults to 20.
             batch_size (int): Training batch size. Defaults to 32.
             patience (int): Early stopping patience. Defaults to 5.
             accelerator (str): PyTorch Lightning accelerator ('auto', 'cpu', 'cuda'). Defaults to 'auto'.
             devices (Union[int, str, List[int]]): Devices specification. Defaults to 'auto'.
-            et_bin (Optional[int]): Et bin index (0-4, see ai.binning.kinematics). Trains on the
-                whole dataset when None (together with eta_bin) or on only that kinematic slice
-                when both are set - the standard 5x5=25-network Ringer scheme. Defaults to None.
-            eta_bin (Optional[int]): |eta| bin index (0-4). Defaults to None.
+            et_bin (Optional[int]): Et bin index. Trains on the whole dataset when None
+                (together with eta_bin) or on only that kinematic slice when both are set -
+                the Ringer one-network-per-region scheme. Defaults to None.
+            eta_bin (Optional[int]): |eta| bin index. Defaults to None.
 
         Raises:
-            ValueError: If exactly one of et_bin/eta_bin is set.
+            ValueError: If exactly one of et_bin/eta_bin is set, or if the region is outside
+                the configured grid.
         """
         if (et_bin is None) != (eta_bin is None):
             raise ValueError("❌ et_bin and eta_bin must be set together (or both left as None).")
 
-        self.label_col = label_col
-        self.data_path = data_path
-        self.max_files = max_files
+        self.schema = schema or DatasetSchema()
+        self.label_col = LABEL
+        self.data_path = self.schema.data_path
+        self.max_files = self.schema.max_files
         self.et_bin = et_bin
         self.eta_bin = eta_bin
 
-        self.results_dir = os.path.join("results", self.model_name)
+        self.results_root = results_root
+        self.results_dir = os.path.join(results_root, self.model_name)
         if et_bin is not None:
-            self.results_dir = os.path.join(self.results_dir, bin_label(et_bin, eta_bin))
-            logger.info(f"🎯 Kinematic bin selected: {bin_description(et_bin, eta_bin)}")
+            GRID.validate(et_bin, eta_bin)
+            self.results_dir = os.path.join(self.results_dir, GRID.bin_label(et_bin, eta_bin))
+            logger.info(f"🎯 Kinematic bin selected: {GRID.bin_description(et_bin, eta_bin)}")
 
         self.artifacts_dir = os.path.join(self.results_dir, "artifacts")
         self.checkpoints_dir = os.path.join(self.results_dir, "checkpoints")
@@ -148,7 +157,7 @@ class BasePipeline:
         self.manifest_path = os.path.join(self.artifacts_dir, "manifest.json")
         self.preprocessor_path = os.path.join(self.artifacts_dir, "preprocessor.joblib")
 
-        self.loader = DataLoader(data_path=data_path, max_files=max_files)
+        self.loader = DataLoader(data_path=self.data_path, max_files=self.max_files)
         self.preprocessor = self.build_preprocessor()
 
         self.trainer = ModelTrainer(
@@ -183,8 +192,7 @@ class BasePipeline:
         """
         if getattr(self, "preprocessor_class", None) is None:
             raise NotImplementedError(
-                f"{type(self).__name__} must set preprocessor_class or override "
-                f"build_preprocessor()."
+                f"{type(self).__name__} must set preprocessor_class or override build_preprocessor()."
             )
         return self.preprocessor_class()
 
@@ -220,11 +228,13 @@ class BasePipeline:
 
     def load_dataframe(self) -> Optional[pd.DataFrame]:
         """
-        Loads the dataset, attaches labels and applies the kinematic bin cut.
+        Loads the dataset in the canonical column vocabulary and applies the kinematic cut.
 
-        Runs as a single lazy polars query - column projection, per-file labelling and the
-        bin filter all happen inside the streaming parquet scan - so peak memory is bound by
-        the selected columns of the selected rows, never by the full dataset.
+        Runs as a single lazy polars query - the join with any side table, the column
+        projection, the label derivation and the region filter all happen inside the streaming
+        parquet scan - so peak memory is bound by the selected columns of the selected rows,
+        never by the full dataset. A ring stored as element `i` of a nested list is projected
+        exactly like one stored in its own column, so the layout costs nothing either way.
 
         Deterministic given the same files on disk, which is what lets `train` and `evaluate`
         run as separate processes over the same row ordering.
@@ -238,32 +248,29 @@ class BasePipeline:
             logger.error("❌ No data was loaded.")
             return None
 
-        LabelGenerator.validate_files(files)
+        if self.schema.needs_file_paths:
+            validate_files(files)
 
-        lazy_frame = self.loader.scan(files)
-        available = [name for name in lazy_frame.collect_schema().names() if name != 'file_path']
-
-        logger.info("🏷️ Generating labels...")
-        lazy_frame = lazy_frame.with_columns(
-            LabelGenerator.label_expr(file_path_col='file_path', label_col=self.label_col)
-        )
+        lazy_frame = self.schema.scan(files)
+        available = self.schema.canonical_columns(lazy_frame.collect_schema().names())
 
         columns = self.required_columns(available)
-        if columns is not None:
-            keep = list(dict.fromkeys(
-                list(columns)
-                + [col for col in ('cl_et', 'cl_eta') if col in available]
-                + [self.label_col]
-            ))
-            logger.info(f"🔎 Projecting scan down to {len(keep)} of {len(available)} columns.")
-            lazy_frame = lazy_frame.select(keep)
-        else:
-            lazy_frame = lazy_frame.drop('file_path')
+        if columns is None:
+            columns = [name for name in available if name != self.label_col]
+        keep = list(dict.fromkeys(
+            list(columns)
+            + [name for name in (ET, ETA, ROW_ID) if name in available]
+            + [self.label_col]
+        ))
+        logger.info(f"🔎 Projecting scan down to {len(keep)} canonical column(s).")
+        lazy_frame = self.schema.project(lazy_frame, keep)
 
         if self.et_bin is not None:
-            logger.info(f"✂️ Restricting to kinematic bin {bin_label(self.et_bin, self.eta_bin)} "
-                        f"({bin_description(self.et_bin, self.eta_bin)})...")
-            lazy_frame = lazy_frame.filter(bin_filter_expr(self.et_bin, self.eta_bin))
+            logger.info(f"✂️ Restricting to kinematic bin {GRID.bin_label(self.et_bin, self.eta_bin)} "
+                        f"({GRID.bin_description(self.et_bin, self.eta_bin)})...")
+            lazy_frame = lazy_frame.filter(
+                GRID.filter_expr(self.et_bin, self.eta_bin, ET, ETA)
+            )
 
         df = lazy_frame.collect(engine="streaming").to_pandas()
 
@@ -274,25 +281,32 @@ class BasePipeline:
                 logger.error("❌ No data was loaded.")
             return None
 
+        if df[self.label_col].isna().any():
+            raise RuntimeError(
+                f"❌ {int(df[self.label_col].isna().sum())} row(s) have no label. Check "
+                f"dataset.label in the config against the dataset's actual contents."
+            )
+
         logger.info(f"   {len(df)} rows loaded.")
         return df
+
 
     def dataset_fingerprint(self, df: pd.DataFrame, Y: np.ndarray) -> Dict[str, Any]:
         """
         Describes the exact dataset the fold indices were drawn from, so `evaluate` can
         refuse to run against a different one.
 
-        The parquet rows carry no stable physical key - (run_number, event_number, cl_idx)
-        repeats heavily across files - so rows can only be referenced positionally.
-        That makes this fingerprint the guard rail: it pins the file list, the row/class
-        counts and an order-sensitive row digest; a mismatch means the positional indices no
-        longer point at the same rows.
+        Rows are referenced positionally, because not every dataset has a stable physical key
+        (the mc25 tables' (run_number, event_number, cl_idx) repeats heavily across files).
+        That makes this fingerprint the guard rail: it pins the file list, the row/class counts
+        and an order-sensitive row digest; a mismatch means the positional indices no longer
+        point at the same rows.
 
-        The row digest hashes the label sequence and the cl_et sequence in row order. Counts
-        alone are permutation-invariant, and labels alone are constant within each source file
-        (they derive from the file path), so only a per-row quantity like cl_et makes a
-        reordering *inside* a file - which streaming collects are in principle free to do -
-        detectable.
+        The row digest hashes the label sequence plus a per-row quantity in row order - the
+        dataset's own row id when it has one, otherwise Et. Counts alone are permutation
+        invariant, and labels alone can be constant within a source file, so only a per-row
+        quantity makes a reordering *inside* a file - which streaming collects are in principle
+        free to do - detectable.
 
         Args:
             df (pd.DataFrame): The loaded DataFrame.
@@ -305,8 +319,14 @@ class BasePipeline:
         digest = hashlib.sha1("\n".join(files).encode()).hexdigest()
 
         row_hasher = hashlib.sha1(np.ascontiguousarray(Y, dtype=np.int8).tobytes())
-        if 'cl_et' in df.columns:
-            row_hasher.update(np.ascontiguousarray(df['cl_et'].to_numpy(), dtype=np.float32).tobytes())
+        if ROW_ID in df.columns:
+            row_key = ("row_id", np.ascontiguousarray(df[ROW_ID].to_numpy(), dtype=np.uint64))
+        elif ET in df.columns:
+            row_key = ("et", np.ascontiguousarray(df[ET].to_numpy(), dtype=np.float32))
+        else:
+            row_key = ("labels_only", None)
+        if row_key[1] is not None:
+            row_hasher.update(row_key[1].tobytes())
 
         return {
             "data_path": self.data_path,
@@ -316,6 +336,7 @@ class BasePipeline:
             "n_rows": int(len(df)),
             "n_positives": int((Y == 1).sum()),
             "n_negatives": int((Y == 0).sum()),
+            "row_key": row_key[0],
             "rows_sha1": row_hasher.hexdigest(),
         }
 
@@ -332,11 +353,15 @@ class BasePipeline:
         Raises:
             RuntimeError: If the fingerprints disagree.
         """
-        blocking = ["n_rows", "n_files", "files_sha1", "n_positives", "n_negatives", "rows_sha1"]
+        # Only keys the stored fingerprint carries are compared: a manifest that omits one
+        # says nothing about it, and the remaining keys - `rows_sha1` above all - still catch
+        # a dataset that moved under the fold indices.
+        blocking = ["n_rows", "n_files", "files_sha1", "n_positives", "n_negatives",
+                    "row_key", "rows_sha1"]
         differences = [
             f"{key}: trained on {stored.get(key)!r}, now {current.get(key)!r}"
             for key in blocking
-            if stored.get(key) != current.get(key)
+            if key in stored and stored.get(key) != current.get(key)
         ]
         if differences:
             raise RuntimeError(
@@ -394,7 +419,6 @@ class BasePipeline:
         self.preprocessor.save(self.preprocessor_path)
 
         _atomic_write_json({
-            "manifest_version": MANIFEST_VERSION,
             "model": self.model_name,
             "model_class": self.model_class.__name__,
             "et_bin": self.et_bin,
@@ -408,6 +432,7 @@ class BasePipeline:
             "monitor_metric": self.monitor_metric,
             "n_rows": int(len(df)),
             "dataset": self.dataset_fingerprint(df, Y),
+            "schema": self.schema.describe(),
             "preprocessor": os.path.relpath(self.preprocessor_path, self.results_dir),
         }, self.manifest_path)
         logger.info(f"📄 Wrote manifest: {self.manifest_path}")
@@ -600,7 +625,7 @@ class BasePipeline:
         # without re-running inference.
         kinematics = {
             column: df[column].to_numpy()
-            for column in ("cl_et", "cl_eta") if column in df.columns
+            for column in (ET, ETA, ROW_ID) if column in df.columns
         }
 
         def out_of_sample_mask(fold: int) -> Optional[np.ndarray]:
@@ -767,7 +792,7 @@ class BasePipeline:
         """
         if self.et_bin is None:
             return "full phase space"
-        return bin_label(self.et_bin, self.eta_bin)
+        return GRID.bin_label(self.et_bin, self.eta_bin)
 
     def cli_region_args(self) -> str:
         """

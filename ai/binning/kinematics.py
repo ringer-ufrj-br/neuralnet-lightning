@@ -1,129 +1,133 @@
+"""
+Kinematic binning: the Et x |eta| grid the Ringer scheme trains one network per cell of.
+
+The grid is fixed - it is the ATLAS standard binning, the same for every dataset here - so it
+lives as constants and there is exactly one `GRID` instance to read them from. Et is compared
+in the unit the dataset stores (MeV in every dataset so far) and only converted for display.
+"""
+
+import logging
+from typing import List, Tuple
+
 import numpy as np
 import polars as pl
-from typing import List
 
-# Et bin edges in GeV (lower edge of each bin; the last bin is open-ended). `cl_et` in the
-# dataset is stored in MeV, so callers must convert (this module does it internally).
-ET_BIN_EDGES_GEV: List[float] = [15.0, 20.0, 30.0, 40.0, 50.0]
+logger = logging.getLogger(__name__)
 
-# |eta| bin edges - closed at both ends (values >= ETA_BIN_EDGES[-1] fall outside ATLAS
-# calorimeter acceptance and are excluded, unlike the open-ended top Et bin).
-ETA_BIN_EDGES: List[float] = [0.0, 0.8, 1.37, 1.54, 2.37, 2.5]
+#: Et bin edges in MeV, one more than there are bins; the last is open-ended.
+ET_EDGES: List[float] = [15e3, 20e3, 30e3, 40e3, 50e3, float("inf")]
 
-N_ET_BINS = len(ET_BIN_EDGES_GEV)
-N_ETA_BINS = len(ETA_BIN_EDGES) - 1
-N_BINS = N_ET_BINS * N_ETA_BINS  # 25
+#: |eta| bin edges, closed at both ends - at or above the last is outside acceptance.
+ETA_EDGES: List[float] = [0.0, 0.8, 1.37, 1.54, 2.37, 2.5]
+
+#: Et is stored in MeV and printed in GeV.
+ET_SCALE, ET_UNIT = 1e-3, "GeV"
 
 
-def et_bin_index(et_mev: np.ndarray) -> np.ndarray:
-    """
-    Computes the Et bin index (0-4) for each value, or -1 if below the lowest edge (15 GeV).
-    The top bin (index 4) is open-ended (>= 50 GeV).
+class Binning:
+    """The Et x |eta| grid. One instance, `GRID`, built from the constants above."""
 
-    Args:
-        et_mev (np.ndarray): Cluster transverse energy in MeV (as stored in `cl_et`).
+    et_edges = ET_EDGES
+    eta_edges = ETA_EDGES
 
-    Returns:
-        np.ndarray: Integer bin indices, same shape as input, -1 for out-of-range values.
-    """
-    et_gev = np.asarray(et_mev, dtype=np.float64) / 1000.0
-    idx = np.searchsorted(ET_BIN_EDGES_GEV, et_gev, side="right") - 1
-    idx = np.where(et_gev < ET_BIN_EDGES_GEV[0], -1, idx)
-    return idx
+    @property
+    def n_et_bins(self) -> int:
+        """Number of Et bins."""
+        return len(self.et_edges) - 1
+
+    @property
+    def n_eta_bins(self) -> int:
+        """Number of |eta| bins."""
+        return len(self.eta_edges) - 1
+
+    @property
+    def n_bins(self) -> int:
+        """Total regions, i.e. how many networks the grid asks for."""
+        return self.n_et_bins * self.n_eta_bins
+
+    @property
+    def regions(self) -> List[Tuple[int, int]]:
+        """Every (et_bin, eta_bin) pair in row-major order - what a launcher fans out over."""
+        return [(et, eta) for et in range(self.n_et_bins) for eta in range(self.n_eta_bins)]
+
+    def validate(self, et_bin: int, eta_bin: int) -> None:
+        """
+        Checks a region index pair against the grid.
+
+        Raises:
+            ValueError: If either index is outside the grid.
+        """
+        if not 0 <= et_bin < self.n_et_bins:
+            raise ValueError(f"❌ et_bin {et_bin} is outside the grid (0-{self.n_et_bins - 1}).")
+        if not 0 <= eta_bin < self.n_eta_bins:
+            raise ValueError(f"❌ eta_bin {eta_bin} is outside the grid (0-{self.n_eta_bins - 1}).")
+
+    # ------------------------------------------------------------------ index
+
+    def et_bin_index(self, et_mev: np.ndarray) -> np.ndarray:
+        """Et bin of each value (MeV), -1 outside the grid."""
+        values = np.asarray(et_mev, dtype=np.float64)
+        idx = np.searchsorted(self.et_edges[:-1], values, side="right") - 1
+        return np.where((values < self.et_edges[0]) | (values >= self.et_edges[-1]), -1, idx)
+
+    def eta_bin_index(self, eta: np.ndarray) -> np.ndarray:
+        """|eta| bin of each signed eta, -1 outside the grid."""
+        abs_eta = np.abs(np.asarray(eta, dtype=np.float64))
+        idx = np.searchsorted(self.eta_edges[:-1], abs_eta, side="right") - 1
+        return np.where(abs_eta >= self.eta_edges[-1], -1, idx)
+
+    def filter_expr(self, et_bin: int, eta_bin: int, et_col: str, eta_col: str) -> pl.Expr:
+        """
+        Rows of one region, as a lazy filter - so out-of-region rows are dropped during the
+        parquet scan rather than after loading. Promotes to float64 like the numpy versions
+        above, so edge cases land in the same bin either way.
+        """
+        self.validate(et_bin, eta_bin)
+        et = pl.col(et_col).cast(pl.Float64)
+        expr = et >= self.et_edges[et_bin]
+        if not np.isinf(self.et_edges[et_bin + 1]):
+            expr = expr & (et < self.et_edges[et_bin + 1])
+        abs_eta = pl.col(eta_col).cast(pl.Float64).abs()
+        return expr & (abs_eta >= self.eta_edges[eta_bin]) & (abs_eta < self.eta_edges[eta_bin + 1])
+
+    # ------------------------------------------------------------------ label
+
+    def _et(self, index: int) -> float:
+        """The Et edge at `index`, in display units."""
+        return self.et_edges[index] * ET_SCALE
+
+    def bin_label(self, et_bin: int, eta_bin: int) -> str:
+        """Directory-friendly region label, e.g. 'et2_eta0'."""
+        return f"et{et_bin}_eta{eta_bin}"
+
+    def bin_description(self, et_bin: int, eta_bin: int) -> str:
+        """Human-readable ranges, e.g. 'Et in [30, 40) GeV, |eta| in [0.00, 0.80)'."""
+        return (f"Et in [{self._et(et_bin):g}, {self._et(et_bin + 1):g}) {ET_UNIT}, "
+                f"|eta| in [{self.eta_edges[eta_bin]:.2f}, {self.eta_edges[eta_bin + 1]:.2f})")
+
+    def et_range_str(self, et_bin: int, latex: bool = False) -> str:
+        """Et column header, e.g. '15 < Et[GeV] < 20' or the open-ended 'Et[GeV] > 50'."""
+        lo, hi = self._et(et_bin), self._et(et_bin + 1)
+        if latex:
+            et = rf"E_T[\mathrm{{{ET_UNIT}}}]"
+            return f"${et} > {lo:g}$" if np.isinf(hi) else f"${lo:g} < {et} < {hi:g}$"
+        et = f"Et[{ET_UNIT}]"
+        return f"{et} > {lo:g}" if np.isinf(hi) else f"{lo:g} < {et} < {hi:g}"
+
+    def et_range_compact(self, et_bin: int) -> str:
+        """Short Et header for renders that size columns to content, e.g. '30-40 GeV'."""
+        lo, hi = self._et(et_bin), self._et(et_bin + 1)
+        return f"> {lo:g} {ET_UNIT}" if np.isinf(hi) else f"{lo:g}-{hi:g} {ET_UNIT}"
+
+    def eta_range_str(self, eta_bin: int, latex: bool = False) -> str:
+        """|eta| row header, e.g. '0.00 < |eta| < 0.80'."""
+        lo, hi = self.eta_edges[eta_bin], self.eta_edges[eta_bin + 1]
+        return rf"${lo:.2f} < |\eta| < {hi:.2f}$" if latex else f"{lo:.2f} < |eta| < {hi:.2f}"
+
+    def eta_range_compact(self, eta_bin: int) -> str:
+        """Short |eta| row header, e.g. '0.00-0.80'."""
+        return f"{self.eta_edges[eta_bin]:.2f}-{self.eta_edges[eta_bin + 1]:.2f}"
 
 
-def eta_bin_index(eta: np.ndarray) -> np.ndarray:
-    """
-    Computes the |eta| bin index (0-4) for each value, or -1 if outside [0, 2.5).
-
-    Args:
-        eta (np.ndarray): Cluster pseudorapidity, signed (as stored in `cl_eta`).
-
-    Returns:
-        np.ndarray: Integer bin indices, same shape as input, -1 for out-of-range values.
-    """
-    abs_eta = np.abs(np.asarray(eta, dtype=np.float64))
-    lower_edges = ETA_BIN_EDGES[:-1]
-    idx = np.searchsorted(lower_edges, abs_eta, side="right") - 1
-    idx = np.where(abs_eta >= ETA_BIN_EDGES[-1], -1, idx)
-    return idx
-
-
-def bin_filter_expr(et_bin: int, eta_bin: int, et_col: str = "cl_et", eta_col: str = "cl_eta") -> pl.Expr:
-    """
-    Polars filter expression selecting exactly the rows of one kinematic bin, equivalent to
-    `(et_bin_index(cl_et) == et_bin) & (eta_bin_index(cl_eta) == eta_bin)`. Meant for lazy
-    queries so out-of-bin rows are dropped during the parquet scan instead of after loading
-    the full dataset. Both computations promote to float64 first, like the numpy versions,
-    so edge cases land in the same bin either way.
-
-    Args:
-        et_bin (int): Et bin index (0-4); the top bin is open-ended.
-        eta_bin (int): |eta| bin index (0-4).
-        et_col (str): Column with Et in MeV. Defaults to 'cl_et'.
-        eta_col (str): Column with signed eta. Defaults to 'cl_eta'.
-
-    Returns:
-        pl.Expr: Boolean expression, True for rows inside the bin.
-    """
-    et_gev = pl.col(et_col).cast(pl.Float64) / 1000.0
-    expr = et_gev >= ET_BIN_EDGES_GEV[et_bin]
-    if et_bin + 1 < N_ET_BINS:
-        expr = expr & (et_gev < ET_BIN_EDGES_GEV[et_bin + 1])
-
-    abs_eta = pl.col(eta_col).cast(pl.Float64).abs()
-    expr = expr & (abs_eta >= ETA_BIN_EDGES[eta_bin]) & (abs_eta < ETA_BIN_EDGES[eta_bin + 1])
-    return expr
-
-
-def bin_label(et_bin: int, eta_bin: int) -> str:
-    """Directory/file-friendly label for a given (et_bin, eta_bin) pair, e.g. 'et2_eta0'."""
-    return f"et{et_bin}_eta{eta_bin}"
-
-
-def bin_description(et_bin: int, eta_bin: int) -> str:
-    """Human-readable range description, e.g. 'Et in [30, 40) GeV, |eta| in [0.00, 0.80)'."""
-    et_lo = ET_BIN_EDGES_GEV[et_bin]
-    et_hi = ET_BIN_EDGES_GEV[et_bin + 1] if et_bin + 1 < N_ET_BINS else float("inf")
-    eta_lo = ETA_BIN_EDGES[eta_bin]
-    eta_hi = ETA_BIN_EDGES[eta_bin + 1]
-    return f"Et in [{et_lo:g}, {et_hi:g}) GeV, |eta| in [{eta_lo:.2f}, {eta_hi:.2f})"
-
-
-def et_range_str(et_bin: int, latex: bool = False) -> str:
-    """
-    Column header for an Et bin, e.g. '15 < Et[GeV] < 20' (or the open-ended 'Et[GeV] > 50').
-
-    Args:
-        et_bin (int): Et bin index (0-4).
-        latex (bool): Render with LaTeX math markup instead of plain text. Defaults to False.
-
-    Returns:
-        str: The formatted range label.
-    """
-    lo = ET_BIN_EDGES_GEV[et_bin]
-    is_open = et_bin + 1 >= N_ET_BINS
-    if latex:
-        et = r"E_T[\mathrm{GeV}]"
-        return f"${et} > {lo:g}$" if is_open else f"${lo:g} < {et} < {ET_BIN_EDGES_GEV[et_bin + 1]:g}$"
-    if is_open:
-        return f"Et[GeV] > {lo:g}"
-    return f"{lo:g} < Et[GeV] < {ET_BIN_EDGES_GEV[et_bin + 1]:g}"
-
-
-def eta_range_str(eta_bin: int, latex: bool = False) -> str:
-    """
-    Row header for an |eta| bin, e.g. '0.00 < |eta| < 0.80'.
-
-    Args:
-        eta_bin (int): |eta| bin index (0-4).
-        latex (bool): Render with LaTeX math markup instead of plain text. Defaults to False.
-
-    Returns:
-        str: The formatted range label.
-    """
-    lo = ETA_BIN_EDGES[eta_bin]
-    hi = ETA_BIN_EDGES[eta_bin + 1]
-    if latex:
-        return rf"${lo:.2f} < |\eta| < {hi:.2f}$"
-    return f"{lo:.2f} < |eta| < {hi:.2f}"
+#: The grid. There is only one.
+GRID = Binning()

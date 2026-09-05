@@ -9,6 +9,17 @@ from ai.preprocess.base import BasePreprocessor
 logger = logging.getLogger(__name__)
 tqdm.pandas(desc="Processing Samples")
 
+#: Cell-image columns, one per calorimeter layer.
+CELL_COLUMNS: List[str] = [
+    'cl_cells_presampler',
+    'cl_cells_em1',
+    'cl_cells_em2',
+    'cl_cells_em3',
+    'cl_cells_had1',
+    'cl_cells_had2',
+    'cl_cells_had3',
+]
+
 class PreprocessCNN2D(BasePreprocessor):
     """
     Preprocessor for 2D Convolutional Neural Networks (CNN2D) that formats calorimeter cell energies into multi-channel 2D image tensors.
@@ -21,18 +32,10 @@ class PreprocessCNN2D(BasePreprocessor):
         Args:
             target_shape (Tuple[int, int, int]): Tensor dimensions (channels, max_height, max_width). Defaults to (7, 7, 15).
         """
-        self.target_shape = target_shape
-        self.cell_columns = [
-            'cl_cells_presampler',
-            'cl_cells_em1',
-            'cl_cells_em2',
-            'cl_cells_em3',
-            'cl_cells_had1',
-            'cl_cells_had2',
-            'cl_cells_had3'
-        ]
-        self.max_h = 7
-        self.max_w = 15
+        self.cell_columns = list(CELL_COLUMNS)
+        self.target_shape = (len(self.cell_columns),) + tuple(target_shape[1:])
+        self.max_h = self.target_shape[1]
+        self.max_w = self.target_shape[2]
 
     def pad_array(self, arr: np.ndarray) -> np.ndarray:
         """
@@ -42,7 +45,7 @@ class PreprocessCNN2D(BasePreprocessor):
             arr (np.ndarray): Input 2D cell energy array.
 
         Returns:
-            np.ndarray: Zero-padded float32 2D array of shape (7, 15).
+            np.ndarray: Zero-padded float32 2D array of shape (max_h, max_w).
         """
         arr = np.stack(arr).astype(np.float32)
         
@@ -71,7 +74,7 @@ class PreprocessCNN2D(BasePreprocessor):
             df (pd.DataFrame): Input DataFrame containing calorimeter cell columns.
 
         Returns:
-            np.ndarray: Multi-channel tensor array of shape (N, 7, 7, 15).
+            np.ndarray: Multi-channel tensor array of shape (N, C, max_h, max_w).
         """
         return self.normalize(self.build_images(df))
 
@@ -85,7 +88,7 @@ class PreprocessCNN2D(BasePreprocessor):
             df (pd.DataFrame): Input DataFrame containing calorimeter cell columns.
 
         Returns:
-            np.ndarray: Multi-channel tensor array of shape (N, 7, 7, 15), unnormalised.
+            np.ndarray: Multi-channel tensor array of shape (N, C, max_h, max_w), unnormalised.
         """
         missing = [col for col in self.cell_columns if col not in df.columns]
         if missing:
@@ -121,7 +124,7 @@ class PreprocessCNN2D(BasePreprocessor):
 
     def required_columns(self, available: List[str]) -> List[str]:
         """
-        The 7 calorimeter cell-image columns, leaving the 300 ring/shower-shape columns unread.
+        The calorimeter cell-image columns, leaving the ring/shower-shape columns unread.
 
         Args:
             available (List[str]): Column names present in the dataset files.

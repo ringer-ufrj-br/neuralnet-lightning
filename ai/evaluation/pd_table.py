@@ -23,13 +23,7 @@ import numpy as np
 import pandas as pd
 
 from ai.evaluation.metrics import sp_index
-from ai.binning.kinematics import (
-    ET_BIN_EDGES_GEV,
-    ETA_BIN_EDGES,
-    N_ET_BINS,
-    et_range_str,
-    eta_range_str,
-)
+from ai.binning.kinematics import GRID
 
 logger = logging.getLogger(__name__)
 
@@ -76,14 +70,12 @@ def _et_label(et_bin: Optional[int], compact: bool = False, latex: bool = False)
         return "all $E_T$" if latex else "all Et"
     if et_bin == INTEGRATED:
         return rf"\textbf{{{INTEGRATED_LABEL}}}" if latex else INTEGRATED_LABEL
+    grid = GRID
     if latex:
-        return et_range_str(et_bin, latex=True)
+        return grid.et_range_str(et_bin, latex=True)
     if not compact:
-        return et_range_str(et_bin)
-    lo = ET_BIN_EDGES_GEV[et_bin]
-    if et_bin + 1 >= N_ET_BINS:
-        return f"> {lo:g} GeV"
-    return f"{lo:g}-{ET_BIN_EDGES_GEV[et_bin + 1]:g} GeV"
+        return grid.et_range_str(et_bin)
+    return grid.et_range_compact(et_bin)
 
 
 def _eta_label(eta_bin: Optional[int], compact: bool = False, latex: bool = False) -> str:
@@ -103,11 +95,12 @@ def _eta_label(eta_bin: Optional[int], compact: bool = False, latex: bool = Fals
         return r"all $|\eta|$" if latex else "all |eta|"
     if eta_bin == INTEGRATED:
         return rf"\textbf{{{INTEGRATED_LABEL}}}" if latex else INTEGRATED_LABEL
+    grid = GRID
     if latex:
-        return eta_range_str(eta_bin, latex=True)
+        return grid.eta_range_str(eta_bin, latex=True)
     if not compact:
-        return eta_range_str(eta_bin)
-    return f"{ETA_BIN_EDGES[eta_bin]:.2f}-{ETA_BIN_EDGES[eta_bin + 1]:.2f}"
+        return grid.eta_range_str(eta_bin)
+    return grid.eta_range_compact(eta_bin)
 
 
 def discover_regions(
@@ -137,8 +130,7 @@ def discover_regions(
         path
         for target in targets
         for path in glob.glob(
-            os.path.join(results_root, target, "**", "artifacts", "manifest.json"),
-            recursive=True
+            os.path.join(results_root, target, "**", "artifacts", "manifest.json"), recursive=True
         )
     })
 
@@ -259,6 +251,7 @@ def collect(
         for target in targets
     ]
     paths = sorted({path for pattern in patterns for path in glob.glob(pattern, recursive=True)})
+
 
     frames = []
     for path in paths:

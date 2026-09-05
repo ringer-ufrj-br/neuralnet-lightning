@@ -20,7 +20,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 from ai.loader.loader import DataLoader
-from ai.label.label_generator import LabelGenerator
+from ai.label.label_generator import label_from_path
 from ai.preprocess.cnn2d import PreprocessCNN2D
 
 
@@ -38,7 +38,7 @@ df = loader.execute()
 
 # 2. Geração de Labels
 label_col = 'label'
-df = LabelGenerator.apply_label(df, file_path_col='file_path', label_col=label_col)
+df[label_col] = df["file_path"].apply(label_from_path)
 if 'file_path' in df.columns:
     df.drop(columns=['file_path'], inplace=True)
 

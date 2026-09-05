@@ -15,3 +15,4 @@ class PipelineCNN2D(BasePipeline):
 
     model_class = ModelCNN2D
     preprocessor_class = PreprocessCNN2D
+

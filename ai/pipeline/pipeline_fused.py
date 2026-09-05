@@ -24,6 +24,7 @@ class PipelineFused(BasePipeline):
     model_class = ModelFused
     preprocessor_class = PreprocessFused
 
+
     def build_model_kwargs(self, X: np.ndarray) -> Dict[str, Any]:
         """
         Tells the model where the rings end and the cell image begins.

@@ -1,10 +1,10 @@
 import numpy as np
 import pandas as pd
 import logging
-from typing import Tuple, List
+from typing import List, Tuple
 
+from .base import BasePreprocessor, RING, N_RINGS
 from .cnn2d import PreprocessCNN2D
-from .base import BasePreprocessor
 
 logger = logging.getLogger(__name__)
 
@@ -14,17 +14,16 @@ class PreprocessFused(BasePreprocessor):
     cell images into a single feature array.
     """
 
-    def __init__(self, num_rings: int = 100, ring_norm: str = 'norm1') -> None:
+    def __init__(self, ring_norm: str = 'norm1') -> None:
         """
         Initializes PreprocessFused instance.
         Args:
-            num_rings (int): Number of ring features to extract. Defaults to 100.
             ring_norm (str): Ring normalization: 'norm1', 'log' or None. Defaults to 'norm1'.
         """
         self.cells_pp = PreprocessCNN2D()
-        self.num_rings = num_rings
+        self.num_rings = N_RINGS
         self.ring_norm = ring_norm
-        self.ring_columns = [f"cl_ring_{i}" for i in range(self.num_rings)]
+        self.ring_columns = [RING % i for i in range(N_RINGS)]
 
     def process_rings(self, df: pd.DataFrame) -> np.ndarray:
         """
@@ -54,7 +53,7 @@ class PreprocessFused(BasePreprocessor):
         Args:
             df (pd.DataFrame): Input DataFrame.
         Returns:
-            Tuple[np.ndarray, np.ndarray]: Rings of shape (N, num_rings) and cells of shape (N, 7, 7, 15).
+            Tuple[np.ndarray, np.ndarray]: Rings of shape (N, num_rings) and cells of shape (N, C, max_h, max_w).
         """
         return self.process_rings(df), self.cells_pp.build_images(df)
 
@@ -75,7 +74,7 @@ class PreprocessFused(BasePreprocessor):
 
     def required_columns(self, available: List[str]) -> List[str]:
         """
-        Both branches' columns: the ring columns this model reads plus the 7 cell-image
+        Both branches' columns: the ring columns this model reads plus the cell-image
         columns the CNN branch needs.
 
         Args:

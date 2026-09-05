@@ -33,7 +33,10 @@ A separação existe para que **re-avaliar não exija retreinar**: recortar pont
   - `ai/preprocess/base.py`: `BasePreprocessor`, a base dos preprocessadores.
   - `ai/preprocess/`: preprocessadores de cada arquitetura.
   - `ai/evaluation/`: métricas, gráficos e o construtor do tabelão (`pd_table.py`).
-  - `ai/binning/kinematics.py`: bins de $E_T$ e $|\eta|$ (grade 5×5 = 25 redes).
+  - `ai/preprocess/base.py`: tradução do layout de cada dataset para o vocabulário canônico
+    (`label`, `et`, `eta`, `ring_i`) que o resto do código usa.
+  - `ai/binning/kinematics.py`: a grade de $E_T$ × $|\eta|$ (uma rede por região), com as
+    bordas vindas do config.
 - **`ai/configs/*.yaml`**: configurações e hiperparâmetros de cada experimento.
 - **`data/`**: conjuntos de dados (Parquet/ROOT).
 - **`results/`**: relatórios, métricas, gráficos e checkpoints.
@@ -87,9 +90,6 @@ GB — apontando `data_path` do YAML direto para o caminho compartilhado.
 
 ```yaml
 model: "MLP"                       # Modelo a ser utilizado (MLP | CNN2D | Fused)
-data_path: data/parquet/           # Caminho para os dados
-max_files: 100                     # Quantidade máxima de arquivos por pasta (omita para todos)
-label_col: "label"                 # Coluna de rótulo
 max_epochs: 5000                   # Teto de épocas; quem para o treino é o Early Stopping
 batch_size: 1024                   # Tamanho do batch
 learning_rate: 0.001               # Taxa de aprendizado
@@ -98,7 +98,37 @@ n_splits: 10                       # Folds da validação cruzada (1 = sem valid
 n_inits: 5                         # Inicializações independentes por fold; a melhor é mantida
 threshold: 0.8                     # Limiar fixo das métricas globais
 seed: 42                           # Semente da partição de folds
+label_col: "label"                 # Nome canônico da coluna de rótulo dentro do pipeline
 ```
+
+### Dataset: o bloco `dataset:`
+
+Nenhum módulo do `ai/` conhece o nome de uma coluna do dataset. O pipeline trabalha num
+**vocabulário canônico** — `label`, `et`, `eta`, `ring_0 … ring_99`, `row_id` — e o
+`ai/preprocess/base.py` mapeia esse vocabulário para o que existe no Parquet. Os padrões
+descrevem o layout mc25, então os configs acima não precisam declarar nada. Um dataset
+diferente declara só o que difere:
+
+```yaml
+dataset:
+  data_path: .../electron_ringer.parquet
+  max_files: 100
+  rings_col: "TrigEMClusterContainer.ringsE"   # com '%i' (ex. "cl_ring_%i") = uma coluna por
+                                               # anel; sem '%i' = uma coluna de lista com os 100
+  et_col: "TrigEMClusterContainer.et"          # na unidade em que está gravado (MeV)
+  eta_col: "TrigEMClusterContainer.eta"        # com sinal
+  label_col: target                            # ausente = rótulo vem do nome do arquivo
+
+results_root: results/mc21   # regiões são nomeadas por índice de bin: um root por dataset
+```
+
+A normalização **não** é opção de config: ela faz parte do modelo. Para treinar com outra,
+herde o preprocessador, sobrescreva `fit`/`normalize` e registre um pipeline para ele — assim a
+normalização de um conjunto de checkpoints é legível na classe que os produziu.
+
+A grade Et × |η| é fixa (a padrão do ATLAS, em `ai/binning/kinematics.py`) e igual para todos
+os datasets. `python ai/run.py grid --config <cfg>` imprime `<n_et> <n_eta>`, e é daí que
+`slurm_bins.sh` e `scripts/run_local_grid.sh` tiram o tamanho do array.
 
 ### Partição e o que a avaliação cobre
 
@@ -155,7 +185,7 @@ Um fold específico (paralelização em SLURM):
 python ai/run.py train --config ai/configs/mlp.yaml --fold 3
 ```
 
-Uma região cinemática específica da grade 5×5:
+Uma região cinemática específica da grade:
 
 ```bash
 python ai/run.py train --config ai/configs/mlp.yaml --et-bin 2 --eta-bin 0
@@ -252,7 +282,7 @@ python ai/run.py report --no-integrated
 
 ### 4. SLURM
 
-A grade 5×5 vai como **um job array** de 25 tarefas — cada tarefa deriva seu par (et, eta) do
+A grade inteira vai como **um job array** (tamanho lido do config) — cada tarefa deriva seu par (et, eta) do
 `SLURM_ARRAY_TASK_ID`, treina os folds daquele bin e avalia em seguida. Ao fim do array, um job
 dependente monta o tabelão:
 
@@ -260,7 +290,7 @@ dependente monta o tabelão:
 ./slurm_bins.sh ai/configs/mlp.yaml
 ```
 
-Segundo argumento opcional limita quantas tarefas rodam em paralelo (`--array=0-24%N`), para
+Segundo argumento opcional limita quantas tarefas rodam em paralelo (`--array=0-N%M`), para
 não tomar todas as GPUs da fila:
 
 ```bash
@@ -312,7 +342,7 @@ Herde de `BasePreprocessor` e escreva `required_columns` (quais colunas ler do p
 ```python
 class PreprocessMinhaRede(BasePreprocessor):
     def required_columns(self, available):
-        return [c for c in available if c.startswith("cl_ring_")]
+        return [c for c in available if c.startswith("ring_")]
 
     def transform(self, df):
         X = df[self.required_columns(list(df.columns))].to_numpy(dtype=np.float32)
@@ -384,7 +414,7 @@ results/<MODEL>[/et<i>_eta<j>]/
 │   ├── fold_N.ckpt            # melhor checkpoint do fold (nome fixo)
 │   └── fold_N.json            # pos_weight, melhor métrica, épocas, kwargs
 ├── history/fold_N.csv         # loss de treino/validação por época
-├── scores/fold_N.parquet      # y_true, y_prob, cl_et, cl_eta, in_sample (região inteira)
+├── scores/fold_N.parquet      # y_true, y_prob, et, eta, row_id, in_sample (região inteira)
 ├── metrics/
 │   ├── per_fold.csv           # métricas globais por fold
 │   ├── operating_points.csv   # PD/SP/FA por (fold, ponto de operação)

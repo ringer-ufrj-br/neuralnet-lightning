@@ -6,10 +6,16 @@ Three subcommands, deliberately separate:
     python ai/run.py train    --config ai/configs/mlp.yaml [--fold N] [--et-bin i --eta-bin j]
     python ai/run.py evaluate --config ai/configs/mlp.yaml [--et-bin i --eta-bin j]
     python ai/run.py report   --config ai/configs/mlp.yaml
+    python ai/run.py grid     --config ai/configs/mlp.yaml [--format shape|pairs|describe]
 
 `train` only produces models and the artefacts needed to reload them; `evaluate` turns those
 models into scores, metrics and plots for one kinematic region; `report` aggregates every
-evaluated region into the cross-validation table ("pd_table") as LaTeX and as a figure.
+evaluated region into the cross-validation table ("pd_table") as LaTeX and as a figure; `grid`
+just prints the Et x |eta| regions the config defines, so a launcher can fan out over them
+without hardcoding a grid size.
+
+Which dataset any of this runs on is entirely a matter of the config's `dataset:` and
+`binning:` blocks - see ai/preprocess/base.py.
 """
 
 import argparse
@@ -37,7 +43,7 @@ def load_config(config_path: str) -> Dict[str, Any]:
         Dict[str, Any]: Parsed configuration dictionary.
     """
     with open(config_path, 'r') as file:
-        return yaml.safe_load(file)
+        return yaml.safe_load(file) or {}
 
 
 def build_pipeline(config: Dict[str, Any], args: argparse.Namespace) -> Any:
@@ -54,6 +60,7 @@ def build_pipeline(config: Dict[str, Any], args: argparse.Namespace) -> Any:
     Raises:
         ValueError: If the configured model has no pipeline.
     """
+    from ai.preprocess.base import DatasetSchema
     from ai.pipeline.registry import get_pipeline
 
     accelerator = args.accelerator or config.get("accelerator", "auto")
@@ -65,10 +72,12 @@ def build_pipeline(config: Dict[str, Any], args: argparse.Namespace) -> Any:
     # picked up automatically.
     pipeline_class = get_pipeline(model_type)
 
+    # Everything dataset-specific - column names, ring storage, where the label comes from -
+    # is resolved here, once, from the config. No pipeline, preprocessor or model below this
+    # line names a dataset column.
     return pipeline_class(
-        data_path=config.get("data_path"),
-        max_files=config.get("max_files"),
-        label_col=config.get("label_col", "label"),
+        schema=DatasetSchema.from_config(config),
+        results_root=config.get("results_root", "results"),
         max_epochs=config.get("max_epochs", 20),
         batch_size=config.get("batch_size", 32),
         patience=config.get("patience", 5),
@@ -135,8 +144,8 @@ def add_common_arguments(parser: argparse.ArgumentParser, config_default: Option
             optional, which is what `report` wants: it reads the results tree, not the data.
     """
     parser.add_argument('--config', type=str, default=config_default, help="Path to YAML configuration file.")
-    parser.add_argument('--et-bin', type=int, default=None, help="Et bin index 0-4 (requires --eta-bin too, useful for SLURM parallelism of the 25-network grid).")
-    parser.add_argument('--eta-bin', type=int, default=None, help="|eta| bin index 0-4 (requires --et-bin too).")
+    parser.add_argument('--et-bin', type=int, default=None, help="Et bin index into the configured grid (requires --eta-bin too, useful for SLURM parallelism of the per-region networks).")
+    parser.add_argument('--eta-bin', type=int, default=None, help="|eta| bin index into the configured grid (requires --et-bin too).")
     parser.add_argument('--accelerator', type=str, default=None, help="PyTorch Lightning accelerator (e.g. auto, cpu, cuda).")
     parser.add_argument('--devices', type=str, default=None, help="Devices to use (e.g. auto, 1, 0).")
 
@@ -163,9 +172,14 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument('--reuse-scores', action='store_true', help="Reuse the cached scores/fold_N.parquet instead of re-running inference.")
     evaluate_parser.add_argument('--no-plots', action='store_true', help="Skip figure rendering (metrics and tables only).")
 
+    grid_parser = subparsers.add_parser("grid", help="Print the kinematic grid a config defines, for scripts that fan out over it.")
+    grid_parser.add_argument('--config', type=str, default='config.yaml', help="Path to YAML configuration file.")
+    grid_parser.add_argument('--format', type=str, default='shape', choices=('shape', 'pairs', 'describe'),
+                             help="'shape' prints '<n_et> <n_eta>', 'pairs' prints one 'et eta' line per region, 'describe' prints each region's ranges.")
+
     report_parser = subparsers.add_parser("report", help="Aggregate every evaluated region into the cross-validation table.")
     add_common_arguments(report_parser, config_default=None)
-    report_parser.add_argument('--results-root', type=str, default='results', help="Root results directory to scan. Defaults to 'results'.")
+    report_parser.add_argument('--results-root', type=str, default=None, help="Root results directory to scan. Defaults to the config's results_root, else 'results'.")
     report_parser.add_argument('--output-dir', type=str, default=None, help="Where to write the table. Defaults to results/<MODEL>/pd_table, or results/comparison/pd_table when comparing models.")
     report_parser.add_argument('--models', type=str, default=None, help="Comma-separated models to compare, in row order (e.g. 'MLP,CNN2D'). Alternative to --config; without either, every evaluated model is included.")
     report_parser.add_argument('--no-integrated', action='store_false', dest='integrated', help="Skip the separate integrated table (phase-space total), leaving only the per-region tables.")
@@ -204,17 +218,30 @@ def main() -> None:
         logger.error(f"❌ Configuration file '{args.config}' not found.")
         sys.exit(1)
 
+    if args.command == "grid":
+        from ai.binning.kinematics import GRID as binning
+        if args.format == "shape":
+            print(f"{binning.n_et_bins} {binning.n_eta_bins}")
+        elif args.format == "pairs":
+            for et_bin, eta_bin in binning.regions:
+                print(f"{et_bin} {eta_bin}")
+        else:
+            for et_bin, eta_bin in binning.regions:
+                print(f"{binning.bin_label(et_bin, eta_bin)}\t{binning.bin_description(et_bin, eta_bin)}")
+        return
+
     if args.command == "report":
         from ai.evaluation.pd_table import build_report, discover_regions, log_inventory
 
         model_names = resolve_report_models(config, args.models)
+        results_root = args.results_root or config.get("results_root", "results")
 
         if args.list_only:
-            log_inventory(discover_regions(args.results_root, model_names), args.results_root)
+            log_inventory(discover_regions(results_root, model_names), results_root)
             return
 
         written = build_report(
-            results_root=args.results_root,
+            results_root=results_root,
             model_names=model_names,
             output_dir=args.output_dir,
             decimals=args.decimals,
