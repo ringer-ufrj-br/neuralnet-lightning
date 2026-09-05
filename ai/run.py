@@ -289,14 +289,13 @@ def main() -> None:
     elif args.command == "evaluate":
         try:
             pipeline.evaluate(
-                threshold=config.get("threshold", 0.5),
                 operating_points=resolve_operating_points(config),
                 reuse_scores=args.reuse_scores,
                 make_plots=not args.no_plots
             )
-        except (FileNotFoundError, RuntimeError) as exc:
-            # These are the expected "you are holding it wrong" failures - region not trained,
-            # or the data moved under the stored fold indices. A stack trace adds nothing.
+        except FileNotFoundError as exc:
+            # The expected "you are holding it wrong" failure - the region is not trained.
+            # A stack trace adds nothing.
             logger.error(str(exc))
             sys.exit(1)
 

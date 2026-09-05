@@ -1,9 +1,5 @@
 import pandas as pd
 from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
     roc_auc_score,
     average_precision_score,
     confusion_matrix
@@ -71,11 +67,14 @@ def compute_operating_points(
 def compute_metrics(
     y_true: Union[List[int], np.ndarray],
     y_prob: Union[List[float], np.ndarray],
-    threshold: float = 0.5,
     pos_weight: Optional[float] = None
 ) -> Dict[str, float]:
     """
-    Computes the global (fixed-threshold) metric set for one set of predictions.
+    Computes the threshold-free metric set for one set of predictions.
+
+    Everything here is a property of the score ranking rather than of any particular cut, so
+    it is comparable across models without agreeing on a decision threshold first. Metrics at
+    a cut belong to `compute_operating_points`, where the cut is derived from a target PD.
 
     Pure function with no I/O, so it can be reused by the pipeline, by notebooks and by
     the table builder without dragging a ModelSummary instance along.
@@ -83,19 +82,13 @@ def compute_metrics(
     Args:
         y_true (Union[List[int], np.ndarray]): True target labels.
         y_prob (Union[List[float], np.ndarray]): Predicted probabilities.
-        threshold (float): Classification decision threshold. Defaults to 0.5.
         pos_weight (Optional[float]): Positive class weight used during training. Defaults to None.
 
     Returns:
-        Dict[str, float]: Accuracy, AUC_ROC, AUC_PR, Precision, Recall, F1_Score, SP_Index,
-        Threshold, N_Positives, N_Negatives and (when given) Pos_Weight.
+        Dict[str, float]: AUC_ROC, AUC_PR, N_Positives, N_Negatives and (when given) Pos_Weight.
     """
     y_true_arr = np.asarray(y_true).flatten()
     y_prob_arr = np.asarray(y_prob).flatten()
-    y_pred = (y_prob_arr >= threshold).astype(int)
-
-    n_pos = int((y_true_arr == 1).sum())
-    n_neg = int((y_true_arr == 0).sum())
 
     try:
         auc_roc = float(roc_auc_score(y_true_arr, y_prob_arr))
@@ -107,23 +100,11 @@ def compute_metrics(
     except Exception:
         auc_pr = 0.0
 
-    tn, fp, fn, tp = confusion_matrix(y_true_arr, y_pred, labels=[0, 1]).ravel()
-    pd_rate = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    fa_rate = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-
     metrics = {
-        "Accuracy": float(accuracy_score(y_true_arr, y_pred)),
         "AUC_ROC": auc_roc,
         "AUC_PR": auc_pr,
-        "Precision": float(precision_score(y_true_arr, y_pred, zero_division=0)),
-        "Recall": float(recall_score(y_true_arr, y_pred, zero_division=0)),
-        "F1_Score": float(f1_score(y_true_arr, y_pred, zero_division=0)),
-        "PD": float(pd_rate),
-        "FA": float(fa_rate),
-        "SP_Index": float(sp_index(pd_rate, fa_rate)),
-        "Threshold": float(threshold),
-        "N_Positives": n_pos,
-        "N_Negatives": n_neg
+        "N_Positives": int((y_true_arr == 1).sum()),
+        "N_Negatives": int((y_true_arr == 0).sum()),
     }
 
     if pos_weight is not None:
@@ -169,22 +150,6 @@ class ModelSummary:
         logger.info(f"📝 Saved {description} ({len(df)} rows) to: {filepath}")
         return df
 
-    def save_metrics(
-        self,
-        records: List[Dict[str, Any]],
-        filename: str = "per_fold.csv"
-    ) -> pd.DataFrame:
-        """
-        Saves the per-fold global metric rows (as produced by compute_metrics, plus a Fold key).
-
-        Args:
-            records (List[Dict[str, Any]]): One dict per fold.
-            filename (str): CSV output filename. Defaults to 'per_fold.csv'.
-
-        Returns:
-            pd.DataFrame: The written frame.
-        """
-        return self._write(records, filename, "per-fold metrics")
 
     def save_operating_points(
         self,

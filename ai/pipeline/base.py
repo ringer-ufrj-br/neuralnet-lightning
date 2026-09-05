@@ -6,8 +6,8 @@ commands, on different machines and at different times:
 
 * `train`    - loads data, fits the preprocessor on the training rows only, runs the K-Fold
                cross-validation and persists everything an evaluation needs: one checkpoint
-               per fold under a fixed name, the preprocessor, each fold's validation indices and
-               a manifest describing the dataset the split was derived from.
+               per fold under a fixed name, the preprocessor, and each fold's validation
+               indices.
 * `evaluate` - reloads those artefacts, re-runs inference over the whole region for every fold,
                persists the raw scores and produces the per-fold metrics, the plots and the
                region's slice of the cross-validation table.
@@ -53,9 +53,9 @@ def _atomic_write_json(payload: Dict[str, Any], filepath: str) -> str:
     """
     Writes JSON via a temporary file plus os.replace.
 
-    Under SLURM every fold of a region is its own process writing the same manifest; a plain
-    open()/write() lets a reader observe a half-written file. os.replace is atomic on POSIX,
-    so a reader always sees either the old or the new complete file.
+    Under SLURM these sidecars are written by many processes at once and read by the step that
+    follows; a plain open()/write() lets a reader observe a half-written file. os.replace is
+    atomic on POSIX, so a reader always sees either the old or the new complete file.
 
     Args:
         payload (Dict[str, Any]): JSON-serialisable content.
@@ -155,7 +155,6 @@ class BasePipeline:
         self.checkpoints_dir = os.path.join(self.results_dir, "checkpoints")
         self.history_dir = os.path.join(self.results_dir, "history")
         self.scores_dir = os.path.join(self.results_dir, "scores")
-        self.manifest_path = os.path.join(self.artifacts_dir, "manifest.json")
         self.preprocessor_path = os.path.join(self.artifacts_dir, "preprocessor.joblib")
 
         self.loader = DataLoader(data_path=self.data_path, max_files=self.max_files)
@@ -292,85 +291,6 @@ class BasePipeline:
         return df
 
 
-    def dataset_fingerprint(self, df: pd.DataFrame, Y: np.ndarray) -> Dict[str, Any]:
-        """
-        Describes the exact dataset the fold indices were drawn from, so `evaluate` can
-        refuse to run against a different one.
-
-        Rows are referenced positionally, because not every dataset has a stable physical key
-        (the mc25 tables' (run_number, event_number, cl_idx) repeats heavily across files).
-        That makes this fingerprint the guard rail: it pins the file list, the row/class counts
-        and an order-sensitive row digest; a mismatch means the positional indices no longer
-        point at the same rows.
-
-        The row digest hashes the label sequence plus a per-row quantity in row order - the
-        dataset's own row id when it has one, otherwise Et. Counts alone are permutation
-        invariant, and labels alone can be constant within a source file, so only a per-row
-        quantity makes a reordering *inside* a file - which streaming collects are in principle
-        free to do - detectable.
-
-        Args:
-            df (pd.DataFrame): The loaded DataFrame.
-            Y (np.ndarray): The label array.
-
-        Returns:
-            Dict[str, Any]: Fingerprint fields.
-        """
-        files = sorted(self.loader.get_files())
-        digest = hashlib.sha1("\n".join(files).encode()).hexdigest()
-
-        row_hasher = hashlib.sha1(np.ascontiguousarray(Y, dtype=np.int8).tobytes())
-        if ROW_ID in df.columns:
-            row_key = ("row_id", np.ascontiguousarray(df[ROW_ID].to_numpy(), dtype=np.uint64))
-        elif ET in df.columns:
-            row_key = ("et", np.ascontiguousarray(df[ET].to_numpy(), dtype=np.float32))
-        else:
-            row_key = ("labels_only", None)
-        if row_key[1] is not None:
-            row_hasher.update(row_key[1].tobytes())
-
-        return {
-            "data_path": self.data_path,
-            "max_files": self.max_files,
-            "n_files": len(files),
-            "files_sha1": digest,
-            "n_rows": int(len(df)),
-            "n_positives": int((Y == 1).sum()),
-            "n_negatives": int((Y == 0).sum()),
-            "row_key": row_key[0],
-            "rows_sha1": row_hasher.hexdigest(),
-        }
-
-    @staticmethod
-    def _check_fingerprint(stored: Dict[str, Any], current: Dict[str, Any]) -> None:
-        """
-        Compares two dataset fingerprints and raises on any difference that would invalidate
-        the stored positional fold indices.
-
-        Args:
-            stored (Dict[str, Any]): Fingerprint recorded at training time.
-            current (Dict[str, Any]): Fingerprint of the data just loaded.
-
-        Raises:
-            RuntimeError: If the fingerprints disagree.
-        """
-        # Only keys the stored fingerprint carries are compared: a manifest that omits one
-        # says nothing about it, and the remaining keys - `rows_sha1` above all - still catch
-        # a dataset that moved under the fold indices.
-        blocking = ["n_rows", "n_files", "files_sha1", "n_positives", "n_negatives",
-                    "row_key", "rows_sha1"]
-        differences = [
-            f"{key}: trained on {stored.get(key)!r}, now {current.get(key)!r}"
-            for key in blocking
-            if key in stored and stored.get(key) != current.get(key)
-        ]
-        if differences:
-            raise RuntimeError(
-                "❌ The dataset changed since training, so the stored fold indices no longer "
-                "identify the same rows:\n  - " + "\n  - ".join(differences) +
-                "\n   Re-run `train` for this region before evaluating."
-            )
-
     # ------------------------------------------------------------------ train
 
     def train(
@@ -422,25 +342,6 @@ class BasePipeline:
 
         os.makedirs(self.artifacts_dir, exist_ok=True)
         self.preprocessor.save(self.preprocessor_path)
-
-        _atomic_write_json({
-            "model": self.model_name,
-            "model_class": self.model_class.__name__,
-            "et_bin": self.et_bin,
-            "eta_bin": self.eta_bin,
-            "region": self.region_label(),
-            "label_col": self.label_col,
-            "seed": seed,
-            "n_splits": n_splits,
-            "n_inits": n_inits,
-            "learning_rate": learning_rate,
-            "monitor_metric": self.monitor_metric,
-            "n_rows": int(len(df)),
-            "dataset": self.dataset_fingerprint(df, Y),
-            "schema": self.schema.describe(),
-            "preprocessor": os.path.relpath(self.preprocessor_path, self.results_dir),
-        }, self.manifest_path)
-        logger.info(f"📄 Wrote manifest: {self.manifest_path}")
 
         model_kwargs = {'learning_rate': learning_rate, **self.build_model_kwargs(X_all)}
         logger.info(f"🏋️ Training {n_splits} folds (kwargs={model_kwargs}, weighted loss enabled)...")
@@ -576,7 +477,6 @@ class BasePipeline:
 
     def evaluate(
         self,
-        threshold: float = 0.5,
         operating_points: Optional[Dict[str, float]] = None,
         reuse_scores: bool = False,
         make_plots: bool = True
@@ -586,7 +486,6 @@ class BasePipeline:
         its slice of the cross-validation table.
 
         Args:
-            threshold (float): Fixed decision threshold for the global metric set. Defaults to 0.5.
             operating_points (Optional[Dict[str, float]]): Working point name -> target PD.
                 Defaults to {"tight": 0.90, "medium": 0.95, "loose": 0.99}.
             reuse_scores (bool): Skip inference and read `scores/fold_N.parquet` written by an
@@ -599,10 +498,8 @@ class BasePipeline:
 
         Raises:
             FileNotFoundError: If the region has not been trained yet.
-            RuntimeError: If the dataset no longer matches the one training split.
         """
         operating_points = operating_points or DEFAULT_OPERATING_POINTS
-        manifest = self.load_manifest()
         fold_infos = self.load_fold_infos()
 
         if not fold_infos:
@@ -611,17 +508,16 @@ class BasePipeline:
             )
 
         logger.info(f"📊 Evaluating {self.model_name} ({self.region_label()}): "
-                    f"{len(fold_infos)} fold(s), threshold={threshold}")
+                    f"{len(fold_infos)} fold(s)")
 
-        fold_scores = self._collect_scores(manifest, fold_infos, reuse_scores)
+        fold_scores = self._collect_scores(fold_infos, reuse_scores)
 
-        metric_rows, operating_rows, long_rows = [], [], []
+        operating_rows, long_rows = [], []
         for fold in sorted(fold_scores):
             y_true, y_prob = fold_scores[fold]
             pos_weight = fold_infos[fold].get("pos_weight")
 
-            metrics = compute_metrics(y_true, y_prob, threshold=threshold, pos_weight=pos_weight)
-            metric_rows.append({"Fold": fold, **metrics})
+            metrics = compute_metrics(y_true, y_prob, pos_weight=pos_weight)
 
             points = compute_operating_points(y_true, y_prob, operating_points)
             for point in points:
@@ -648,19 +544,17 @@ class BasePipeline:
                     f"SP={point['SP_Index']:.4f}, threshold={point['Threshold']:.4f}"
                 )
 
-        self.summary.save_metrics(metric_rows, filename="per_fold.csv")
         self.summary.save_operating_points(operating_rows, filename="operating_points.csv")
         long_df = self.summary.save_long_table(long_rows, filename="folds_long.csv")
 
         if make_plots:
-            self._render_plots(fold_scores, threshold, operating_points)
+            self._render_plots(fold_scores, operating_points)
 
         logger.info(f"✅ Evaluation complete. Results under: {self.results_dir}")
         return long_df
 
     def _collect_scores(
         self,
-        manifest: Dict[str, Any],
         fold_infos: Dict[int, Dict[str, Any]],
         reuse_scores: bool
     ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
@@ -669,7 +563,6 @@ class BasePipeline:
         running each fold's checkpoint over the full region (in-sample rows included).
 
         Args:
-            manifest (Dict[str, Any]): The training manifest.
             fold_infos (Dict[int, Dict[str, Any]]): Per-fold sidecars, keyed by fold number.
             reuse_scores (bool): Read cached scores instead of re-running inference.
 
@@ -692,9 +585,8 @@ class BasePipeline:
             raise RuntimeError("❌ No data was loaded; cannot evaluate.")
 
         Y = self.preprocessor.get_labels(df, label_col=self.label_col)
-        self._check_fingerprint(manifest.get("dataset", {}), self.dataset_fingerprint(df, Y))
 
-        preprocessor = type(self.preprocessor).load(os.path.join(self.results_dir, manifest["preprocessor"]))
+        preprocessor = type(self.preprocessor).load(self.preprocessor_path)
         self.preprocessor = preprocessor
 
         # Every fold is scored over the WHOLE region, in-sample rows included. Train and
@@ -791,7 +683,6 @@ class BasePipeline:
     def _render_plots(
         self,
         fold_scores: Dict[int, Tuple[np.ndarray, np.ndarray]],
-        threshold: float,
         operating_points: Dict[str, float]
     ) -> None:
         """
@@ -799,18 +690,20 @@ class BasePipeline:
 
         Args:
             fold_scores (Dict[int, Tuple[np.ndarray, np.ndarray]]): Mapping fold -> (y_true, y_prob).
-            threshold (float): Decision threshold used for the confusion matrix.
             operating_points (Dict[str, float]): Working point name -> target PD.
         """
         logger.info(f"🖼️ Rendering plots into {self.monitor.output_dir}...")
         for fold in sorted(fold_scores):
             y_true, y_prob = fold_scores[fold]
             points = compute_operating_points(y_true, y_prob, operating_points)
+            # The confusion matrix needs one cut; the tightest working point is the one the
+            # trigger would actually run at, so it is the cut worth picturing.
+            cut = min(points, key=lambda point: point["Target_PD"])["Threshold"] if points else 0.5
 
             self.monitor.plot_roc_curve(y_true, y_prob, filename=f"roc_curve_fold_{fold}.pdf", operating_points=points)
             self.monitor.plot_pr_curve(y_true, y_prob, filename=f"pr_curve_fold_{fold}.pdf")
             self.monitor.plot_confusion_matrix(
-                y_true, (y_prob >= threshold).astype(int),
+                y_true, (y_prob >= cut).astype(int),
                 filename=f"confusion_matrix_fold_{fold}.pdf"
             )
 
@@ -832,29 +725,12 @@ class BasePipeline:
 
     # ----------------------------------------------------------------- shared
 
-    def load_manifest(self) -> Dict[str, Any]:
-        """
-        Reads the training manifest for this region.
-
-        Returns:
-            Dict[str, Any]: The manifest contents.
-
-        Raises:
-            FileNotFoundError: If this region has not been trained.
-        """
-        if not os.path.exists(self.manifest_path):
-            raise FileNotFoundError(
-                f"❌ No manifest at '{self.manifest_path}'. Run `train` for this region first."
-            )
-        with open(self.manifest_path) as handle:
-            return json.load(handle)
-
     def load_fold_infos(self) -> Dict[int, Dict[str, Any]]:
         """
         Reads the per-fold sidecars written by train().
 
-        Each fold owns its own file rather than sharing one manifest entry, so N parallel
-        single-fold SLURM jobs never contend over the same file.
+        Each fold owns its own file, so N parallel single-fold SLURM jobs never contend over
+        the same one.
 
         Returns:
             Dict[int, Dict[str, Any]]: Mapping fold number -> sidecar contents.

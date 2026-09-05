@@ -13,7 +13,6 @@ compared side by side under identical working points.
 """
 
 import glob
-import json
 import logging
 import os
 import re
@@ -111,10 +110,10 @@ def discover_regions(
     Inventories what exists on disk under a results tree: which models, which kinematic
     regions, how many folds were trained and how many were evaluated.
 
-    Discovery is anchored on `artifacts/manifest.json` - the file `train` writes for every
-    region - rather than on the metrics, so a region that was trained but never evaluated is
-    still found and can be reported as missing instead of silently leaving a hole in the table.
-    The model name comes from the manifest itself, not from the directory name.
+    Discovery is anchored on each region's `checkpoints/` directory rather than on its metrics,
+    so a region that was trained but never evaluated is still found and reported as missing
+    instead of silently leaving a hole in the table. Model and region are read from the path:
+    `<results_root>/<model>/<region>`, or `<results_root>/<model>` for an ungridded run.
 
     Args:
         results_root (str): Root results directory. Defaults to 'results'.
@@ -126,25 +125,21 @@ def discover_regions(
         'folds_trained', 'folds_evaluated' and 'evaluated'. Empty when nothing was trained.
     """
     targets = list(model_names) if model_names else ["*"]
-    manifest_paths = sorted({
+    checkpoint_dirs = sorted({
         path
         for target in targets
-        for path in glob.glob(
-            os.path.join(results_root, target, "**", "artifacts", "manifest.json"), recursive=True
-        )
+        for path in glob.glob(os.path.join(results_root, target, "**", "checkpoints"), recursive=True)
     })
 
     rows = []
-    for manifest_path in manifest_paths:
-        region_dir = os.path.dirname(os.path.dirname(manifest_path))
-        try:
-            with open(manifest_path) as handle:
-                manifest = json.load(handle)
-        except Exception as exc:
-            logger.warning(f"⚠️ Skipping unreadable manifest '{manifest_path}': {exc}")
-            continue
+    for checkpoint_dir in checkpoint_dirs:
+        region_dir = os.path.dirname(checkpoint_dir)
+        parts = os.path.relpath(region_dir, results_root).split(os.sep)
+        model, region = parts[0], (parts[1] if len(parts) > 1 else "full phase space")
 
-        sidecars = glob.glob(os.path.join(region_dir, "checkpoints", "fold_*.json"))
+        sidecars = glob.glob(os.path.join(checkpoint_dir, "fold_*.json"))
+        if not sidecars:
+            continue
         long_path = os.path.join(region_dir, "metrics", "folds_long.csv")
 
         folds_evaluated = 0
@@ -155,8 +150,8 @@ def discover_regions(
                 folds_evaluated = 0
 
         rows.append({
-            "model": manifest.get("model", os.path.basename(region_dir)),
-            "region": manifest.get("region", os.path.basename(region_dir)),
+            "model": model,
+            "region": region,
             "path": region_dir,
             "folds_trained": len(sidecars),
             "folds_evaluated": folds_evaluated,

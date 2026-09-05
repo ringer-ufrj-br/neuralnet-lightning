@@ -11,5 +11,4 @@ learning_rate: 0.001
 patience: 50
 n_splits: 5
 n_inits: 5
-threshold: 0.8
 seed: 42

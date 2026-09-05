@@ -24,7 +24,7 @@ Two halves, in the order the data flows through them:
   own preprocessor module when the transform differs too.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import os
 import logging
 from typing import Any, Dict, List, Optional, Sequence
@@ -92,10 +92,6 @@ class DatasetSchema:
             eta_col=str(block.get("eta_col", "cl_eta")),
             label_col=block.get("label_col"),
         )
-
-    def describe(self) -> Dict[str, Any]:
-        """JSON form, recorded in the manifest so a run's layout is recoverable."""
-        return asdict(self)
 
     @property
     def rings_are_listed(self) -> bool:
