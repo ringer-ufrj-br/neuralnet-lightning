@@ -20,7 +20,6 @@ class PipelineMLP(BasePipeline):
     model_class = ModelMLP
     preprocessor_class = PreprocessMLP
 
-
     def build_model_kwargs(self, X: np.ndarray) -> Dict[str, Any]:
         """
         Derives the MLP input dimension from the preprocessed feature matrix.
