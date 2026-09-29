@@ -2,7 +2,7 @@ import logging
 from typing import List
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from sklearn.preprocessing import StandardScaler
 
 from ai.preprocess.base import BasePreprocessor, RING
@@ -85,10 +85,11 @@ class PreprocessMLP(BasePreprocessor):
 
     @staticmethod
     def _log_energies(X: np.ndarray) -> np.ndarray:
-        """log1p of the ring energies with negative noise clipped to zero."""
-        return np.log1p(np.clip(X, 0.0, None)).astype(np.float32)
+        """log1p of the float32 ring energies with negative noise clipped to zero, in place."""
+        np.clip(X, 0.0, None, out=X)
+        return np.log1p(X, out=X)
 
-    def fit(self, df: pd.DataFrame) -> "PreprocessMLP":
+    def fit(self, df: pl.DataFrame) -> "PreprocessMLP":
         """Fits the StandardScaler on the log1p-compressed rings. MUST see the training split only."""
         X = self._log_energies(self.extract(df, self.feature_columns))
         logger.info(f"📐 Fitting StandardScaler on {len(X)} training rows...")
@@ -96,6 +97,10 @@ class PreprocessMLP(BasePreprocessor):
         return self
 
     def normalize(self, X: np.ndarray) -> np.ndarray:
-        """log1p, then the StandardScaler learned in `fit` (which raises NotFittedError before it)."""
-        return self.scaler.transform(self._log_energies(X)).astype(np.float32)
+        """
+        log1p, then the StandardScaler learned in `fit` (which raises NotFittedError before it),
+        both in place on the array `extract` returned.
+        """
+        X = self.scaler.transform(self._log_energies(X), copy=False)
+        return X.astype(np.float32, copy=False)
 

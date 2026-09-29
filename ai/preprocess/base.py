@@ -32,7 +32,6 @@ import os
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
-import pandas as pd
 import polars as pl
 
 logger = logging.getLogger(__name__)
@@ -228,6 +227,10 @@ class BasePreprocessor:
     Either kind overrides `fit` only if it has state to learn from the training split (a
     scaler, a mean, ...). The pipeline persists the whole fitted instance with joblib, so
     anything stored on `self` in `fit` is restored for evaluation with no extra code.
+
+    The frames are polars end to end: converting to pandas would copy the whole frame, briefly
+    holding it twice. The feature matrix is built once and every later step works on it in
+    place, so the peak is the frame plus one matrix.
     """
 
     #: Dataset columns this preprocessor consumes, in feature order. When set, it drives the
@@ -245,18 +248,24 @@ class BasePreprocessor:
         than inside the model, where it would be recomputed for every batch of every epoch on
         data that never changes.
 
+        Works in place, so `X` must be an array this preprocessor owns - the one `extract`
+        returned, not a view of anything the caller still reads.
+
         Args:
             X (np.ndarray): Feature array, first dimension being the batch.
 
         Returns:
-            np.ndarray: Float32 array of the same shape, each sample scaled by its own total.
-                Samples summing to zero are left as they are rather than turned into NaNs.
+            np.ndarray: `X` itself as float32, each sample scaled by its own total. Samples
+                summing to zero are left as they are rather than turned into NaNs.
         """
+        X = np.asarray(X, dtype=np.float32)
         axes = tuple(range(1, X.ndim))
         if not axes:
-            return X.astype(np.float32)
+            return X
         total = np.abs(X.sum(axis=axes, keepdims=True))
-        return (X / np.where(total == 0.0, 1.0, total)).astype(np.float32)
+        total[total == 0.0] = 1.0
+        X /= total
+        return X
 
     def required_columns(self, available: List[str]) -> Optional[List[str]]:
         """
@@ -266,21 +275,31 @@ class BasePreprocessor:
         """
         return self.feature_columns
 
-    def extract(self, df: pd.DataFrame, cols: List[str]) -> np.ndarray:
+    def extract(self, df: pl.DataFrame, cols: List[str]) -> np.ndarray:
         """
-        `cols` as a float32 matrix with NaNs and the -999 sensor-anomaly marker zeroed. A
-        missing column raises KeyError - a wrong column set is a bug, not something to recover
-        from.
-        """
-        X = df[cols].values.astype(np.float32)
-        X = np.nan_to_num(X, nan=0.0)
-        return np.where(X == -999, 0.0, X)
+        `cols` as a float32 matrix with NaNs and the -999 sensor-anomaly marker zeroed (±inf
+        clipped to the float32 range, as np.nan_to_num does). A missing column raises
+        ColumnNotFoundError - a wrong column set is a bug, not something to recover from.
 
-    def fit(self, df: pd.DataFrame) -> "BasePreprocessor":
+        The matrix is allocated once and filled and cleaned a column at a time; polars hands
+        each column over without copying it, so no intermediate 2-D copy ever exists and the
+        cleaning masks are one column long. It is column-major - the layout pandas used to
+        hand over - which keeps each column contiguous and the per-event sums of `normalize`,
+        and so every trained model, bit-identical to what pandas produced.
+        """
+        X = np.empty((df.height, len(cols)), dtype=np.float32, order="F")
+        for j, name in enumerate(cols):
+            column = X[:, j]
+            column[...] = df.get_column(name).to_numpy()
+            np.nan_to_num(column, copy=False, nan=0.0)
+            column[column == -999] = 0.0
+        return X
+
+    def fit(self, df: pl.DataFrame) -> "BasePreprocessor":
         """Learns whatever state this preprocessor needs from the training split. No-op here."""
         return self
 
-    def transform(self, df: pd.DataFrame) -> np.ndarray:
+    def transform(self, df: pl.DataFrame) -> np.ndarray:
         """
         The model's input array. The default is the baseline path: extract `feature_columns`,
         clean sensor anomalies and normalise each event.
@@ -293,6 +312,6 @@ class BasePreprocessor:
         logger.info(f"🧪 Extracting {len(cols)} features ({cols[0]} ... {cols[-1]})...")
         return self.normalize(self.extract(df, cols))
 
-    def fit_transform(self, df: pd.DataFrame) -> np.ndarray:
+    def fit_transform(self, df: pl.DataFrame) -> np.ndarray:
         """Fits on the given rows and transforms them in one call."""
         return self.fit(df).transform(df)

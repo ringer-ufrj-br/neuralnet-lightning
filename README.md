@@ -178,7 +178,6 @@ sem sigmoid.
 viram a entrada da rede:
 
 ```python
-import numpy as np
 from ai.preprocess.base import BasePreprocessor
 
 
@@ -186,10 +185,13 @@ class PreprocessMinhaRede(BasePreprocessor):
     def required_columns(self, available):
         return [c for c in available if c.startswith("ring_")]
 
-    def transform(self, df):
-        X = df[self.required_columns(list(df.columns))].to_numpy(dtype=np.float32)
+    def transform(self, df):        # df é um DataFrame do polars
+        X = self.extract(df, self.required_columns(df.columns))  # matriz float32, sem NaN nem -999
         return self.normalize(X)    # norm1: cada evento dividido pela soma das suas features
 ```
+
+O `df` é do polars, não do pandas: converter para pandas copiaria o dataframe inteiro. Monte a
+matriz com `extract` (ou preenchendo um array já alocado) e trabalhe nela no lugar.
 
 Se for só uma lista de colunas com norm1, basta declarar `feature_columns`: o `transform`
 padrão extrai essas colunas e aplica o norm1. Se o preprocessador precisa aprender algo dos

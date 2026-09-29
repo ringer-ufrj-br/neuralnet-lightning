@@ -1,14 +1,12 @@
 import logging
-from typing import List
+from typing import List, Optional
 
 import numpy as np
-import pandas as pd
-from tqdm import tqdm
+import polars as pl
 
 from ai.preprocess.base import BasePreprocessor
 
 logger = logging.getLogger(__name__)
-tqdm.pandas(desc="Processing Samples")
 
 #: Cell-image columns, one per calorimeter layer.
 CELL_COLUMNS: List[str] = [
@@ -31,29 +29,53 @@ class PreprocessCNN2D(BasePreprocessor):
     #: (channels, height, width) every event's image is padded to.
     target_shape = (len(CELL_COLUMNS), 7, 15)
 
-    def pad_array(self, arr: np.ndarray) -> np.ndarray:
-        """One layer: -999 sensor anomalies zeroed, log1p of the clipped energies, zero-padded
-        around the centre to the target height x width."""
-        arr = np.stack(arr).astype(np.float32)
-        arr = np.log1p(np.clip(np.where(arr == -999, 0, arr), 0, None))
-        dh, dw = self.target_shape[1] - arr.shape[0], self.target_shape[2] - arr.shape[1]
-        return np.pad(arr, ((dh // 2, dh - dh // 2), (dw // 2, dw - dw // 2)))
+    def layer_cells(self, df: pl.DataFrame, col: str) -> np.ndarray:
+        """
+        One layer as an (N, h, w) array. Every event carries the same grid for a given layer
+        (3x3 presampler, 3x15 EM1, 7x7 EM2, ...), so polars converts the nested lists into one
+        fixed-size buffer and no per-event Python object is ever created.
+        """
+        first = df.get_column(col).head(1).to_list()[0]
+        h, w = len(first), len(first[0])
+        if h > self.target_shape[1] or w > self.target_shape[2]:
+            raise ValueError(f"❌ Column '{col}' is {h}x{w}, larger than the "
+                             f"{self.target_shape[1]}x{self.target_shape[2]} target image.")
+        try:
+            grid = df.select(pl.col(col).list.eval(pl.element().list.to_array(w)).list.to_array(h))
+        except pl.exceptions.PolarsError as exc:
+            raise ValueError(f"❌ Column '{col}' is not the same {h}x{w} grid on every event.") from exc
+        return grid.to_series().to_numpy()
 
-    def transform(self, df: pd.DataFrame) -> np.ndarray:
+    def transform(self, df: pl.DataFrame) -> np.ndarray:
         """Builds the cell images and normalises each one by its own total."""
         return self.normalize(self.build_images(df))
 
-    def build_images(self, df: pd.DataFrame) -> np.ndarray:
+    def build_images(self, df: pl.DataFrame, out: Optional[np.ndarray] = None) -> np.ndarray:
         """
         The (N, C, H, W) cell images, unnormalised. Separate from `transform` so PreprocessFused
         can take the raw images and normalise once over the concatenated rings+cells vector.
+
+        Each layer is written centred into its channel of one preallocated array, and cleaned
+        there in place: -999 sensor anomalies zeroed, then log1p of the energies clipped at zero.
+        The padding stays zero. `out`, a zeroed (N, C, H, W) float32 array or view, is filled
+        instead of a new array when given.
         """
+        _, height, width = self.target_shape
+        X = np.zeros((df.height, *self.target_shape), dtype=np.float32) if out is None else out
+
         logger.info("🖼️ Converting calorimeter layers to 2D image tensors...")
-        layers = []
         for i, col in enumerate(CELL_COLUMNS):
             logger.info(f"⚡ [{i+1}/{len(CELL_COLUMNS)}] Processing channel: {col}")
-            layers.append(np.stack(df[col].progress_apply(self.pad_array).values))
-        return np.stack(layers, axis=1)
+            cells = self.layer_cells(df, col)
+            h, w = cells.shape[1:]
+            top, left = (height - h) // 2, (width - w) // 2
+            layer = X[:, i, top:top + h, left:left + w]
+            layer[...] = cells
+            del cells
+            layer[layer == -999] = 0.0
+            np.clip(layer, 0, None, out=layer)
+            np.log1p(layer, out=layer)
+        return X
 
     def required_columns(self, available: List[str]) -> List[str]:
         """The cell-image columns, leaving the ring/shower-shape columns unread."""

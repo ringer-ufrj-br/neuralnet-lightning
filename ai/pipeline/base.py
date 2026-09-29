@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import joblib
 import numpy as np
 import pandas as pd
+import polars
 import pytorch_lightning as pl
 import torch
 
@@ -144,7 +145,7 @@ class BasePipeline:
 
     # ------------------------------------------------------------------ data
 
-    def load_dataframe(self) -> Optional[pd.DataFrame]:
+    def load_dataframe(self) -> Optional[polars.DataFrame]:
         """
         Loads the dataset in the canonical column vocabulary and applies the kinematic cut, or
         returns None when nothing could be loaded.
@@ -154,6 +155,9 @@ class BasePipeline:
         parquet scan - so peak memory is bound by the selected columns of the selected rows,
         never by the full dataset. A ring stored as element `i` of a nested list is projected
         exactly like one stored in its own column, so the layout costs nothing either way.
+
+        The frame stays in polars: the preprocessors only ever ask it for numpy arrays, and a
+        conversion to pandas would briefly hold the whole frame twice.
 
         Deterministic given the same files on disk, which is what lets `train` and `evaluate`
         run as separate processes over the same row ordering.
@@ -186,18 +190,21 @@ class BasePipeline:
                         f"({kinematics.bin_description(self.et_bin, self.eta_bin)})...")
             lazy_frame = lazy_frame.filter(kinematics.filter_expr(self.et_bin, self.eta_bin, ET, ETA))
 
-        df = lazy_frame.collect(engine="streaming").to_pandas()
+        df = lazy_frame.collect(engine="streaming")
 
-        if df.empty:
+        if df.is_empty():
             if self.et_bin is not None:
                 logger.error("❌ No data remaining after kinematic binning.")
             else:
                 logger.error("❌ No data was loaded.")
             return None
 
-        if df[LABEL].isna().any():
+        # The label is always cast to Int8 (DatasetSchema.label_expr), so null is its only
+        # "missing" value.
+        missing = df.get_column(LABEL).null_count()
+        if missing:
             raise RuntimeError(
-                f"❌ {int(df[LABEL].isna().sum())} row(s) have no label. Check "
+                f"❌ {missing} row(s) have no label. Check "
                 f"dataset.label in the config against the dataset's actual contents."
             )
 
@@ -231,13 +238,16 @@ class BasePipeline:
         if df is None:
             return
 
-        Y = df[LABEL].to_numpy(np.float32)
+        Y = np.asarray(df.get_column(LABEL).to_numpy(), dtype=np.float32)
 
         # The k-fold partition is the whole scheme: k-1 partitions train and 1 validates, which
         # is what drives early stopping and the choice between initialisations. There is no
         # separate holdout, because `evaluate` scores every fold over the full region anyway.
         logger.info(f"✂️ Stratified {n_splits}-fold partition over {len(df)} rows.")
         X_all = self.preprocessor.fit_transform(df)
+        # Everything training needs is in X_all and Y now; the frame would otherwise stay
+        # resident, as large as X_all itself, for the whole of training.
+        del df
 
         os.makedirs(self.artifacts_dir, exist_ok=True)
         joblib.dump(self.preprocessor, self.preprocessor_path)
@@ -378,7 +388,7 @@ class BasePipeline:
         # space rather than only each fold's held-out partition. The `in_sample` column below
         # records which rows the fold trained on, so an out-of-sample-only cut stays available
         # to anyone who wants it.
-        y_true = df[LABEL].to_numpy(np.float32)
+        y_true = np.asarray(df.get_column(LABEL).to_numpy(), dtype=np.float32)
         X_all = self.preprocessor.transform(df)
         logger.info(f"🧾 Scoring the full region: {len(y_true)} rows "
                     f"({int((y_true == 1).sum())} signal, {int((y_true == 0).sum())} background).")
@@ -386,9 +396,10 @@ class BasePipeline:
         # Kept alongside the scores so the table can be re-cut per kinematic region later
         # without re-running inference.
         kinematic_columns = {
-            column: df[column].to_numpy()
+            column: df.get_column(column).to_numpy()
             for column in (ET, ETA, ROW_ID) if column in df.columns
         }
+        del df  # the rest of the frame is not needed for inference
 
         def out_of_sample_mask(fold: int) -> Optional[np.ndarray]:
             """True where the row was held out from this fold's training; None when unknown."""
