@@ -100,7 +100,7 @@ def discover_regions(
             "model": model,
             "region": region,
             "path": region_dir,
-            "folds_trained": len(sidecars),
+            "folds_trained": len({re.match(r"fold_(\d+)", os.path.basename(p)).group(1) for p in sidecars}),
             "folds_evaluated": folds_evaluated,
             "evaluated": folds_evaluated > 0,
         })

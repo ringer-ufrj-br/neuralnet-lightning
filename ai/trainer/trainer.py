@@ -223,8 +223,7 @@ class ModelTrainer:
         """
         Trains every requested (fold, initialisation) pair - a fresh model each, with pos_weight
         recomputed strictly from the fold's training split - and returns one record per model.
-        Keeping each fold's best initialisation is BasePipeline.select_best_inits' job, so it
-        works the same whether the initialisations ran here or in separate scheduler jobs.
+        Every model is kept; picking each fold's best initialisation is left to evaluation.
 
         Splits are stratified on the label so that every fold keeps the dataset's
         signal/background proportion - with the strong class imbalance of this dataset a plain
@@ -276,12 +275,13 @@ class ModelTrainer:
                 batch_size=self.batch_size, shuffle=False
             )
 
-            # A job killed mid-fold (a SLURM timeout, a Ctrl-C) leaves its per-init checkpoints
-            # and sidecars behind. Clear the ones this run is about to produce, so a rerun
-            # starts from a clean slate and never picks a winner among stale leftovers.
-            for stale in glob.glob(os.path.join(self.checkpoint_dir, f"fold_{fold}_init_{target_init or '*'}.*")):
-                logger.info(f"🧹 Removing a file left by an interrupted run: {stale}")
-                os.remove(stale)
+            # Retraining a fold replaces what an earlier or interrupted run left for it (a SLURM
+            # timeout, a Ctrl-C, an older single fold_N checkpoint), so evaluation never picks
+            # among stale leftovers. Sibling initialisations running in other jobs are untouched.
+            for pattern in (f"fold_{fold}.*", f"fold_{fold}_init_{target_init or '*'}.*"):
+                for stale in glob.glob(os.path.join(self.checkpoint_dir, pattern)):
+                    logger.info(f"🧹 Removing a file left by an earlier run: {stale}")
+                    os.remove(stale)
 
             for init in [target_init] if target_init is not None else range(1, n_inits + 1):
                 # Distinct but reproducible weights per (seed, fold, init). The data partition

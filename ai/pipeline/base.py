@@ -218,12 +218,12 @@ class BasePipeline:
         """
         Trains the cross-validation folds and persists every artefact `evaluate` will need.
 
-        No metrics, plots or tables are produced here - training's only job is to leave behind
-        reproducible models. Safe to run as parallel single-(fold, init) jobs: the split is a
-        pure function of (data, seed), the shared artefacts are written with identical content,
-        and each (fold, init) owns its own checkpoint and sidecar. Each fold's best
-        initialisation is promoted right away, unless `target_init` says this job trained just
-        one of them - then `select_best_inits` does it once the sibling jobs have finished.
+        No metrics, plots or tables are produced here, and nothing is picked or discarded:
+        training's only job is to leave behind reproducible models, every (fold, init) pair
+        under its own `fold_N_init_M` name. Choosing each fold's best initialisation is up to
+        `evaluate`. Safe to run as parallel single-(fold, init) jobs: the split is a pure
+        function of (data, seed), the shared artefacts are written with identical content, and
+        each (fold, init) owns its own checkpoint and sidecar.
         """
         logger.info(f"🚀 Starting training: {self.model_name} ({self.region_label()})")
 
@@ -286,72 +286,8 @@ class BasePipeline:
             }, os.path.join(self.checkpoints_dir, f"{stem}.json"))
 
         logger.info(f"✅ Training complete. Artefacts under: {self.results_dir}")
-        if target_init is None:
-            self.select_best_inits()
-        else:
-            logger.info(f"   Next, once every initialisation of this region has finished: "
-                        f"python ai/run.py select {self.cli_region_args()}")
-
-    def select_best_inits(self) -> None:
-        """
-        Picks each fold's best initialisation and promotes it to the plain `fold_N` names the
-        rest of the pipeline expects.
-
-        Every (fold, init) training leaves `fold_N_init_M.ckpt` plus a sidecar with its
-        monitored score. Here the winner per fold is renamed to `fold_N.ckpt` / `fold_N.json` /
-        `history/fold_N.csv` and the losers are deleted - otherwise n_inits would multiply the
-        checkpoints on disk.
-
-        Idempotent: a region whose folds are already settled is left alone, so re-running a
-        failed scheduler step is safe. Raises FileNotFoundError if the region was never trained.
-        """
-        pattern = os.path.join(self.checkpoints_dir, "fold_*_init_*.json")
-        per_init: Dict[int, List[Dict[str, Any]]] = {}
-        for path in sorted(glob.glob(pattern)):
-            with open(path) as handle:
-                info = json.load(handle)
-            info["_sidecar"] = path
-            per_init.setdefault(int(info["fold"]), []).append(info)
-
-        if not per_init:
-            settled = self.load_fold_infos()
-            if settled:
-                logger.info(f"✔️ {self.region_label()}: already settled ({len(settled)} fold(s)).")
-                return
-            raise FileNotFoundError(
-                f"❌ No per-initialisation sidecars in '{self.checkpoints_dir}'. Run `train` first."
-            )
-
-        for fold, candidates in sorted(per_init.items()):
-            scored = [c for c in candidates if c.get("best_score") is not None]
-            winner = max(scored or candidates, key=lambda c: c.get("best_score") or 0.0)
-            logger.info(f"🏆 Fold {fold}: kept initialisation {winner['init']} of "
-                        f"{len(candidates)} ({MONITOR}={winner.get('best_score')})")
-
-            for name, key in (("ckpt", "checkpoint"), ("csv", "history")):
-                source = os.path.join(self.results_dir, winner[key])
-                target = os.path.join(os.path.dirname(source), f"fold_{fold}.{name}")
-                if os.path.exists(source):
-                    os.replace(source, target)
-                winner[key] = os.path.relpath(target, self.results_dir)
-
-            winner["best_init"] = winner.pop("init")
-            winner["n_inits"] = len(candidates)
-            _atomic_write_json({k: v for k, v in winner.items() if k != "_sidecar"},
-                               os.path.join(self.checkpoints_dir, f"fold_{fold}.json"))
-
-            for loser in candidates:
-                if loser is winner:
-                    continue
-                for key in ("checkpoint", "history"):
-                    path = os.path.join(self.results_dir, loser[key])
-                    if os.path.exists(path):
-                        os.remove(path)
-            for entry in candidates:
-                os.remove(entry["_sidecar"])
-
-        logger.info(f"✅ {self.region_label()}: {len(per_init)} fold(s) settled.")
-        logger.info(f"   Next: python ai/run.py evaluate {self.cli_region_args()}")
+        logger.info(f"   Next, once every training of this region has finished: "
+                    f"python ai/run.py evaluate {self.cli_region_args()}")
 
     # --------------------------------------------------------------- evaluate
 
@@ -405,7 +341,7 @@ class BasePipeline:
         logger.info(f"📝 Saved long-format fold table ({len(long_rows)} rows) to: {long_path}")
 
         if make_plots:
-            self._render_plots(fold_scores, operating_points)
+            self._render_plots(fold_scores, operating_points, fold_infos)
 
         logger.info(f"✅ Evaluation complete. Results under: {self.results_dir}")
 
@@ -474,7 +410,8 @@ class BasePipeline:
                 logger.warning(f"⚠️ Fold {fold}: checkpoint '{checkpoint}' is missing; skipping.")
                 continue
 
-            logger.info(f"🧠 Fold {fold}: loading {checkpoint}")
+            logger.info(f"🧠 Fold {fold}: best initialisation is {checkpoint} "
+                        f"({MONITOR}={fold_infos[fold].get('best_score')})")
             # pos_weight is excluded from save_hyperparameters (it is a training-time buffer,
             # not architecture), so Lightning cannot rebuild it from the checkpoint's hparams
             # and the state_dict keys would not match. Feed it back from the fold sidecar.
@@ -513,7 +450,8 @@ class BasePipeline:
     def _render_plots(
         self,
         fold_scores: Dict[int, Tuple[np.ndarray, np.ndarray]],
-        operating_points: Dict[str, float]
+        operating_points: Dict[str, float],
+        fold_infos: Dict[int, Dict[str, Any]]
     ) -> None:
         """Renders the per-fold figures plus the fold-overlay ROC for this region."""
         logger.info(f"🖼️ Rendering plots into {self.monitor.output_dir}...")
@@ -531,8 +469,8 @@ class BasePipeline:
                 filename=f"confusion_matrix_fold_{fold}.pdf"
             )
 
-            history_path = os.path.join(self.history_dir, f"fold_{fold}.csv")
-            if os.path.exists(history_path):
+            history_path = os.path.join(self.results_dir, fold_infos[fold].get("history", ""))
+            if os.path.isfile(history_path):
                 history = pd.read_csv(history_path)
                 self.monitor.plot_loss(
                     history["train_loss"].dropna().tolist(),
@@ -551,19 +489,17 @@ class BasePipeline:
 
     def load_fold_infos(self) -> Dict[int, Dict[str, Any]]:
         """
-        The per-fold sidecars written by train(), keyed by fold number. Each fold owns its own
-        file, so N parallel single-fold SLURM jobs never contend over the same one.
+        The sidecar of each fold's best initialisation - the highest monitored score - keyed by
+        fold number. Training keeps every (fold, init) model; this is where one is picked per
+        fold. A single `fold_N.json` left by older versions counts as that fold's only init.
         """
-        infos = {}
-        if not os.path.isdir(self.checkpoints_dir):
-            return infos
-        for name in sorted(os.listdir(self.checkpoints_dir)):
-            if not name.startswith("fold_") or not name.endswith(".json"):
-                continue
-            with open(os.path.join(self.checkpoints_dir, name)) as handle:
+        candidates: Dict[int, List[Dict[str, Any]]] = {}
+        for path in sorted(glob.glob(os.path.join(self.checkpoints_dir, "fold_*.json"))):
+            with open(path) as handle:
                 info = json.load(handle)
-            infos[int(info["fold"])] = info
-        return infos
+            candidates.setdefault(int(info["fold"]), []).append(info)
+        return {fold: max(infos, key=lambda info: info.get("best_score") or 0.0)
+                for fold, infos in sorted(candidates.items())}
 
     def region_label(self) -> str:
         """Human-readable label of this region, e.g. 'et2_eta0' or 'full phase space'."""

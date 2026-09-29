@@ -1,19 +1,17 @@
 """
 Entrypoint for the ATLAS/CERN neural network experiments.
 
-    python ai/run.py train    --config ai/configs/mlp.yaml [--fold N] [--et-bin i --eta-bin j]
-    python ai/run.py train    --config ai/configs/mlp.yaml --et-bin i --eta-bin j --fold N --init M
-    python ai/run.py select   --config ai/configs/mlp.yaml [--et-bin i --eta-bin j]
+    python ai/run.py train    --config ai/configs/mlp.yaml [--fold N [--init M]] [--et-bin i --eta-bin j]
     python ai/run.py evaluate --config ai/configs/mlp.yaml [--et-bin i --eta-bin j]
     python ai/run.py report   --config ai/configs/mlp.yaml
     python ai/run.py grid
 
-`train` only produces models and the artefacts needed to reload them - with `--fold`/`--init`
-it trains exactly one model, which is what lets a scheduler run one training per job, and
-`select` then promotes each fold's best initialisation; `evaluate` turns those
-models into scores, metrics and plots for one kinematic region; `report` aggregates every
-evaluated region into the cross-validation table ("pd_table") as LaTeX and HTML; `grid` prints
-one 'et eta' line per region of the fixed Et x |eta| grid, for launchers that fan out over it.
+`train` only produces models, every (fold, initialisation) pair kept on disk - with
+`--fold`/`--init` it trains exactly one, which is what lets a scheduler run one training per
+job; `evaluate` picks each fold's best initialisation and turns it into scores, metrics and
+plots for one kinematic region; `report` aggregates every evaluated region into the
+cross-validation table ("pd_table") as LaTeX and HTML; `grid` prints one 'et eta' line per
+region of the fixed Et x |eta| grid, for launchers that fan out over it.
 
 Which dataset any of this runs on is entirely a matter of the config's `dataset:` block - see
 ai/preprocess/base.py.
@@ -99,7 +97,7 @@ def add_common_arguments(parser: argparse.ArgumentParser, config_default: Option
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """The argument parser with the train/select/evaluate/report/grid subcommands."""
+    """The argument parser with the train/evaluate/report/grid subcommands."""
     parser = argparse.ArgumentParser(
         description="Neural Network Training Orchestrator (ATLAS CERN).",
         formatter_class=argparse.RawDescriptionHelpFormatter
@@ -109,12 +107,9 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser = subparsers.add_parser("train", help="Train the cross-validation folds and persist the models.")
     add_common_arguments(train_parser)
     train_parser.add_argument('--fold', type=int, default=None, help="Train a specific fold only (1-indexed; useful for SLURM parallelism).")
-    train_parser.add_argument('--init', type=int, default=None, help="Train a specific initialisation only (1-indexed; requires --fold). One training per job: the checkpoint keeps its fold_N_init_M name and `select` picks the winner afterwards.")
+    train_parser.add_argument('--init', type=int, default=None, help="Train a specific initialisation only (1-indexed; requires --fold), for one training per job.")
 
-    select_parser = subparsers.add_parser("select", help="Pick each fold's best initialisation and promote it, after one-training-per-job runs.")
-    add_common_arguments(select_parser)
-
-    evaluate_parser = subparsers.add_parser("evaluate", help="Score the trained folds and produce metrics and plots for one region.")
+    evaluate_parser = subparsers.add_parser("evaluate", help="Score each fold's best initialisation and produce metrics and plots for one region.")
     add_common_arguments(evaluate_parser)
     evaluate_parser.add_argument('--reuse-scores', action='store_true', help="Reuse the cached scores/fold_N.parquet instead of re-running inference.")
     evaluate_parser.add_argument('--no-plots', action='store_true', help="Skip figure rendering (metrics and tables only).")
@@ -196,12 +191,6 @@ def main() -> None:
             n_inits=config.get("n_inits", 1),
             target_init=args.init
         )
-    elif args.command == "select":
-        try:
-            pipeline.select_best_inits()
-        except FileNotFoundError as exc:
-            logger.error(str(exc))
-            sys.exit(1)
     elif args.command == "evaluate":
         try:
             pipeline.evaluate(

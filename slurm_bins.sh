@@ -9,8 +9,8 @@
 # tarefa so). Sao tres etapas encadeadas por dependencia:
 #
 #   1. array de n_bins x n_folds x n_inits tarefas -> um treino cada
-#   2. array de n_bins tarefas -> escolhe o melhor init de cada fold (select)
-#      e avalia a regiao
+#   2. array de n_bins tarefas -> avalia a regiao (o evaluate usa o melhor init
+#      de cada fold; todos os inits continuam salvos)
 #   3. um job -> monta o tabelao
 #
 # Cada etapa so comeca quando a anterior termina inteira (afterok).
@@ -109,17 +109,16 @@ TRAIN_JOB_ID=$(sbatch --parsable -p "$PARTITION" --chdir="$REPO_DIR" -N 1 "${GRE
 }
 
 # Etapa 2: uma tarefa por regiao. So pode rodar quando TODOS os inits terminaram, porque
-# `select` compara os n_inits checkpoints de cada fold para escolher o vencedor.
+# o evaluate compara os n_inits checkpoints de cada fold para usar o melhor.
 EVAL_JOB_ID=$(sbatch --parsable -p "$PARTITION" --chdir="$REPO_DIR" -N 1 "${GRES_FLAG[@]}" \
      --array="0-$(( N_BINS - 1 ))" \
      --dependency="afterok:${TRAIN_JOB_ID}" \
-     --job-name="select_eval" \
+     --job-name="evaluate" \
      --output="${LOG_DIR}/eval_%A_%a.out" \
      --error="${LOG_DIR}/eval_%A_%a.err" \
      --wrap="et=\$(( SLURM_ARRAY_TASK_ID / $N_ETA_BINS )); \
              eta=\$(( SLURM_ARRAY_TASK_ID % $N_ETA_BINS )); \
              echo \"Task \$SLURM_ARRAY_TASK_ID -> et\${et}_eta\${eta}\"; \
-             $PYTHON ai/run.py select --config $CONFIG_FILE --et-bin \$et --eta-bin \$eta && \
              $PYTHON ai/run.py evaluate --config $CONFIG_FILE --et-bin \$et --eta-bin \$eta") || {
     echo "ERRO: sbatch recusou o array de avaliacao; cancele o treino com 'scancel ${TRAIN_JOB_ID}'." >&2
     exit 1
@@ -139,7 +138,7 @@ REPORT_JOB_ID=$(sbatch --parsable --chdir="$REPO_DIR" -N 1 \
 
 echo "====================================================================="
 echo "Treino:   array ${TRAIN_JOB_ID} (${N_TASKS} tarefas, um treino cada)."
-echo "Select+avaliacao: array ${EVAL_JOB_ID} (${N_BINS} tarefas), apos o treino."
+echo "Avaliacao: array ${EVAL_JOB_ID} (${N_BINS} tarefas), apos o treino."
 echo "Tabelao:  job ${REPORT_JOB_ID}, apos a avaliacao."
 echo "Use 'squeue -u \$USER' para monitorar."
 echo "Cancelar tudo: 'scancel ${TRAIN_JOB_ID} ${EVAL_JOB_ID} ${REPORT_JOB_ID}'."

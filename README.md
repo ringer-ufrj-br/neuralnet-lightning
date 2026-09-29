@@ -14,8 +14,8 @@ São três comandos, um depois do outro:
 
 | Comando | O que faz |
 |---|---|
-| `train` | Treina a rede com validação cruzada e salva os modelos |
-| `evaluate` | Passa os modelos treinados nos dados e calcula métricas e gráficos |
+| `train` | Treina a rede com validação cruzada e salva todos os modelos (cada fold × inicialização) |
+| `evaluate` | Escolhe a melhor inicialização de cada fold, passa nos dados e calcula métricas e gráficos |
 | `report` | Junta todas as regiões no tabelão (LaTeX e HTML) |
 
 Cada passo lê o que o anterior salvou em disco. Assim dá para refazer a avaliação ou a tabela
@@ -67,7 +67,7 @@ batch_size: 1024
 learning_rate: 0.001
 patience: 50          # quantas épocas sem melhorar antes de parar
 n_splits: 10          # número de folds da validação cruzada (1 = treina um modelo só)
-n_inits: 5            # quantas vezes treinar cada fold com pesos iniciais diferentes; fica o melhor
+n_inits: 5            # quantas vezes treinar cada fold com pesos iniciais diferentes; o evaluate usa a melhor
 seed: 42              # semente da divisão em folds
 ```
 
@@ -143,7 +143,7 @@ Treina e avalia as 25 regiões, uma de cada vez, e monta o tabelão no final. Se
 Rode do nó de login. O script faz três etapas, cada uma esperando a anterior terminar sem erro:
 
 1. um job para cada treino (região × fold × inicialização);
-2. um job por região, que escolhe a melhor inicialização de cada fold (`select`) e avalia;
+2. um job por região, que avalia usando a melhor inicialização de cada fold;
 3. um job que monta o tabelão.
 
 O script já usa o Python do `neuralnet-env`; para usar outro, rode
@@ -237,8 +237,8 @@ Mais algumas dicas:
 ```
 results/<MODELO>/et<i>_eta<j>/
 ├── artifacts/     o preprocessador ajustado e quais eventos cada fold usou na validação
-├── checkpoints/   fold_N.ckpt (a melhor rede do fold) e fold_N.json (detalhes do treino)
-├── history/       a loss de cada época
+├── checkpoints/   fold_N_init_M.ckpt (cada fold × inicialização) e o .json com os detalhes do treino
+├── history/       a loss de cada época, por fold e inicialização
 ├── scores/        a nota que a rede deu a cada evento da região, por fold
 ├── metrics/       folds_long.csv: P_D, SP e F_A por fold e ponto de operação
 └── plots/         ROC, PR, matriz de confusão e curvas de loss
