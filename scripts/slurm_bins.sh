@@ -16,8 +16,8 @@
 # Cada etapa so comeca quando a anterior termina inteira (afterok).
 
 # As partitions 'gpu' e 'cpu' sao filas distintas; sem -p o sbatch usa a default (cpu),
-# que nao tem placa. Neste cluster as GPUs NAO estao registradas como GRES no SLURM
-# (scontrol show node calobaXX -> Gres=(null)), portanto --gres=gpu:1 faz o sbatch
+# que nao tem placa. Neste cluster as GPUs NAO estao registradas como GRES no SLURM,
+# portanto --gres=gpu:1 faz o sbatch
 # recusar a submissao com "Requested node configuration is not available": a escolha da
 # partition gpu ja garante um no com placa. Caso o GRES venha a ser configurado,
 # submeta com GRES=gpu:1.
