@@ -101,6 +101,5 @@ class PreprocessMLP(BasePreprocessor):
         log1p, then the StandardScaler learned in `fit` (which raises NotFittedError before it),
         both in place on the array `extract` returned.
         """
-        X = self.scaler.transform(self._log_energies(X), copy=False)
-        return X.astype(np.float32, copy=False)
+        return self.scaler.transform(self._log_energies(X), copy=False)
 

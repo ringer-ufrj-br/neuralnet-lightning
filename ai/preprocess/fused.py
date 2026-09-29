@@ -32,10 +32,7 @@ class PreprocessFused(BasePreprocessor):
 
         rings = self.extract(df, self.ring_columns)
         total = np.abs(rings).sum(axis=1, keepdims=True)
-        np.divide(rings, total, out=rings, where=total > 0)
-        rings[~(total[:, 0] > 0)] = 0.0
-        X[:, :n_rings] = rings
-        del rings
+        np.divide(rings, total, out=X[:, :n_rings], where=total > 0)
 
         # copy=False: a view is required, or the images would land in a discarded copy.
         self.cells_pp.build_images(df, out=X[:, n_rings:].reshape((df.height, *cell_shape), copy=False))
