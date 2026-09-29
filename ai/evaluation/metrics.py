@@ -18,13 +18,6 @@ def sp_index(pd: Number, fa: Number) -> Number:
     single implementation works with Python floats, numpy arrays and torch tensors alike -
     it is shared by both the per-epoch training metric (models/*.py, torch tensors) and the
     post-hoc evaluation report (evaluation/summary.py, numpy arrays).
-
-    Args:
-        pd: Probability of detection, in [0, 1].
-        fa: False alarm rate, in [0, 1].
-
-    Returns:
-        The SP Index, same type as the inputs.
     """
     return ((pd * (1 - fa)) ** 0.5 * (pd + 1 - fa) / 2) ** 0.5
 
@@ -38,14 +31,7 @@ def max_sp_index(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     of by how separable the two classes are.
 
     Sweeps the thresholds the ROC visits - one per distinct score, so a cut never splits a
-    group of equal scores - and returns the best SP among them.
-
-    Args:
-        preds (torch.Tensor): Predicted probabilities (post-sigmoid), any shape.
-        targets (torch.Tensor): Binary ground-truth labels, same shape as preds.
-
-    Returns:
-        torch.Tensor: Scalar best SP Index, 0 when either class is absent.
+    group of equal scores - and returns the best SP among them (0 when either class is absent).
     """
     scores = preds.flatten()
     y = targets.flatten().long()

@@ -18,35 +18,25 @@ that is on disk and addressable.
 """
 
 import glob
-import hashlib
 import json
 import logging
 import os
-import sys
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
+import joblib
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
 
-logger = logging.getLogger(__name__)
-
-# Ensure root directory is in path for imports
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
-
-from ai.loader.loader import DataLoader
-from ai.label.label_generator import validate_files
-from ai.trainer.trainer import ModelTrainer
+from ai.trainer.trainer import MONITOR, ModelTrainer
 from ai.evaluation.monitor import ModelMonitor
-from ai.evaluation.summary import (
-    DEFAULT_OPERATING_POINTS,
-    ModelSummary,
-    compute_metrics,
-    compute_operating_points,
-)
-from ai.binning.kinematics import GRID
+from ai.evaluation.summary import DEFAULT_OPERATING_POINTS, compute_metrics, compute_operating_points
+from ai.binning import kinematics
+from ai.label.label_generator import validate_files
 from ai.preprocess.base import ET, ETA, LABEL, ROW_ID, DatasetSchema
+
+logger = logging.getLogger(__name__)
 
 
 def _atomic_write_json(payload: Dict[str, Any], filepath: str) -> str:
@@ -56,13 +46,6 @@ def _atomic_write_json(payload: Dict[str, Any], filepath: str) -> str:
     Under SLURM these sidecars are written by many processes at once and read by the step that
     follows; a plain open()/write() lets a reader observe a half-written file. os.replace is
     atomic on POSIX, so a reader always sees either the old or the new complete file.
-
-    Args:
-        payload (Dict[str, Any]): JSON-serialisable content.
-        filepath (str): Destination path.
-
-    Returns:
-        str: The written path.
     """
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     tmp_path = f"{filepath}.tmp.{os.getpid()}"
@@ -78,7 +61,8 @@ class BasePipeline:
 
     Subclasses declare the model class and the preprocessor, plus whatever model kwargs are
     derived from the feature array; everything else - data loading, kinematic binning, the
-    cross-validation, artefact persistence, scoring and reporting - is common.
+    cross-validation, artefact persistence, scoring and reporting - is common. A preprocessor
+    that needs constructor arguments is declared as `functools.partial(PreprocessX, ...)`.
     """
 
     #: LightningModule subclass this pipeline trains (a BaseBinaryClassifier subclass).
@@ -89,10 +73,6 @@ class BasePipeline:
 
     #: Registry name, set by @register_pipeline. Also the results/<NAME>/ directory.
     model_name: str = "Model"
-
-    #: Metric monitored by EarlyStopping/ModelCheckpoint, and its improvement direction.
-    monitor_metric: str = "val_sp"
-    monitor_mode: str = "max"
 
     def __init__(
         self,
@@ -107,49 +87,31 @@ class BasePipeline:
         eta_bin: Optional[int] = None
     ) -> None:
         """
-        Initializes the pipeline and resolves the results directory for this kinematic region.
+        Resolves the results directory for this kinematic region.
 
-        Nothing here knows the dataset's column names: the schema translates whatever is on
-        disk into the canonical `label` / `et` / `eta` / `ring_i` vocabulary every stage below
-        works in, and the binning carries the region edges the dataset was defined against.
+        Nothing here knows the dataset's column names: the schema (the mc25 layout by default)
+        translates whatever is on disk into the canonical `label` / `et` / `eta` / `ring_i`
+        vocabulary every stage below works in.
 
-        Args:
-            schema (Optional[DatasetSchema]): Dataset layout. Defaults to the mc25 layout.
-            results_root (str): Root the artefacts are written under, as
-                `<results_root>/<model>/<region>`. Give each dataset its own root: the region
-                directories are named after bin *indices*, so two datasets sharing a root
-                would silently overwrite each other's identically-named regions. Defaults to
-                'results'.
-            max_epochs (int): Maximum training epochs. Defaults to 20.
-            batch_size (int): Training batch size. Defaults to 32.
-            patience (int): Early stopping patience. Defaults to 5.
-            accelerator (str): PyTorch Lightning accelerator ('auto', 'cpu', 'cuda'). Defaults to 'auto'.
-            devices (Union[int, str, List[int]]): Devices specification. Defaults to 'auto'.
-            et_bin (Optional[int]): Et bin index. Trains on the whole dataset when None
-                (together with eta_bin) or on only that kinematic slice when both are set -
-                the Ringer one-network-per-region scheme. Defaults to None.
-            eta_bin (Optional[int]): |eta| bin index. Defaults to None.
-
-        Raises:
-            ValueError: If exactly one of et_bin/eta_bin is set, or if the region is outside
-                the configured grid.
+        Artefacts go to `<results_root>/<model>/<region>`. Give each dataset its own root: the
+        region directories are named after bin *indices*, so two datasets sharing a root would
+        silently overwrite each other's identically-named regions. With et_bin and eta_bin both
+        None the pipeline covers the whole dataset; with both set, only that kinematic slice -
+        the Ringer one-network-per-region scheme. Raises ValueError if exactly one is set or
+        the region is outside the grid.
         """
         if (et_bin is None) != (eta_bin is None):
             raise ValueError("❌ et_bin and eta_bin must be set together (or both left as None).")
 
         self.schema = schema or DatasetSchema()
-        self.label_col = LABEL
-        self.data_path = self.schema.data_path
-        self.max_files = self.schema.max_files
         self.et_bin = et_bin
         self.eta_bin = eta_bin
 
-        self.results_root = results_root
         self.results_dir = os.path.join(results_root, self.model_name)
         if et_bin is not None:
-            GRID.validate(et_bin, eta_bin)
-            self.results_dir = os.path.join(self.results_dir, GRID.bin_label(et_bin, eta_bin))
-            logger.info(f"🎯 Kinematic bin selected: {GRID.bin_description(et_bin, eta_bin)}")
+            kinematics.validate(et_bin, eta_bin)
+            self.results_dir = os.path.join(self.results_dir, kinematics.bin_label(et_bin, eta_bin))
+            logger.info(f"🎯 Kinematic bin selected: {kinematics.bin_description(et_bin, eta_bin)}")
 
         self.artifacts_dir = os.path.join(self.results_dir, "artifacts")
         self.checkpoints_dir = os.path.join(self.results_dir, "checkpoints")
@@ -157,8 +119,7 @@ class BasePipeline:
         self.scores_dir = os.path.join(self.results_dir, "scores")
         self.preprocessor_path = os.path.join(self.artifacts_dir, "preprocessor.joblib")
 
-        self.loader = DataLoader(data_path=self.data_path, max_files=self.max_files)
-        self.preprocessor = self.build_preprocessor()
+        self.preprocessor = self.preprocessor_class()
 
         self.trainer = ModelTrainer(
             max_epochs=max_epochs,
@@ -167,68 +128,26 @@ class BasePipeline:
             log_dir=os.path.join(self.results_dir, "lightning_logs"),
             checkpoint_dir=self.checkpoints_dir,
             accelerator=accelerator,
-            devices=devices,
-            monitor_metric=self.monitor_metric,
-            monitor_mode=self.monitor_mode
+            devices=devices
         )
 
         self.monitor = ModelMonitor(output_dir=os.path.join(self.results_dir, "plots"))
-        self.summary = ModelSummary(output_dir=os.path.join(self.results_dir, "metrics"))
 
     # ------------------------------------------------------------------ hooks
 
-    def build_preprocessor(self) -> Any:
-        """
-        Builds the preprocessor for this architecture. The default instantiates
-        `preprocessor_class` with no arguments; override only if it needs constructor
-        arguments.
-
-        Returns:
-            Any: A fresh, unfitted preprocessor instance.
-
-        Raises:
-            NotImplementedError: If the subclass declares neither preprocessor_class nor an
-                override.
-        """
-        if getattr(self, "preprocessor_class", None) is None:
-            raise NotImplementedError(
-                f"{type(self).__name__} must set preprocessor_class or override build_preprocessor()."
-            )
-        return self.preprocessor_class()
-
     def build_model_kwargs(self, X: np.ndarray) -> Dict[str, Any]:
         """
-        Builds the constructor kwargs for the model, given the (already preprocessed) training
-        feature array - this is where an architecture picks up e.g. its input dimension.
-
-        Args:
-            X (np.ndarray): Preprocessed training features.
-
-        Returns:
-            Dict[str, Any]: Keyword arguments for model_class.
+        Constructor kwargs for the model, given the (already preprocessed) training feature
+        array - this is where an architecture picks up e.g. its input dimension.
         """
         return {}
-
-    def required_columns(self, available: List[str]) -> Optional[List[str]]:
-        """
-        Declares which dataset columns this architecture actually consumes, so the loader can
-        prune everything else at the parquet scan (the raw files carry 300+ columns, most of
-        them nested calorimeter images no MLP-style model ever touches - loading them all is
-        what used to exhaust memory on full-dataset runs).
-
-        Args:
-            available (List[str]): Column names present in the dataset files.
-
-        Returns:
-            Optional[List[str]]: Columns to load, or None to load every column.
-        """
-        return self.preprocessor.required_columns(available)
 
     # ------------------------------------------------------------------ data
 
     def load_dataframe(self) -> Optional[pd.DataFrame]:
         """
-        Loads the dataset in the canonical column vocabulary and applies the kinematic cut.
+        Loads the dataset in the canonical column vocabulary and applies the kinematic cut, or
+        returns None when nothing could be loaded.
 
         Runs as a single lazy polars query - the join with any side table, the column
         projection, the label derivation and the region filter all happen inside the streaming
@@ -238,12 +157,9 @@ class BasePipeline:
 
         Deterministic given the same files on disk, which is what lets `train` and `evaluate`
         run as separate processes over the same row ordering.
-
-        Returns:
-            Optional[pd.DataFrame]: The prepared DataFrame, or None when nothing could be loaded.
         """
         logger.info("📂 Loading dataset...")
-        files = self.loader.get_files()
+        files = self.schema.files()
         if not files:
             logger.error("❌ No data was loaded.")
             return None
@@ -254,23 +170,21 @@ class BasePipeline:
         lazy_frame = self.schema.scan(files)
         available = self.schema.canonical_columns(lazy_frame.collect_schema().names())
 
-        columns = self.required_columns(available)
+        columns = self.preprocessor.required_columns(available)
         if columns is None:
-            columns = [name for name in available if name != self.label_col]
+            columns = [name for name in available if name != LABEL]
         keep = list(dict.fromkeys(
             list(columns)
             + [name for name in (ET, ETA, ROW_ID) if name in available]
-            + [self.label_col]
+            + [LABEL]
         ))
         logger.info(f"🔎 Projecting scan down to {len(keep)} canonical column(s).")
         lazy_frame = self.schema.project(lazy_frame, keep)
 
         if self.et_bin is not None:
-            logger.info(f"✂️ Restricting to kinematic bin {GRID.bin_label(self.et_bin, self.eta_bin)} "
-                        f"({GRID.bin_description(self.et_bin, self.eta_bin)})...")
-            lazy_frame = lazy_frame.filter(
-                GRID.filter_expr(self.et_bin, self.eta_bin, ET, ETA)
-            )
+            logger.info(f"✂️ Restricting to kinematic bin {kinematics.bin_label(self.et_bin, self.eta_bin)} "
+                        f"({kinematics.bin_description(self.et_bin, self.eta_bin)})...")
+            lazy_frame = lazy_frame.filter(kinematics.filter_expr(self.et_bin, self.eta_bin, ET, ETA))
 
         df = lazy_frame.collect(engine="streaming").to_pandas()
 
@@ -281,15 +195,14 @@ class BasePipeline:
                 logger.error("❌ No data was loaded.")
             return None
 
-        if df[self.label_col].isna().any():
+        if df[LABEL].isna().any():
             raise RuntimeError(
-                f"❌ {int(df[self.label_col].isna().sum())} row(s) have no label. Check "
+                f"❌ {int(df[LABEL].isna().sum())} row(s) have no label. Check "
                 f"dataset.label in the config against the dataset's actual contents."
             )
 
         logger.info(f"   {len(df)} rows loaded.")
         return df
-
 
     # ------------------------------------------------------------------ train
 
@@ -301,38 +214,24 @@ class BasePipeline:
         seed: int = 42,
         n_inits: int = 1,
         target_init: Optional[int] = None
-    ) -> List[Dict[str, Any]]:
+    ) -> None:
         """
         Trains the cross-validation folds and persists every artefact `evaluate` will need.
 
         No metrics, plots or tables are produced here - training's only job is to leave behind
-        reproducible models. Safe to run as N parallel single-fold jobs: the split is a pure
-        function of (data, seed), the shared artefacts are written atomically with identical
-        content, and each fold owns its own checkpoint and sidecar.
-
-        Args:
-            n_splits (int): Number of K-Fold splits. Defaults to 5.
-            learning_rate (float): Model learning rate. Defaults to 0.001.
-            target_fold (Optional[int]): Train only this fold (1-indexed), for SLURM parallelism.
-            seed (int): Seed for the fold partition. Defaults to 42.
-            n_inits (int): Independent initialisations per fold; the best is kept. Defaults to 1.
-            target_init (Optional[int]): Train only this initialisation (1-indexed), leaving the
-                checkpoint under its own name and the winner unpicked. One training per
-                scheduler job; `select_best_inits` finishes the job afterwards.
-
-        Returns:
-            List[Dict[str, Any]]: The fold records returned by ModelTrainer.fit_kfold.
+        reproducible models. Safe to run as parallel single-(fold, init) jobs: the split is a
+        pure function of (data, seed), the shared artefacts are written with identical content,
+        and each (fold, init) owns its own checkpoint and sidecar. Each fold's best
+        initialisation is promoted right away, unless `target_init` says this job trained just
+        one of them - then `select_best_inits` does it once the sibling jobs have finished.
         """
         logger.info(f"🚀 Starting training: {self.model_name} ({self.region_label()})")
 
         df = self.load_dataframe()
         if df is None:
-            return []
+            return
 
-        Y = self.preprocessor.get_labels(df, label_col=self.label_col)
-        if Y is None:
-            logger.error("❌ Labels column not found.")
-            return []
+        Y = df[LABEL].to_numpy(np.float32)
 
         # The k-fold partition is the whole scheme: k-1 partitions train and 1 validates, which
         # is what drives early stopping and the choice between initialisations. There is no
@@ -341,23 +240,22 @@ class BasePipeline:
         X_all = self.preprocessor.fit_transform(df)
 
         os.makedirs(self.artifacts_dir, exist_ok=True)
-        self.preprocessor.save(self.preprocessor_path)
+        joblib.dump(self.preprocessor, self.preprocessor_path)
+        logger.info(f"💾 Saved preprocessor to: {self.preprocessor_path}")
 
         model_kwargs = {'learning_rate': learning_rate, **self.build_model_kwargs(X_all)}
         logger.info(f"🏋️ Training {n_splits} folds (kwargs={model_kwargs}, weighted loss enabled)...")
 
-        fold_records = self.trainer.fit_kfold(
+        records = self.trainer.fit_kfold(
             self.model_class, model_kwargs, X_all, Y,
             n_splits=n_splits, target_fold=target_fold, seed=seed, n_inits=n_inits,
             target_init=target_init
         )
 
         os.makedirs(self.history_dir, exist_ok=True)
-        for record in fold_records:
+        for record in records:
             fold = record["fold"]
-            # One training per job: this job owns only its own initialisation's artefacts.
-            # `select_best_inits` renames the winner's to the plain fold_N names afterwards.
-            stem = f"fold_{fold}" if target_init is None else f"fold_{fold}_init_{target_init}"
+            stem = f"fold_{fold}_init_{record['init']}"
 
             history_path = os.path.join(self.history_dir, f"{stem}.csv")
             loss_callback = record["loss_callback"]
@@ -369,57 +267,43 @@ class BasePipeline:
 
             # The rows this fold validated on rather than trained on. Evaluation scores every
             # row regardless, so these only mark which predictions are out of sample.
-            val_rel = None
-            if record.get("val_ids") is not None:
-                val_path = os.path.join(self.artifacts_dir, f"val_indices_fold_{fold}.npy")
-                np.save(val_path, np.sort(record["val_ids"]))
-                val_rel = os.path.relpath(val_path, self.results_dir)
+            val_path = os.path.join(self.artifacts_dir, f"val_indices_fold_{fold}.npy")
+            np.save(val_path, np.sort(record["val_ids"]))
 
             _atomic_write_json({
                 "fold": fold,
-                "init": target_init,
+                "init": record["init"],
                 "checkpoint": os.path.relpath(record["checkpoint"], self.results_dir),
-                "val_indices": val_rel,
-                "n_inits": record.get("n_inits", 1),
-                "best_init": record.get("best_init", 1),
+                "val_indices": os.path.relpath(val_path, self.results_dir),
                 "pos_weight": record["pos_weight"],
                 "best_score": record["best_score"],
-                "monitor_metric": self.monitor_metric,
+                "monitor_metric": MONITOR,
                 "epochs": record["epochs"],
                 "n_train": record["n_train"],
                 "n_val": record["n_val"],
-                "model_kwargs": {k: v for k, v in model_kwargs.items()},
+                "model_kwargs": model_kwargs,
                 "history": os.path.relpath(history_path, self.results_dir),
             }, os.path.join(self.checkpoints_dir, f"{stem}.json"))
 
         logger.info(f"✅ Training complete. Artefacts under: {self.results_dir}")
         if target_init is None:
-            logger.info(f"   Next: python ai/run.py evaluate {self.cli_region_args()}")
+            self.select_best_inits()
         else:
             logger.info(f"   Next, once every initialisation of this region has finished: "
                         f"python ai/run.py select {self.cli_region_args()}")
-        return fold_records
 
-    def select_best_inits(self) -> Dict[int, Dict[str, Any]]:
+    def select_best_inits(self) -> None:
         """
         Picks each fold's best initialisation and promotes it to the plain `fold_N` names the
         rest of the pipeline expects.
 
-        This is the join point of the one-training-per-job layout: every (fold, init) job wrote
-        `fold_N_init_M.ckpt` plus a sidecar with its monitored score, and nothing compared them
-        because the siblings were still running elsewhere. Here they are all on disk, so the
-        winner per fold is renamed to `fold_N.ckpt` / `fold_N.json` / `history/fold_N.csv` and
-        the losing checkpoints are deleted - otherwise n_inits would multiply the checkpoints
-        on disk.
+        Every (fold, init) training leaves `fold_N_init_M.ckpt` plus a sidecar with its
+        monitored score. Here the winner per fold is renamed to `fold_N.ckpt` / `fold_N.json` /
+        `history/fold_N.csv` and the losers are deleted - otherwise n_inits would multiply the
+        checkpoints on disk.
 
         Idempotent: a region whose folds are already settled is left alone, so re-running a
-        failed scheduler step is safe.
-
-        Returns:
-            Dict[int, Dict[str, Any]]: The winning sidecar per fold.
-
-        Raises:
-            FileNotFoundError: If no per-initialisation sidecar exists for this region.
+        failed scheduler step is safe. Raises FileNotFoundError if the region was never trained.
         """
         pattern = os.path.join(self.checkpoints_dir, "fold_*_init_*.json")
         per_init: Dict[int, List[Dict[str, Any]]] = {}
@@ -433,18 +317,16 @@ class BasePipeline:
             settled = self.load_fold_infos()
             if settled:
                 logger.info(f"✔️ {self.region_label()}: already settled ({len(settled)} fold(s)).")
-                return settled
+                return
             raise FileNotFoundError(
                 f"❌ No per-initialisation sidecars in '{self.checkpoints_dir}'. Run `train` first."
             )
 
-        better = max if self.monitor_mode == "max" else min
-        winners: Dict[int, Dict[str, Any]] = {}
         for fold, candidates in sorted(per_init.items()):
             scored = [c for c in candidates if c.get("best_score") is not None]
-            winner = better(scored or candidates, key=lambda c: c.get("best_score") or 0.0)
+            winner = max(scored or candidates, key=lambda c: c.get("best_score") or 0.0)
             logger.info(f"🏆 Fold {fold}: kept initialisation {winner['init']} of "
-                        f"{len(candidates)} ({self.monitor_metric}={winner.get('best_score')})")
+                        f"{len(candidates)} ({MONITOR}={winner.get('best_score')})")
 
             for name, key in (("ckpt", "checkpoint"), ("csv", "history")):
                 source = os.path.join(self.results_dir, winner[key])
@@ -453,11 +335,10 @@ class BasePipeline:
                     os.replace(source, target)
                 winner[key] = os.path.relpath(target, self.results_dir)
 
-            winner.pop("init", None)
+            winner["best_init"] = winner.pop("init")
             winner["n_inits"] = len(candidates)
             _atomic_write_json({k: v for k, v in winner.items() if k != "_sidecar"},
                                os.path.join(self.checkpoints_dir, f"fold_{fold}.json"))
-            winners[fold] = winner
 
             for loser in candidates:
                 if loser is winner:
@@ -469,9 +350,8 @@ class BasePipeline:
             for entry in candidates:
                 os.remove(entry["_sidecar"])
 
-        logger.info(f"✅ {self.region_label()}: {len(winners)} fold(s) settled.")
+        logger.info(f"✅ {self.region_label()}: {len(per_init)} fold(s) settled.")
         logger.info(f"   Next: python ai/run.py evaluate {self.cli_region_args()}")
-        return winners
 
     # --------------------------------------------------------------- evaluate
 
@@ -480,24 +360,16 @@ class BasePipeline:
         operating_points: Optional[Dict[str, float]] = None,
         reuse_scores: bool = False,
         make_plots: bool = True
-    ) -> pd.DataFrame:
+    ) -> None:
         """
-        Scores every trained fold over the whole region and writes its metrics, plots and
-        its slice of the cross-validation table.
+        Scores every trained fold over the whole region and writes its metrics, plots and its
+        slice of the cross-validation table (see ai.evaluation.pd_table.LONG_COLUMNS).
 
-        Args:
-            operating_points (Optional[Dict[str, float]]): Working point name -> target PD.
-                Defaults to {"tight": 0.90, "medium": 0.95, "loose": 0.99}.
-            reuse_scores (bool): Skip inference and read `scores/fold_N.parquet` written by an
-                earlier evaluation. Lets working points and plots be recut in seconds without
-                touching the data or the GPU. Defaults to False.
-            make_plots (bool): Whether to render the ROC/PR/confusion/loss figures. Defaults to True.
-
-        Returns:
-            pd.DataFrame: This region's long-format table (see ai.evaluation.pd_table.LONG_COLUMNS).
-
-        Raises:
-            FileNotFoundError: If the region has not been trained yet.
+        `operating_points` maps working point name -> target PD (tight/medium/loose at
+        90/95/99% by default). `reuse_scores` skips inference and reads the
+        `scores/fold_N.parquet` of an earlier evaluation, so working points and plots can be
+        recut in seconds without touching the data or the GPU. Raises FileNotFoundError if the
+        region has not been trained yet.
         """
         operating_points = operating_points or DEFAULT_OPERATING_POINTS
         fold_infos = self.load_fold_infos()
@@ -512,46 +384,30 @@ class BasePipeline:
 
         fold_scores = self._collect_scores(fold_infos, reuse_scores)
 
-        operating_rows, long_rows = [], []
+        long_rows = []
         for fold in sorted(fold_scores):
             y_true, y_prob = fold_scores[fold]
-            pos_weight = fold_infos[fold].get("pos_weight")
+            metrics = compute_metrics(y_true, y_prob)
 
-            metrics = compute_metrics(y_true, y_prob, pos_weight=pos_weight)
-
-            points = compute_operating_points(y_true, y_prob, operating_points)
-            for point in points:
-                operating_rows.append({"Fold": fold, **point})
-                long_rows.append({
-                    "model": self.model_name,
-                    "et_bin": self.et_bin,
-                    "eta_bin": self.eta_bin,
-                    "fold": fold,
-                    "operating_point": point["Operating_Point"],
-                    "target_pd": point["Target_PD"],
-                    "threshold": point["Threshold"],
-                    "pd": point["PD"],
-                    "fa": point["FA"],
-                    "sp": point["SP_Index"],
-                    "auc_roc": metrics["AUC_ROC"],
-                    "auc_pr": metrics["AUC_PR"],
-                    "n_signal": metrics["N_Positives"],
-                    "n_background": metrics["N_Negatives"],
-                })
+            for point in compute_operating_points(y_true, y_prob, operating_points):
+                long_rows.append({"model": self.model_name, "et_bin": self.et_bin,
+                                  "eta_bin": self.eta_bin, "fold": fold, **point, **metrics})
                 logger.info(
-                    f"   fold {fold} {point['Operating_Point']:<7} PD={point['PD']:.4f} "
-                    f"(target {point['Target_PD']:.2f}) -> FA={point['FA']:.4f}, "
-                    f"SP={point['SP_Index']:.4f}, threshold={point['Threshold']:.4f}"
+                    f"   fold {fold} {point['operating_point']:<7} PD={point['pd']:.4f} "
+                    f"(target {point['target_pd']:.2f}) -> FA={point['fa']:.4f}, "
+                    f"SP={point['sp']:.4f}, threshold={point['threshold']:.4f}"
                 )
 
-        self.summary.save_operating_points(operating_rows, filename="operating_points.csv")
-        long_df = self.summary.save_long_table(long_rows, filename="folds_long.csv")
+        metrics_dir = os.path.join(self.results_dir, "metrics")
+        os.makedirs(metrics_dir, exist_ok=True)
+        long_path = os.path.join(metrics_dir, "folds_long.csv")
+        pd.DataFrame(long_rows).to_csv(long_path, index=False)
+        logger.info(f"📝 Saved long-format fold table ({len(long_rows)} rows) to: {long_path}")
 
         if make_plots:
             self._render_plots(fold_scores, operating_points)
 
         logger.info(f"✅ Evaluation complete. Results under: {self.results_dir}")
-        return long_df
 
     def _collect_scores(
         self,
@@ -559,15 +415,8 @@ class BasePipeline:
         reuse_scores: bool
     ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
         """
-        Produces (y_true, y_prob) for every fold, either by reloading cached score files or by
-        running each fold's checkpoint over the full region (in-sample rows included).
-
-        Args:
-            fold_infos (Dict[int, Dict[str, Any]]): Per-fold sidecars, keyed by fold number.
-            reuse_scores (bool): Read cached scores instead of re-running inference.
-
-        Returns:
-            Dict[int, Tuple[np.ndarray, np.ndarray]]: Mapping fold -> (y_true, y_prob).
+        (y_true, y_prob) for every fold, either by reloading cached score files or by running
+        each fold's checkpoint over the full region (in-sample rows included).
         """
         if reuse_scores:
             cached = {}
@@ -584,10 +433,8 @@ class BasePipeline:
         if df is None:
             raise RuntimeError("❌ No data was loaded; cannot evaluate.")
 
-        Y = self.preprocessor.get_labels(df, label_col=self.label_col)
-
-        preprocessor = type(self.preprocessor).load(self.preprocessor_path)
-        self.preprocessor = preprocessor
+        self.preprocessor = joblib.load(self.preprocessor_path)
+        logger.info(f"📂 Loaded preprocessor from: {self.preprocessor_path}")
 
         # Every fold is scored over the WHOLE region, in-sample rows included. Train and
         # validation are separated during training - that is what drives early stopping and
@@ -595,28 +442,20 @@ class BasePipeline:
         # space rather than only each fold's held-out partition. The `in_sample` column below
         # records which rows the fold trained on, so an out-of-sample-only cut stays available
         # to anyone who wants it.
-        y_true = Y.flatten()
-        X_all = preprocessor.transform(df)
+        y_true = df[LABEL].to_numpy(np.float32)
+        X_all = self.preprocessor.transform(df)
         logger.info(f"🧾 Scoring the full region: {len(y_true)} rows "
                     f"({int((y_true == 1).sum())} signal, {int((y_true == 0).sum())} background).")
 
         # Kept alongside the scores so the table can be re-cut per kinematic region later
         # without re-running inference.
-        kinematics = {
+        kinematic_columns = {
             column: df[column].to_numpy()
             for column in (ET, ETA, ROW_ID) if column in df.columns
         }
 
         def out_of_sample_mask(fold: int) -> Optional[np.ndarray]:
-            """
-            Boolean mask of the rows this fold did NOT train on, or None when unknown.
-
-            Args:
-                fold (int): Fold number.
-
-            Returns:
-                Optional[np.ndarray]: True where the row was held out from this fold's training.
-            """
+            """True where the row was held out from this fold's training; None when unknown."""
             rel = fold_infos[fold].get("val_indices")
             if not rel:
                 return None
@@ -646,7 +485,7 @@ class BasePipeline:
             scores[fold] = (y_true, y_prob)
 
             held_out = out_of_sample_mask(fold)
-            columns = {"y_true": y_true, "y_prob": y_prob, **kinematics}
+            columns = {"y_true": y_true, "y_prob": y_prob, **kinematic_columns}
             if held_out is not None:
                 columns["in_sample"] = ~held_out
                 logger.info(f"   fold {fold}: {int(held_out.sum())} of {len(y_true)} rows were out of sample")
@@ -659,18 +498,9 @@ class BasePipeline:
 
     def _predict(self, model: pl.LightningModule, X: np.ndarray, batch_size: int = 8192) -> np.ndarray:
         """
-        Runs batched inference and returns post-sigmoid probabilities.
-
-        Batched rather than in one shot because a region can be tens of millions of rows,
-        which would not fit in memory as a single forward pass.
-
-        Args:
-            model (pl.LightningModule): Trained model, already restored from a checkpoint.
-            X (np.ndarray): Preprocessed features.
-            batch_size (int): Inference batch size. Defaults to 8192.
-
-        Returns:
-            np.ndarray: Probabilities, shape (N,).
+        Post-sigmoid probabilities, shape (N,). Batched rather than in one shot because a
+        region can be tens of millions of rows, which would not fit in memory as a single
+        forward pass.
         """
         model.eval()
         outputs = []
@@ -685,20 +515,14 @@ class BasePipeline:
         fold_scores: Dict[int, Tuple[np.ndarray, np.ndarray]],
         operating_points: Dict[str, float]
     ) -> None:
-        """
-        Renders the per-fold figures plus the fold-overlay ROC for this region.
-
-        Args:
-            fold_scores (Dict[int, Tuple[np.ndarray, np.ndarray]]): Mapping fold -> (y_true, y_prob).
-            operating_points (Dict[str, float]): Working point name -> target PD.
-        """
+        """Renders the per-fold figures plus the fold-overlay ROC for this region."""
         logger.info(f"🖼️ Rendering plots into {self.monitor.output_dir}...")
         for fold in sorted(fold_scores):
             y_true, y_prob = fold_scores[fold]
             points = compute_operating_points(y_true, y_prob, operating_points)
             # The confusion matrix needs one cut; the tightest working point is the one the
             # trigger would actually run at, so it is the cut worth picturing.
-            cut = min(points, key=lambda point: point["Target_PD"])["Threshold"] if points else 0.5
+            cut = min(points, key=lambda point: point["target_pd"])["threshold"]
 
             self.monitor.plot_roc_curve(y_true, y_prob, filename=f"roc_curve_fold_{fold}.pdf", operating_points=points)
             self.monitor.plot_pr_curve(y_true, y_prob, filename=f"pr_curve_fold_{fold}.pdf")
@@ -727,13 +551,8 @@ class BasePipeline:
 
     def load_fold_infos(self) -> Dict[int, Dict[str, Any]]:
         """
-        Reads the per-fold sidecars written by train().
-
-        Each fold owns its own file, so N parallel single-fold SLURM jobs never contend over
-        the same one.
-
-        Returns:
-            Dict[int, Dict[str, Any]]: Mapping fold number -> sidecar contents.
+        The per-fold sidecars written by train(), keyed by fold number. Each fold owns its own
+        file, so N parallel single-fold SLURM jobs never contend over the same one.
         """
         infos = {}
         if not os.path.isdir(self.checkpoints_dir):
@@ -747,23 +566,13 @@ class BasePipeline:
         return infos
 
     def region_label(self) -> str:
-        """
-        Human-readable label of the kinematic region this pipeline instance covers.
-
-        Returns:
-            str: e.g. 'et2_eta0' or 'full phase space'.
-        """
+        """Human-readable label of this region, e.g. 'et2_eta0' or 'full phase space'."""
         if self.et_bin is None:
             return "full phase space"
-        return GRID.bin_label(self.et_bin, self.eta_bin)
+        return kinematics.bin_label(self.et_bin, self.eta_bin)
 
     def cli_region_args(self) -> str:
-        """
-        The `--et-bin/--eta-bin` fragment that reproduces this region on the command line.
-
-        Returns:
-            str: e.g. '--et-bin 2 --eta-bin 0', or '' for the ungridded case.
-        """
+        """The `--et-bin/--eta-bin` fragment that reproduces this region ('' when ungridded)."""
         if self.et_bin is None:
             return ""
         return f"--et-bin {self.et_bin} --eta-bin {self.eta_bin}"

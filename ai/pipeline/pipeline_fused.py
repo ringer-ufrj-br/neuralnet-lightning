@@ -24,17 +24,8 @@ class PipelineFused(BasePipeline):
     model_class = ModelFused
     preprocessor_class = PreprocessFused
 
-
     def build_model_kwargs(self, X: np.ndarray) -> Dict[str, Any]:
-        """
-        Tells the model where the rings end and the cell image begins.
-
-        Args:
-            X (np.ndarray): Preprocessed training features, shape (N, n_rings + C*H*W).
-
-        Returns:
-            Dict[str, Any]: {'n_rings': ..., 'cell_shape': ...}.
-        """
+        """Tells the model where the rings end and the cell image begins."""
         n_rings = len(self.preprocessor.ring_columns)
         cell_shape = self.preprocessor.cells_pp.target_shape
         logger.info(f"📐 Fused input: {n_rings} rings + cells{tuple(cell_shape)} = {X.shape[1]} features")

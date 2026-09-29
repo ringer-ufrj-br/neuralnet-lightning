@@ -24,12 +24,13 @@ Two halves, in the order the data flows through them:
   own preprocessor module when the transform differs too.
 """
 
+from collections import defaultdict
 from dataclasses import dataclass
-import os
+import glob
 import logging
+import os
 from typing import Any, Dict, List, Optional, Sequence
 
-import joblib
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -43,12 +44,16 @@ logger = logging.getLogger(__name__)
 LABEL, ET, ETA, RING, ROW_ID = "label", "et", "eta", "ring_%i", "row_id"
 
 #: Stable per-row key, where a dataset has one. A dataset without it simply has no column of
-#: this name, and ROW_ID is then never offered - the fingerprint falls back to Et.
+#: this name, and ROW_ID is then never offered.
 ROW_ID_COL = "id"
 
 #: The Ringer layout: 100 rings across pre-sample, EM1-3 and HAD1-3. The per-layer split is
 #: spelled out in ai/preprocess/mlp.py, where the feature selection needs it.
 N_RINGS: int = 100
+
+#: Where the data is read from when the config names no data_path.
+DEFAULT_DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "..", "data", "parquet", "**", "*.parquet")
 
 
 def ring_name(index: int) -> str:
@@ -79,19 +84,28 @@ class DatasetSchema:
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "DatasetSchema":
         """
-        Builds a schema from a config's `dataset:` block. `data_path` and `max_files` are
-        also accepted at the top level of the config, and every field defaults to the mc25
-        layout, so a config that declares no `dataset:` block describes those tables.
+        Builds a schema from a config's `dataset:` block. `data_path` and `max_files` are also
+        accepted at the top level of the config; anything left out keeps its mc25 default, and
+        a key the schema does not know raises TypeError.
         """
-        block = dict(config.get("dataset") or {})
-        return cls(
-            data_path=block.get("data_path", config.get("data_path")),
-            max_files=block.get("max_files", config.get("max_files")),
-            rings_col=str(block.get("rings_col", "cl_ring_%i")),
-            et_col=str(block.get("et_col", "cl_et")),
-            eta_col=str(block.get("eta_col", "cl_eta")),
-            label_col=block.get("label_col"),
-        )
+        return cls(**{"data_path": config.get("data_path"), "max_files": config.get("max_files"),
+                      **(config.get("dataset") or {})})
+
+    def files(self) -> List[str]:
+        """
+        The parquet files to read. `data_path` is a directory, a file or a glob; `max_files`
+        caps how many are taken from each folder, in sorted order.
+        """
+        path = self.data_path or DEFAULT_DATA_PATH
+        if os.path.isdir(path):
+            path = os.path.join(path, "**", "*.parquet")
+        per_folder = defaultdict(list)
+        for file_path in glob.glob(path, recursive=True):
+            if os.path.isfile(file_path):
+                per_folder[os.path.dirname(file_path)].append(file_path)
+        files = [f for folder in per_folder.values() for f in sorted(folder)[:self.max_files]]
+        logger.info(f"📂 Found {len(files)} valid parquet files.")
+        return files
 
     @property
     def rings_are_listed(self) -> bool:
@@ -168,12 +182,7 @@ class DatasetSchema:
         return pl.col(name)
 
     def ring_expr(self, index: int) -> pl.Expr:
-        """
-        Ring `index` under its canonical name, from either storage shape.
-
-        Raises:
-            IndexError: If the index is outside the Ringer layout.
-        """
+        """Ring `index` under its canonical name, from either storage shape."""
         if not 0 <= index < N_RINGS:
             raise IndexError(f"❌ Ring {index} is out of range for {N_RINGS} rings.")
         alias = ring_name(index)
@@ -188,7 +197,7 @@ class DatasetSchema:
 
         from ai.label.label_generator import label_expr
 
-        return label_expr(label_col=LABEL)
+        return label_expr(LABEL)
 
     # ------------------------------------------------------------------- scan
 
@@ -206,27 +215,23 @@ class DatasetSchema:
 
 class BasePreprocessor:
     """
-    The contract every preprocessor honours, plus the parts that are the same for all of them
-    (persistence, label extraction, fit_transform).
+    The contract every preprocessor honours, plus the parts that are the same for all of them.
 
     The baseline preprocessor is a column selection: set `feature_columns` and the inherited
     `required_columns` / `transform` do the rest - extract those columns, zero the sensor
-    anomalies, normalise each event by its own total. PreprocessMLP is exactly this.
+    anomalies, normalise each event. PreprocessMLP is exactly this, with its own `normalize`.
 
     A preprocessor whose input is not a flat slice of dataset columns (the CNN2D image
     builder, the Fused rings+cells concatenation) instead overrides `transform`, and usually
     `required_columns`, and leaves `feature_columns` as None.
 
     Either kind overrides `fit` only if it has state to learn from the training split (a
-    scaler, a mean, ...). The default `fit` is a no-op.
-
-    Persistence is joblib pickling of the whole instance, so anything stored on `self` in
-    `fit` is restored by `load` - no per-preprocessor save/load code is needed.
+    scaler, a mean, ...). The pipeline persists the whole fitted instance with joblib, so
+    anything stored on `self` in `fit` is restored for evaluation with no extra code.
     """
 
     #: Dataset columns this preprocessor consumes, in feature order. When set, it drives the
-    #: default `required_columns` and `transform`. Left None by preprocessors that build their
-    #: input some other way and override `transform`.
+    #: default `required_columns` and `transform`.
     feature_columns: Optional[List[str]] = None
 
     def normalize(self, X: np.ndarray) -> np.ndarray:
@@ -255,63 +260,30 @@ class BasePreprocessor:
 
     def required_columns(self, available: List[str]) -> Optional[List[str]]:
         """
-        Declares which dataset columns this preprocessor consumes, so the loader can prune the
-        rest during the parquet scan. The raw files carry 300+ columns, most of them nested
-        calorimeter images; reading them all is what used to exhaust memory.
-
-        The default returns `feature_columns` (None when unset, i.e. load everything).
-
-        Args:
-            available (List[str]): Column names present in the dataset files.
-
-        Returns:
-            Optional[List[str]]: Columns to load, or None to load everything.
+        Which canonical columns this preprocessor consumes, so the scan can prune the rest: the
+        raw files carry 300+ columns, most of them nested calorimeter images, and reading them
+        all is what used to exhaust memory. None loads everything.
         """
         return self.feature_columns
 
     def extract(self, df: pd.DataFrame, cols: List[str]) -> np.ndarray:
         """
-        Pulls `cols` out of `df` as a clean float32 matrix: NaNs and the -999 sensor-anomaly
-        marker are zeroed. A missing column raises KeyError here rather than being silently
-        worked around - a wrong column set is a bug, not something to recover from.
-
-        Args:
-            df (pd.DataFrame): Input rows.
-            cols (List[str]): Column names to extract, in order.
-
-        Returns:
-            np.ndarray: Cleaned float32 array, first dimension being the batch. Not normalised.
+        `cols` as a float32 matrix with NaNs and the -999 sensor-anomaly marker zeroed. A
+        missing column raises KeyError - a wrong column set is a bug, not something to recover
+        from.
         """
         X = df[cols].values.astype(np.float32)
         X = np.nan_to_num(X, nan=0.0)
         return np.where(X == -999, 0.0, X)
 
     def fit(self, df: pd.DataFrame) -> "BasePreprocessor":
-        """
-        Learns whatever state this preprocessor needs from the training split. The default is
-        a no-op, for preprocessors that are pure functions of their input.
-
-        Args:
-            df (pd.DataFrame): Training rows.
-
-        Returns:
-            BasePreprocessor: self, for chaining.
-        """
+        """Learns whatever state this preprocessor needs from the training split. No-op here."""
         return self
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Turns a DataFrame into the model's input array.
-
-        The default is the baseline path: extract `feature_columns`, clean sensor anomalies
-        and normalise each event by its own total. Preprocessors that build their input some
-        other way override this; those must leave `feature_columns` as None.
-
-        Args:
-            df (pd.DataFrame): Rows to transform.
-
-        Returns:
-            np.ndarray: Float32 features, first dimension being the batch.
+        The model's input array. The default is the baseline path: extract `feature_columns`,
+        clean sensor anomalies and normalise each event.
         """
         if self.feature_columns is None:
             raise NotImplementedError(
@@ -322,59 +294,5 @@ class BasePreprocessor:
         return self.normalize(self.extract(df, cols))
 
     def fit_transform(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Fits on the given rows and transforms them in one call.
-
-        Args:
-            df (pd.DataFrame): Training rows.
-
-        Returns:
-            np.ndarray: The transformed features.
-        """
+        """Fits on the given rows and transforms them in one call."""
         return self.fit(df).transform(df)
-
-    def save(self, filepath: str) -> str:
-        """
-        Persists the fitted preprocessor alongside the trained checkpoints.
-
-        Args:
-            filepath (str): Destination path (.joblib).
-
-        Returns:
-            str: The written path.
-        """
-        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-        joblib.dump(self, filepath)
-        logger.info(f"💾 Saved preprocessor to: {filepath}")
-        return filepath
-
-    @staticmethod
-    def load(filepath: str) -> "BasePreprocessor":
-        """
-        Loads a preprocessor previously written by save().
-
-        Args:
-            filepath (str): Path to the .joblib file.
-
-        Returns:
-            BasePreprocessor: The restored instance.
-        """
-        preprocessor = joblib.load(filepath)
-        logger.info(f"📂 Loaded preprocessor from: {filepath}")
-        return preprocessor
-
-    def get_labels(self, df: pd.DataFrame, label_col: str = 'label') -> Optional[np.ndarray]:
-        """
-        Extracts target labels from the DataFrame.
-
-        Args:
-            df (pd.DataFrame): Input rows.
-            label_col (str): Label column name. Defaults to 'label'.
-
-        Returns:
-            Optional[np.ndarray]: Float32 labels, or None when the column is absent.
-        """
-        if label_col in df.columns:
-            return df[label_col].values.astype(np.float32)
-        logger.warning(f"⚠️ Label column '{label_col}' not found in DataFrame.")
-        return None

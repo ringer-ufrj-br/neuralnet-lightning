@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# Orquestrador da Grade Et x Eta via SLURM (tamanho vem do config)
+# Orquestrador da Grade Et x Eta via SLURM
 # ==============================================================================
 # UM TREINO POR TAREFA. Cada tarefa do primeiro array deriva sua tripla
 # (et, eta, fold, init) do SLURM_ARRAY_TASK_ID e treina exatamente um modelo,
@@ -28,9 +28,6 @@ GRES="${GRES:-}"
 CONFIG_FILE=${1:-"ai/configs/mlp.yaml"}
 MAX_CONCURRENT=${2:-}          # opcional: limita quantas tarefas rodam ao mesmo tempo
 
-# A grade vem do config (bloco `binning:`), nao daqui: datasets diferentes tem bordas e
-# quantidades de bins diferentes. `run.py grid` imprime "<n_et> <n_eta>".
-
 # O job roda no nó de computação, que não herda confiavelmente o ambiente do nó de login: o
 # interpretador do venv é resolvido por caminho absoluto e o diretório de trabalho do job é
 # fixado no repositório (os caminhos de config, data/ e results/ são relativos a ele).
@@ -44,23 +41,18 @@ if [ ! -x "$PYTHON" ]; then
     exit 1
 fi
 
-read -r N_ET_BINS N_ETA_BINS < <(cd "$REPO_DIR" && "$PYTHON" ai/run.py grid --config "$CONFIG_FILE" --format shape 2>/dev/null | tail -1)
-if [ -z "$N_ET_BINS" ] || [ -z "$N_ETA_BINS" ]; then
-    echo "ERRO: falha ao ler a grade de '$CONFIG_FILE'." >&2
-    echo "      Execute '$PYTHON ai/run.py grid --config $CONFIG_FILE' para ver o erro." >&2
-    exit 1
-fi
-
-# n_splits e n_inits saem do mesmo config; sao eles que dizem quantos treinos existem por bin.
-read -r N_FOLDS N_INITS < <(cd "$REPO_DIR" && "$PYTHON" -c "
+# A grade é fixa (ai/binning/kinematics.py); n_splits e n_inits saem do config. Juntos dizem
+# quantos treinos existem.
+read -r N_ET_BINS N_ETA_BINS N_FOLDS N_INITS < <(cd "$REPO_DIR" && "$PYTHON" -c "
 import sys
 sys.path.insert(0, '$REPO_DIR')
+from ai.binning.kinematics import N_ET_BINS, N_ETA_BINS
 from ai.run import load_config
 c = load_config(sys.argv[1])
-print(int(c.get('n_splits', 5)), int(c.get('n_inits', 1)))
+print(N_ET_BINS, N_ETA_BINS, int(c.get('n_splits', 5)), int(c.get('n_inits', 1)))
 " "$CONFIG_FILE")
-if [ -z "$N_FOLDS" ] || [ -z "$N_INITS" ]; then
-    echo "ERRO: falha ao ler n_splits/n_inits de '$CONFIG_FILE'." >&2
+if [ -z "$N_INITS" ]; then
+    echo "ERRO: falha ao ler a grade e n_splits/n_inits de '$CONFIG_FILE'." >&2
     exit 1
 fi
 

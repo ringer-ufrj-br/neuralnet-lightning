@@ -1,7 +1,8 @@
+import logging
+from typing import List
+
 import numpy as np
 import pandas as pd
-import logging
-from typing import List, Tuple
 from tqdm import tqdm
 
 from ai.preprocess.base import BasePreprocessor
@@ -20,116 +21,40 @@ CELL_COLUMNS: List[str] = [
     'cl_cells_had3',
 ]
 
+
 class PreprocessCNN2D(BasePreprocessor):
     """
-    Preprocessor for 2D Convolutional Neural Networks (CNN2D) that formats calorimeter cell energies into multi-channel 2D image tensors.
+    Formats calorimeter cell energies into multi-channel 2D images, one channel per layer.
+    Deterministic (padding + log1p), so the inherited no-op `fit` is all it needs.
     """
 
-    def __init__(self, target_shape: Tuple[int, int, int] = (7, 7, 15)) -> None:
-        """
-        Initializes PreprocessCNN2D instance.
-
-        Args:
-            target_shape (Tuple[int, int, int]): Tensor dimensions (channels, max_height, max_width). Defaults to (7, 7, 15).
-        """
-        self.cell_columns = list(CELL_COLUMNS)
-        self.target_shape = (len(self.cell_columns),) + tuple(target_shape[1:])
-        self.max_h = self.target_shape[1]
-        self.max_w = self.target_shape[2]
+    #: (channels, height, width) every event's image is padded to.
+    target_shape = (len(CELL_COLUMNS), 7, 15)
 
     def pad_array(self, arr: np.ndarray) -> np.ndarray:
-        """
-        Preprocesses and pads a single 2D calorimeter cell energy layer.
-
-        Args:
-            arr (np.ndarray): Input 2D cell energy array.
-
-        Returns:
-            np.ndarray: Zero-padded float32 2D array of shape (max_h, max_w).
-        """
+        """One layer: -999 sensor anomalies zeroed, log1p of the clipped energies, zero-padded
+        around the centre to the target height x width."""
         arr = np.stack(arr).astype(np.float32)
-        
-        # Handle sensor anomalies (-999)
-        arr = np.where(arr == -999, 0, arr)
-        
-        # Clip values and apply log1p transformation
-        arr = np.log1p(np.clip(arr, 0, None))
-        
-        h, w = arr.shape
-        pad_h = self.max_h - h
-        pad_w = self.max_w - w
-        
-        pad_top = pad_h // 2
-        pad_bottom = pad_h - pad_top
-        pad_left = pad_w // 2
-        pad_right = pad_w - pad_left
-        
-        return np.pad(arr, ((pad_top, pad_bottom), (pad_left, pad_right)), 'constant', constant_values=0)
+        arr = np.log1p(np.clip(np.where(arr == -999, 0, arr), 0, None))
+        dh, dw = self.target_shape[1] - arr.shape[0], self.target_shape[2] - arr.shape[1]
+        return np.pad(arr, ((dh // 2, dh - dh // 2), (dw // 2, dw - dw // 2)))
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Builds the cell images and normalises each one by its own total.
-
-        Args:
-            df (pd.DataFrame): Input DataFrame containing calorimeter cell columns.
-
-        Returns:
-            np.ndarray: Multi-channel tensor array of shape (N, C, max_h, max_w).
-        """
+        """Builds the cell images and normalises each one by its own total."""
         return self.normalize(self.build_images(df))
 
     def build_images(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Transforms DataFrame cell energy columns into multi-channel 2D image tensors, without
-        normalising. Separate from `transform` so PreprocessFused can take the raw images and
-        normalise once over the concatenated rings+cells vector instead of twice.
-
-        Args:
-            df (pd.DataFrame): Input DataFrame containing calorimeter cell columns.
-
-        Returns:
-            np.ndarray: Multi-channel tensor array of shape (N, C, max_h, max_w), unnormalised.
+        The (N, C, H, W) cell images, unnormalised. Separate from `transform` so PreprocessFused
+        can take the raw images and normalise once over the concatenated rings+cells vector.
         """
-        missing = [col for col in self.cell_columns if col not in df.columns]
-        if missing:
-            logger.error(f"❌ Missing required cell columns: {missing}")
-            raise ValueError(f"❌ Missing required cell columns: {missing}")
-
-        num_samples = len(df)
-        num_layers = len(self.cell_columns)
-        
-        X = np.zeros((num_samples, num_layers, self.max_h, self.max_w), dtype=np.float32)
-
         logger.info("🖼️ Converting calorimeter layers to 2D image tensors...")
-        for i, col in enumerate(self.cell_columns):
-            logger.info(f"⚡ [{i+1}/{num_layers}] Processing channel: {col}")
-            layer_arrays = np.stack(df[col].progress_apply(self.pad_array).values)
-            X[:, i, :, :] = layer_arrays
-            
-        return X
-
-    def fit(self, df: pd.DataFrame) -> "PreprocessCNN2D":
-        """
-        No-op fit, present so this preprocessor honours the same fit/transform/save/load
-        contract as PreprocessMLP and can be driven by the shared pipeline. The cell-to-image
-        conversion is fully deterministic (padding + log1p), with nothing learned from data.
-
-        Args:
-            df (pd.DataFrame): Training rows only (unused).
-
-        Returns:
-            PreprocessCNN2D: self, for chaining.
-        """
-        return self
+        layers = []
+        for i, col in enumerate(CELL_COLUMNS):
+            logger.info(f"⚡ [{i+1}/{len(CELL_COLUMNS)}] Processing channel: {col}")
+            layers.append(np.stack(df[col].progress_apply(self.pad_array).values))
+        return np.stack(layers, axis=1)
 
     def required_columns(self, available: List[str]) -> List[str]:
-        """
-        The calorimeter cell-image columns, leaving the ring/shower-shape columns unread.
-
-        Args:
-            available (List[str]): Column names present in the dataset files.
-
-        Returns:
-            List[str]: The cell columns the image tensors are built from.
-        """
-        return list(self.cell_columns)
+        """The cell-image columns, leaving the ring/shower-shape columns unread."""
+        return list(CELL_COLUMNS)

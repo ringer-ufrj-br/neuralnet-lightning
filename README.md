@@ -12,9 +12,9 @@ O fluxo é dividido em **três comandos independentes**:
 
 | Comando | O que faz | O que produz |
 |---|---|---|
-| `train` | Treina os folds da validação cruzada | Checkpoints, preprocessador, índices de validação por fold, manifesto |
+| `train` | Treina os folds da validação cruzada | Checkpoints, preprocessador, índices de validação por fold |
 | `evaluate` | Reinferência dos folds sobre a região inteira | Scores, métricas por fold, gráficos, fatia do tabelão daquela região |
-| `report` | Agrega todas as regiões avaliadas, de um ou vários modelos | Tabelão em `.tex`, figura da tabela e o CSV longo canônico |
+| `report` | Agrega todas as regiões avaliadas, de um ou vários modelos | Tabelão em `.tex` e `.html` e o CSV longo canônico |
 
 A separação existe para que **re-avaliar não exija retreinar**: recortar pontos de operação, refazer gráficos ou remontar a tabela lê apenas artefatos em disco.
 
@@ -40,7 +40,7 @@ A separação existe para que **re-avaliar não exija retreinar**: recortar pont
 - **`ai/configs/*.yaml`**: configurações e hiperparâmetros de cada experimento.
 - **`data/`**: conjuntos de dados (Parquet/ROOT).
 - **`results/`**: relatórios, métricas, gráficos e checkpoints.
-- **`Makefile` & `activate.sh`**: utilitários de ambiente.
+- **`Makefile`**: utilitários de ambiente.
 
 ---
 
@@ -52,7 +52,7 @@ A separação existe para que **re-avaliar não exija retreinar**: recortar pont
    ```
 2. **Ativar o ambiente virtual:**
    ```bash
-   source activate.sh
+   source neuralnet-env/bin/activate
    ```
 
 ### Em cluster (SLURM)
@@ -96,9 +96,7 @@ learning_rate: 0.001               # Taxa de aprendizado
 patience: 50                       # Épocas sem melhora de val_sp antes de parar
 n_splits: 10                       # Folds da validação cruzada (1 = sem validação cruzada)
 n_inits: 5                         # Inicializações independentes por fold; a melhor é mantida
-threshold: 0.8                     # Limiar fixo das métricas globais
 seed: 42                           # Semente da partição de folds
-label_col: "label"                 # Nome canônico da coluna de rótulo dentro do pipeline
 ```
 
 ### Dataset: o bloco `dataset:`
@@ -127,8 +125,8 @@ herde o preprocessador, sobrescreva `fit`/`normalize` e registre um pipeline par
 normalização de um conjunto de checkpoints é legível na classe que os produziu.
 
 A grade Et × |η| é fixa (a padrão do ATLAS, em `ai/binning/kinematics.py`) e igual para todos
-os datasets. `python ai/run.py grid --config <cfg>` imprime `<n_et> <n_eta>`, e é daí que
-`slurm_bins.sh` e `scripts/run_local_grid.sh` tiram o tamanho do array.
+os datasets. `python ai/run.py grid` imprime um par `et eta` por região, que é o que
+`scripts/run_local_grid.sh` percorre.
 
 ### Partição e o que a avaliação cobre
 
@@ -232,11 +230,11 @@ quando há mais de um.
 
 #### Como o `report` acha os modelos
 
-Ele varre a árvore de resultados (`--results-root`, padrão `results/`) procurando
-`artifacts/manifest.json` — o arquivo que o `train` escreve para cada região. O nome do modelo
-sai de dentro do manifesto, não do nome da pasta. A ancoragem é no manifesto (e não nas
-métricas) de propósito: assim uma região **treinada mas não avaliada** aparece no inventário e
-é reportada como faltante, em vez de virar um buraco silencioso na tabela.
+Ele varre a árvore de resultados (`--results-root`, padrão `results/`) procurando o diretório
+`checkpoints/` de cada região, e lê modelo e região do caminho (`<MODEL>/<região>`). A ancoragem
+é nos checkpoints (e não nas métricas) de propósito: assim uma região **treinada mas não
+avaliada** aparece no inventário e é reportada como faltante, em vez de virar um buraco
+silencioso na tabela.
 
 Para ver o inventário sem construir nada:
 
@@ -260,7 +258,7 @@ O `--config` é sempre dispensável: o `report` lê a árvore de resultados, nã
 #### Tabela integrada (arquivo separado)
 
 Além de uma tabela por ponto de operação com a grade por região, o `report` salva a **tabela
-integrada** em arquivos próprios: `pd_table_integrated.tex`, `.pdf`/`.png` e o
+integrada** em arquivos próprios: `pd_table_integrated.tex`, `.html` e o
 `pd_table_integrated_long.csv`. Ela pooleia todas as regiões e traz uma linha por modelo, com
 um grupo de colunas por ponto de operação — o resultado inteiro numa linha por modelo.
 
@@ -282,9 +280,9 @@ python ai/run.py report --no-integrated
 
 ### 4. SLURM
 
-A grade inteira vai como **um job array** (tamanho lido do config) — cada tarefa deriva seu par (et, eta) do
-`SLURM_ARRAY_TASK_ID`, treina os folds daquele bin e avalia em seguida. Ao fim do array, um job
-dependente monta o tabelão:
+A grade inteira vai como job arrays encadeados: um treino por tarefa, cada uma derivando sua
+tupla (et, eta, fold, init) do `SLURM_ARRAY_TASK_ID`; depois uma tarefa por região escolhe o
+melhor init de cada fold (`select`) e avalia; ao fim, um job dependente monta o tabelão:
 
 ```bash
 ./slurm_bins.sh ai/configs/mlp.yaml
@@ -349,9 +347,10 @@ class PreprocessMinhaRede(BasePreprocessor):
         return self.normalize(X)
 ```
 
-`save`, `load`, `fit_transform` e `get_labels` já vêm da base. Escreva `fit` apenas se houver
-estado a aprender dos dados (um scaler, uma média); o `fit` padrão é no-op, que é o certo para
-um preprocessador sem estado como o da MLP.
+`fit_transform` já vem da base, e o pipeline salva o preprocessador ajustado inteiro com joblib.
+Escreva `fit` apenas se houver estado a aprender dos dados (um scaler, uma média, como o
+StandardScaler da MLP); o `fit` padrão é no-op, que é o certo para um preprocessador sem estado
+como o da CNN2D.
 
 ### 3. O pipeline — `ai/pipeline/pipeline_minha_rede.py`
 
@@ -363,6 +362,9 @@ class PipelineMinhaRede(BasePipeline):
     model_class = ModelMinhaRede
     preprocessor_class = PreprocessMinhaRede
 ```
+
+Se o preprocessador precisa de argumentos de construção, declare
+`preprocessor_class = functools.partial(PreprocessMinhaRede, arg=...)`.
 
 Se a arquitetura precisa de um valor que só se conhece depois do preprocessamento — tipicamente
 a dimensão de entrada — acrescente:
@@ -398,7 +400,6 @@ Sobrescreva apenas se precisar; nenhum é obrigatório:
 | `compute_loss` | losses auxiliares, além da principal |
 | `build_metrics` | acrescentar ou remover métricas |
 | `configure_optimizers` | outro otimizador ou um scheduler |
-| `build_preprocessor` | o preprocessador precisa de argumentos de construção |
 
 ---
 
@@ -407,7 +408,6 @@ Sobrescreva apenas se precisar; nenhum é obrigatório:
 ```
 results/<MODEL>[/et<i>_eta<j>]/
 ├── artifacts/
-│   ├── manifest.json          # dataset, split, seed, hiperparâmetros
 │   ├── preprocessor.joblib    # preprocessador ajustado SÓ no treino
 │   └── val_indices_fold_N.npy # linhas que o fold N validou (fora de amostra)
 ├── checkpoints/
@@ -415,19 +415,16 @@ results/<MODEL>[/et<i>_eta<j>]/
 │   └── fold_N.json            # pos_weight, melhor métrica, épocas, kwargs
 ├── history/fold_N.csv         # loss de treino/validação por época
 ├── scores/fold_N.parquet      # y_true, y_prob, et, eta, row_id, in_sample (região inteira)
-├── metrics/
-│   ├── per_fold.csv           # métricas globais por fold
-│   ├── operating_points.csv   # PD/SP/FA por (fold, ponto de operação)
-│   └── folds_long.csv         # tabela canônica desta região
+├── metrics/folds_long.csv     # tabela canônica desta região: PD/SP/FA por (fold, ponto de operação)
 └── plots/                     # ROC, PR, matriz de confusão, loss, ROC dos folds
 
 results/<MODEL>/pd_table/               # ou results/comparison/pd_table/ ao comparar modelos
 ├── pd_table_long.csv                   # tabela canônica agregada (fonte da verdade)
 ├── pd_table_<ponto>.tex                # por região: fragmento LaTeX para \input{}
-├── pd_table_<ponto>.pdf                # por região: render sem precisar de LaTeX
+├── pd_table_<ponto>.html               # por região: a mesma tabela, sem precisar de LaTeX
 ├── pd_table_integrated_long.csv        # integrado: números poolados por fold
 ├── pd_table_integrated.tex             # integrado: fragmento LaTeX
-└── pd_table_integrated.pdf             # integrado: render
+└── pd_table_integrated.html            # integrado: a mesma tabela em HTML
 ```
 
 Todos os CSVs são **sobrescritos** a cada execução (antes eram anexados, o que fazia execuções antigas se acumularem como se fossem folds extras).
@@ -438,7 +435,7 @@ Todos os CSVs são **sobrescritos** a cada execução (antes eram anexados, o qu
 
 Tabela no formato ATLAS/Ringer: linhas são regiões de $|\eta|$, grupos de colunas são regiões de $E_T$, e cada grupo traz $P_D$ / $SP$ / $F_A$ como média ± desvio entre os folds. Quando mais de um modelo foi avaliado, cada região ganha **uma linha por modelo** (coluna `Model`), no lugar das linhas `Reference` / `Cross Validation` do formato original.
 
-A fonte da verdade é o CSV **longo** (`pd_table_long.csv`): uma linha puramente numérica por `(model, et_bin, eta_bin, fold, operating_point)`. O `.tex` e a figura são derivados dele, então existe um único lugar onde os números são produzidos e vários onde são formatados.
+A fonte da verdade é o CSV **longo** (`pd_table_long.csv`): uma linha puramente numérica por `(model, et_bin, eta_bin, fold, operating_point)`. O `.tex` e o `.html` são derivados dele, então existe um único lugar onde os números são produzidos e vários onde são formatados.
 
 O `.tex` gerado precisa dos pacotes:
 
