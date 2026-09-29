@@ -97,9 +97,6 @@ class PreprocessMLP(BasePreprocessor):
         return self
 
     def normalize(self, X: np.ndarray) -> np.ndarray:
-        """
-        log1p, then the StandardScaler learned in `fit` (which raises NotFittedError before it),
-        both in place on the array `extract` returned.
-        """
+        """log1p then the StandardScaler fitted in `fit`, in place."""
         return self.scaler.transform(self._log_energies(X), copy=False)
 

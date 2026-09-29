@@ -1,4 +1,5 @@
 import logging
+import math
 from typing import List
 
 import numpy as np
@@ -27,8 +28,8 @@ class PreprocessFused(BasePreprocessor):
         concatenated.
         """
         n_rings = len(self.ring_columns)
-        cell_shape = tuple(self.cells_pp.target_shape)
-        X = np.zeros((df.height, n_rings + int(np.prod(cell_shape))), dtype=np.float32)
+        cell_shape = self.cells_pp.target_shape
+        X = np.zeros((df.height, n_rings + math.prod(cell_shape)), dtype=np.float32)
 
         rings = self.extract(df, self.ring_columns)
         total = np.abs(rings).sum(axis=1, keepdims=True)

@@ -35,7 +35,7 @@ class PreprocessCNN2D(BasePreprocessor):
         (3x3 presampler, 3x15 EM1, 7x7 EM2, ...), so polars converts the nested lists into one
         fixed-size buffer and no per-event Python object is ever created.
         """
-        first = df.get_column(col).head(1).to_list()[0]
+        first = df[col][0].to_list()
         h, w = len(first), len(first[0])
         if h > self.target_shape[1] or w > self.target_shape[2]:
             raise ValueError(f"❌ Column '{col}' is {h}x{w}, larger than the "

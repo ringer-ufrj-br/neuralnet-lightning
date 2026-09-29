@@ -156,9 +156,6 @@ class BasePipeline:
         never by the full dataset. A ring stored as element `i` of a nested list is projected
         exactly like one stored in its own column, so the layout costs nothing either way.
 
-        The frame stays in polars: the preprocessors only ever ask it for numpy arrays, and a
-        conversion to pandas would briefly hold the whole frame twice.
-
         Deterministic given the same files on disk, which is what lets `train` and `evaluate`
         run as separate processes over the same row ordering.
         """
@@ -201,8 +198,7 @@ class BasePipeline:
 
         # The label is always cast to Int8 (DatasetSchema.label_expr), so null is its only
         # "missing" value.
-        missing = df.get_column(LABEL).null_count()
-        if missing:
+        if missing := df[LABEL].null_count():
             raise RuntimeError(
                 f"❌ {missing} row(s) have no label. Check "
                 f"dataset.label in the config against the dataset's actual contents."
@@ -238,7 +234,7 @@ class BasePipeline:
         if df is None:
             return
 
-        Y = np.asarray(df.get_column(LABEL).to_numpy(), dtype=np.float32)
+        Y = df[LABEL].cast(polars.Float32).to_numpy()
 
         # The k-fold partition is the whole scheme: k-1 partitions train and 1 validates, which
         # is what drives early stopping and the choice between initialisations. There is no
@@ -388,7 +384,7 @@ class BasePipeline:
         # space rather than only each fold's held-out partition. The `in_sample` column below
         # records which rows the fold trained on, so an out-of-sample-only cut stays available
         # to anyone who wants it.
-        y_true = np.asarray(df.get_column(LABEL).to_numpy(), dtype=np.float32)
+        y_true = df[LABEL].cast(polars.Float32).to_numpy()
         X_all = self.preprocessor.transform(df)
         logger.info(f"🧾 Scoring the full region: {len(y_true)} rows "
                     f"({int((y_true == 1).sum())} signal, {int((y_true == 0).sum())} background).")
@@ -396,7 +392,7 @@ class BasePipeline:
         # Kept alongside the scores so the table can be re-cut per kinematic region later
         # without re-running inference.
         kinematic_columns = {
-            column: df.get_column(column).to_numpy()
+            column: df[column].to_numpy()
             for column in (ET, ETA, ROW_ID) if column in df.columns
         }
         del df  # the rest of the frame is not needed for inference

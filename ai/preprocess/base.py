@@ -280,12 +280,7 @@ class BasePreprocessor:
         `cols` as a float32 matrix with NaNs and the -999 sensor-anomaly marker zeroed (±inf
         clipped to the float32 range, as np.nan_to_num does). A missing column raises
         ColumnNotFoundError - a wrong column set is a bug, not something to recover from.
-
-        The matrix is allocated once and filled and cleaned a column at a time; polars hands
-        each column over without copying it, so no intermediate 2-D copy ever exists and the
-        cleaning masks are one column long. It is column-major - the layout pandas used to
-        hand over - which keeps each column contiguous and the per-event sums of `normalize`,
-        and so every trained model, bit-identical to what pandas produced.
+        Column-major, filled one column at a time; keeps `normalize` bit-identical.
         """
         X = np.empty((df.height, len(cols)), dtype=np.float32, order="F")
         for j, name in enumerate(cols):
