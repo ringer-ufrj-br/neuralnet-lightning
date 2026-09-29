@@ -136,8 +136,8 @@ Treina e avalia as 25 regiões, uma de cada vez, e monta o tabelão no final. Se
 ### A grade inteira no cluster (SLURM)
 
 ```bash
-./slurm_bins.sh ai/configs/mlp.yaml       # a grade inteira
-./slurm_bins.sh ai/configs/mlp.yaml 4     # no máximo 4 tarefas rodando ao mesmo tempo
+./scripts/slurm_bins.sh ai/configs/mlp.yaml       # a grade inteira
+./scripts/slurm_bins.sh ai/configs/mlp.yaml 4     # no máximo 4 tarefas rodando ao mesmo tempo
 ```
 
 Rode do nó de login. O script faz três etapas, cada uma esperando a anterior terminar sem erro:
@@ -147,7 +147,7 @@ Rode do nó de login. O script faz três etapas, cada uma esperando a anterior t
 3. um job que monta o tabelão.
 
 O script já usa o Python do `neuralnet-env`; para usar outro, rode
-`PYTHON=/caminho/para/python ./slurm_bins.sh ...`. Para cancelar, `scancel <id>`.
+`PYTHON=/caminho/para/python ./scripts/slurm_bins.sh ...`. Para cancelar, `scancel <id>`.
 
 ---
 

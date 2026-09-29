@@ -31,7 +31,7 @@ MAX_CONCURRENT=${2:-}          # opcional: limita quantas tarefas rodam ao mesmo
 # O job roda no nó de computação, que não herda confiavelmente o ambiente do nó de login: o
 # interpretador do venv é resolvido por caminho absoluto e o diretório de trabalho do job é
 # fixado no repositório (os caminhos de config, data/ e results/ são relativos a ele).
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-$REPO_DIR/neuralnet-env/bin/python}"
 
 if [ ! -x "$PYTHON" ]; then
