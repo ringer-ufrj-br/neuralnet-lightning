@@ -1,318 +1,164 @@
 # neuralnet-lightning
 
-Orquestrador e pipeline de treinamento de redes neurais (baseado em PyTorch / PyTorch Lightning) voltado para análise de dados do ATLAS (CERN).
+Framework para treinar redes neurais (PyTorch Lightning) com os dados do Ringer do ATLAS.
+
+Você escolhe um modelo e um dataset num arquivo de configuração, e o resto já vem pronto:
+validação cruzada, uma rede para cada região de $E_T$ × $|\eta|$, métricas, gráficos e a
+tabela final de eficiências (o "tabelão").
 
 ---
 
-## 📌 Visão Geral
+## 📌 Como funciona
 
-O projeto automatiza o fluxo de carregamento de dados (ex: arquivos Parquet), pré-processamento, criação e treinamento de modelos de deep learning (`MLP`, `CNN2D`), validação cruzada por K-Fold e avaliação de desempenho — incluindo o **tabelão** de validação cruzada em LaTeX.
+São três comandos, um depois do outro:
 
-O fluxo é dividido em **três comandos independentes**:
+| Comando | O que faz |
+|---|---|
+| `train` | Treina a rede com validação cruzada e salva os modelos |
+| `evaluate` | Passa os modelos treinados nos dados e calcula métricas e gráficos |
+| `report` | Junta todas as regiões no tabelão (LaTeX e HTML) |
 
-| Comando | O que faz | O que produz |
-|---|---|---|
-| `train` | Treina os folds da validação cruzada | Checkpoints, preprocessador, índices de validação por fold |
-| `evaluate` | Reinferência dos folds sobre a região inteira | Scores, métricas por fold, gráficos, fatia do tabelão daquela região |
-| `report` | Agrega todas as regiões avaliadas, de um ou vários modelos | Tabelão em `.tex` e `.html` e o CSV longo canônico |
-
-A separação existe para que **re-avaliar não exija retreinar**: recortar pontos de operação, refazer gráficos ou remontar a tabela lê apenas artefatos em disco.
-
----
-
-## 📁 Estrutura Principal do Projeto
-
-- **`ai/`**: módulos de inteligência artificial.
-  - `ai/run.py`: entrypoint com os subcomandos `train` / `evaluate` / `report`.
-  - `ai/pipeline/base.py`: pipeline compartilhado (treino, avaliação, persistência de artefatos).
-  - `ai/pipeline/registry.py`: mapeia o nome em `model:` do YAML para o pipeline correspondente.
-  - `ai/pipeline/pipeline_*.py`: ligam um modelo ao seu preprocessador.
-  - `ai/models/base.py`: `BaseBinaryClassifier`, a base de todas as arquiteturas (loss ponderada,
-    métricas, índice SP, otimizador).
-  - `ai/models/`: as arquiteturas em si.
-  - `ai/preprocess/base.py`: `BasePreprocessor`, a base dos preprocessadores.
-  - `ai/preprocess/`: preprocessadores de cada arquitetura.
-  - `ai/evaluation/`: métricas, gráficos e o construtor do tabelão (`pd_table.py`).
-  - `ai/preprocess/base.py`: tradução do layout de cada dataset para o vocabulário canônico
-    (`label`, `et`, `eta`, `ring_i`) que o resto do código usa.
-  - `ai/binning/kinematics.py`: a grade de $E_T$ × $|\eta|$ (uma rede por região), com as
-    bordas vindas do config.
-- **`ai/configs/*.yaml`**: configurações e hiperparâmetros de cada experimento.
-- **`data/`**: conjuntos de dados (Parquet/ROOT).
-- **`results/`**: relatórios, métricas, gráficos e checkpoints.
-- **`Makefile`**: utilitários de ambiente.
+Cada passo lê o que o anterior salvou em disco. Assim dá para refazer a avaliação ou a tabela
+sem precisar treinar de novo.
 
 ---
 
-## ⚙️ Pré-requisitos e Instalação
+## ⚙️ Instalação
 
-1. **Criar o ambiente virtual e instalar as dependências:**
-   ```bash
-   make venv
-   ```
-2. **Ativar o ambiente virtual:**
-   ```bash
-   source neuralnet-env/bin/activate
-   ```
+```bash
+make venv                            # cria o ambiente e instala as dependências
+source neuralnet-env/bin/activate    # ativa o ambiente
+```
 
-### Em cluster (SLURM)
-
-Faça o `make venv` **de dentro de uma alocação**, não no nó de login: a instalação do torch
-baixa alguns GB e nós de login costumam limitar CPU/memória. Alocar uma GPU no mesmo
-partition dos jobs também permite confirmar que o CUDA enxerga o dispositivo:
+**No cluster**, rode o `make venv` de dentro de uma alocação com GPU, e não no nó de login
+(a instalação do torch é pesada). Por exemplo:
 
 ```bash
 srun -p gpu --gres=gpu:1 --pty bash
-```
-
-```bash
 make venv && ./neuralnet-env/bin/python -c "import torch; print(torch.cuda.is_available())"
 ```
 
-O venv precisa ficar num sistema de arquivos que os nós de computação enxergam (o próprio
-diretório do repositório, não um scratch local do nó).
+Deixe o ambiente dentro da pasta do repositório, para os nós de computação enxergarem.
 
-Feito isso, **a submissão em si roda no nó de login** — `slurm_*.sh` só chama `sbatch`. Os
-scripts resolvem o interpretador em `neuralnet-env/bin/python` por caminho absoluto e passam
-`--chdir` para o repositório, então não dependem do ambiente do nó de login nem de onde você
-submete. Para usar outro interpretador (módulo do cluster, conda, imagem):
-
-```bash
-PYTHON=/caminho/para/python ./slurm_bins.sh ai/configs/mlp.yaml
-```
-
-Os dados podem ser copiados para `data/` com `make copy-data`, ou — evitando duplicar alguns
-GB — apontando `data_path` do YAML direto para o caminho compartilhado.
+**Os dados** podem ser copiados para `data/` com `make copy-data`, ou você pode apontar o
+`data_path` do config direto para a pasta compartilhada.
 
 ---
 
-## ⚙️ Configuração (`ai/configs/*.yaml`)
+## 🧠 Modelos disponíveis
+
+| `model:` | O que é |
+|---|---|
+| `MLP` | Rede pequena (uma camada de 5 neurônios) sobre metade dos anéis. Normalização: log1p + padronização |
+| `MLP_MC21` | A MLP com um nome próprio, para os resultados do mc21 não se misturarem com os do mc25 |
+| `CNN2D` | Rede convolucional sobre as imagens de células do calorímetro (uma camada = um canal) |
+| `Fused` | Anéis e imagens de células em dois ramos, que se juntam no final |
+
+---
+
+## 📝 Configuração
+
+Cada experimento é um arquivo YAML em `ai/configs/`:
 
 ```yaml
-model: "MLP"                       # Modelo a ser utilizado (MLP | CNN2D | Fused)
-max_epochs: 5000                   # Teto de épocas; quem para o treino é o Early Stopping
-batch_size: 1024                   # Tamanho do batch
-learning_rate: 0.001               # Taxa de aprendizado
-patience: 50                       # Épocas sem melhora de val_sp antes de parar
-n_splits: 10                       # Folds da validação cruzada (1 = sem validação cruzada)
-n_inits: 5                         # Inicializações independentes por fold; a melhor é mantida
-seed: 42                           # Semente da partição de folds
+model: "MLP"          # qual modelo (tabela acima)
+max_epochs: 5000      # limite de épocas; o early stopping costuma parar bem antes
+batch_size: 1024
+learning_rate: 0.001
+patience: 50          # quantas épocas sem melhorar antes de parar
+n_splits: 10          # número de folds da validação cruzada (1 = treina um modelo só)
+n_inits: 5            # quantas vezes treinar cada fold com pesos iniciais diferentes; fica o melhor
+seed: 42              # semente da divisão em folds
 ```
 
-### Dataset: o bloco `dataset:`
-
-Nenhum módulo do `ai/` conhece o nome de uma coluna do dataset. O pipeline trabalha num
-**vocabulário canônico** — `label`, `et`, `eta`, `ring_0 … ring_99`, `row_id` — e o
-`ai/preprocess/base.py` mapeia esse vocabulário para o que existe no Parquet. Os padrões
-descrevem o layout mc25, então os configs acima não precisam declarar nada. Um dataset
-diferente declara só o que difere:
-
-```yaml
-dataset:
-  data_path: .../electron_ringer.parquet
-  max_files: 100
-  rings_col: "TrigEMClusterContainer.ringsE"   # com '%i' (ex. "cl_ring_%i") = uma coluna por
-                                               # anel; sem '%i' = uma coluna de lista com os 100
-  et_col: "TrigEMClusterContainer.et"          # na unidade em que está gravado (MeV)
-  eta_col: "TrigEMClusterContainer.eta"        # com sinal
-  label_col: target                            # ausente = rótulo vem do nome do arquivo
-
-results_root: results/mc21   # regiões são nomeadas por índice de bin: um root por dataset
-```
-
-A normalização **não** é opção de config: ela faz parte do modelo. Para treinar com outra,
-herde o preprocessador, sobrescreva `fit`/`normalize` e registre um pipeline para ele — assim a
-normalização de um conjunto de checkpoints é legível na classe que os produziu.
-
-A grade Et × |η| é fixa (a padrão do ATLAS, em `ai/binning/kinematics.py`) e igual para todos
-os datasets. `python ai/run.py grid` imprime um par `et eta` por região, que é o que
-`scripts/run_local_grid.sh` percorre.
-
-### Partição e o que a avaliação cobre
-
-A partição estratificada de `n_splits` folds separa treino de validação **durante o treino**: é
-ela que alimenta o Early Stopping e a escolha entre as inicializações. Não há holdout separado.
-
-O `evaluate` roda cada fold sobre a **região inteira**, incluindo as linhas em que aquele fold
-treinou. As eficiências relatadas, portanto, não são estritamente fora de amostra — é uma
-escolha deliberada, para que os números cubram todo o espaço de fase.
-
-Cada `scores/fold_N.parquet` traz a coluna booleana `in_sample`, marcando as linhas em que
-aquele fold treinou. Quem quiser o recorte estritamente fora de amostra tem os dados à mão:
-
-```python
-d = pd.read_parquet("results/MLP/et2_eta0/scores/fold_1.parquet")
-fora = d[~d.in_sample]
-```
-
-### Inicializações (`n_inits`)
-
-Cada fold é treinado `n_inits` vezes a partir de pesos aleatórios diferentes (a partição dos
-dados não muda), e fica apenas a inicialização com melhor `val_sp`. Serve para reduzir a
-influência de mínimos locais. Os checkpoints perdedores são apagados, então o disco guarda um
-checkpoint por fold independentemente de `n_inits`. Com `n_inits: 1` o comportamento é o de
-sempre.
-
-Os pontos de operação do tabelão são **tight 90% / medium 95% / loose 99%** por padrão, sem
-precisar declarar nada. Para usar outros, sobrescreva no YAML (nome → $P_D$ alvo):
+Os pontos de operação do tabelão são tight (90%), medium (95%) e loose (99%) de $P_D$. Para
+usar outros, acrescente:
 
 ```yaml
 operating_points:
   tight: 0.90
-  medium: 0.95
   veryloose: 0.995
 ```
 
-> `train` sempre roda validação cruzada. Para treinar um modelo só, use `n_splits: 1` —
-> nesse caso o treino usa um único split estratificado de validação e o tabelão sai com um
-> fold e desvio zero.
+### Usando outro dataset
+
+Sem nada declarado, o código espera o layout do mc25. Para outro dataset, informe no bloco
+`dataset:` só o que muda:
+
+```yaml
+dataset:
+  data_path: ../data/mc21_isabela_qt_2sigma_restriction/electron_ringer.parquet
+  max_files: 100                              # opcional: só os N primeiros arquivos de cada pasta
+  rings_col: "TrigEMClusterContainer.ringsE"  # uma coluna com os 100 anéis
+                                              # (ou "cl_ring_%i": uma coluna por anel)
+  et_col: "TrigEMClusterContainer.et"         # em MeV
+  eta_col: "TrigEMClusterContainer.eta"
+  label_col: target                           # sem isso, o rótulo vem do nome do arquivo
+                                              # (Zee = sinal, JF17 = ruído)
+results_root: results/mc21                    # cada dataset na sua pasta de resultados
+```
+
+`ai/configs/mlp_mc21.yaml` é um exemplo completo.
 
 ---
 
-## 🚀 Como Executar
+## 🚀 Rodando
 
-### 1. Treino
-
-```bash
-python ai/run.py train --config ai/configs/mlp.yaml
-```
-
-Um fold específico (paralelização em SLURM):
+A grade $E_T$ × $|\eta|$ tem 5 × 5 regiões, e cada região ganha a sua própria rede. Para uma
+região:
 
 ```bash
-python ai/run.py train --config ai/configs/mlp.yaml --fold 3
+python ai/run.py train    --config ai/configs/mlp.yaml --et-bin 2 --eta-bin 0
+python ai/run.py evaluate --config ai/configs/mlp.yaml --et-bin 2 --eta-bin 0
+python ai/run.py report   --config ai/configs/mlp.yaml
 ```
 
-Uma região cinemática específica da grade:
+Sem `--et-bin`/`--eta-bin`, o treino usa todos os dados numa rede só.
+
+Opções úteis:
+
+- `evaluate --reuse-scores` refaz métricas e gráficos sem rodar a rede de novo.
+- `evaluate --no-plots` calcula só as métricas.
+- `report --models MLP,CNN2D` compara modelos, nessa ordem de linhas.
+- `report` sem `--config` nem `--models` inclui todos os modelos que encontrar.
+- `report --list` mostra o que já foi treinado e avaliado, sem montar a tabela.
+- `report --no-integrated` pula a tabela integrada.
+
+### A grade inteira na sua máquina
 
 ```bash
-python ai/run.py train --config ai/configs/mlp.yaml --et-bin 2 --eta-bin 0
+./scripts/run_local_grid.sh ai/configs/mlp.yaml
 ```
 
-### 2. Avaliação
+Treina e avalia as 25 regiões, uma de cada vez, e monta o tabelão no final. Se parar no meio,
+é só rodar de novo: as regiões já avaliadas são puladas (`FORCE=1` refaz tudo).
+
+### A grade inteira no cluster (SLURM)
 
 ```bash
-python ai/run.py evaluate --config ai/configs/mlp.yaml [--et-bin 2 --eta-bin 0]
+./slurm_bins.sh ai/configs/mlp.yaml       # a grade inteira
+./slurm_bins.sh ai/configs/mlp.yaml 4     # no máximo 4 tarefas rodando ao mesmo tempo
 ```
 
-Recortar pontos de operação e gráficos sem reinferir (usa os scores já salvos):
+Rode do nó de login. O script faz três etapas, cada uma esperando a anterior terminar sem erro:
 
-```bash
-python ai/run.py evaluate --config ai/configs/mlp.yaml --reuse-scores
-```
+1. um job para cada treino (região × fold × inicialização);
+2. um job por região, que escolhe a melhor inicialização de cada fold (`select`) e avalia;
+3. um job que monta o tabelão.
 
-### 3. Tabelão
-
-Todos os modelos já avaliados, sem precisar passar nada:
-
-```bash
-python ai/run.py report
-```
-
-`--config` e `--models` são **alternativas**, não complementos — cada um é uma forma de dizer
-quais modelos entram na tabela:
-
-```bash
-python ai/run.py report --config ai/configs/mlp.yaml     # o modelo nomeado no YAML
-```
-
-```bash
-python ai/run.py report --models MLP,CNN2D               # esses, nessa ordem de linhas
-```
-
-Saída em `results/<MODEL>/pd_table/` para um modelo só, e em `results/comparison/pd_table/`
-quando há mais de um.
-
-> Para a comparação ser justa, os YAMLs dos modelos comparados precisam concordar em
-> `data_path`, `max_files`, `n_splits` e `seed` — é isso que garante que todos foram
-> avaliados exatamente sobre as mesmas linhas de teste. O `report` compara as contagens de
-> sinal/ruído das linhas avaliadas de cada modelo por região e avisa se elas divergirem.
-
-#### Como o `report` acha os modelos
-
-Ele varre a árvore de resultados (`--results-root`, padrão `results/`) procurando o diretório
-`checkpoints/` de cada região, e lê modelo e região do caminho (`<MODEL>/<região>`). A ancoragem
-é nos checkpoints (e não nas métricas) de propósito: assim uma região **treinada mas não
-avaliada** aparece no inventário e é reportada como faltante, em vez de virar um buraco
-silencioso na tabela.
-
-Para ver o inventário sem construir nada:
-
-```bash
-python ai/run.py report --list
-```
-
-```
-🔎 Found 9 trained region(s) under 'results':
-   CNN2D    et2_eta0    3/3 folds evaluated    results/CNN2D/et2_eta0
-   MLP      et2_eta0    3/3 folds evaluated    results/MLP/et2_eta0
-   MLP      et4_eta1    NOT EVALUATED          results/MLP/et4_eta1
-```
-
-Toda execução do `report` imprime esse inventário antes de montar a tabela e avisa, com o
-comando exato para corrigir, quando uma região foi treinada e não avaliada, ou quando só parte
-dos folds foi avaliada.
-
-O `--config` é sempre dispensável: o `report` lê a árvore de resultados, não os dados.
-
-#### Tabela integrada (arquivo separado)
-
-Além de uma tabela por ponto de operação com a grade por região, o `report` salva a **tabela
-integrada** em arquivos próprios: `pd_table_integrated.tex`, `.html` e o
-`pd_table_integrated_long.csv`. Ela pooleia todas as regiões e traz uma linha por modelo, com
-um grupo de colunas por ponto de operação — o resultado inteiro numa linha por modelo.
-
-A integração é ponderada pela população, não pela média das taxas: cada região tem seu próprio
-limiar, então o número integrado é razão de contagens somadas.
-
-$$P_D^{int} = \frac{\sum_r P_D^r \, N_{sinal}^r}{\sum_r N_{sinal}^r}, \qquad
-  F_A^{int} = \frac{\sum_r F_A^r \, N_{ruído}^r}{\sum_r N_{ruído}^r}$$
-
-O pooling acontece **por fold**, antes de agregar, então o ± da tabela integrada é a dispersão
-real entre folds do número integrado. `threshold` e as AUCs ficam vazios (o limiar é por região
-e as AUCs não se combinam a partir de sumários).
-
-Para pular a tabela integrada:
-
-```bash
-python ai/run.py report --no-integrated
-```
-
-### 4. SLURM
-
-A grade inteira vai como job arrays encadeados: um treino por tarefa, cada uma derivando sua
-tupla (et, eta, fold, init) do `SLURM_ARRAY_TASK_ID`; depois uma tarefa por região escolhe o
-melhor init de cada fold (`select`) e avalia; ao fim, um job dependente monta o tabelão:
-
-```bash
-./slurm_bins.sh ai/configs/mlp.yaml
-```
-
-Segundo argumento opcional limita quantas tarefas rodam em paralelo (`--array=0-N%M`), para
-não tomar todas as GPUs da fila:
-
-```bash
-./slurm_bins.sh ai/configs/mlp.yaml 4
-```
-
-Cancelar a grade inteira é `scancel <id-do-array>`; uma região só é `scancel <id>_<indice>`.
-
-O tabelão encadeia com `--dependency=afterok`, então só dispara quando todas as tarefas do
-array terminam com sucesso.
+O script já usa o Python do `neuralnet-env`; para usar outro, rode
+`PYTHON=/caminho/para/python ./slurm_bins.sh ...`. Para cancelar, `scancel <id>`.
 
 ---
 
-## 🧩 Adicionando uma arquitetura
+## 🧩 Adicionando uma rede nova
 
-Uma arquitetura nova são **três arquivos curtos**. Todo o resto — k-fold, binning
-cinemático, batching, métricas, índice SP, EarlyStopping, checkpoints, scoring, gráficos,
-tabelão e a grade SLURM — já vem pronto e funciona igual para qualquer modelo.
+Uma rede nova são três arquivos curtos. Todo o resto (validação cruzada, grade, métricas,
+gráficos, tabelão e SLURM) funciona sem mexer em mais nada. No exemplo, a rede se chama
+`MinhaRede`.
 
-O exemplo abaixo cria uma rede chamada `MinhaRede`.
-
-### 1. O modelo — `ai/models/minha_rede.py`
-
-Herde de `BaseBinaryClassifier` e escreva apenas `build_network`, devolvendo as camadas:
+**1. O modelo:** `ai/models/minha_rede.py`. Escreva só o `build_network`, que devolve as
+camadas:
 
 ```python
 import torch.nn as nn
@@ -321,169 +167,125 @@ from ai.models.base import BaseBinaryClassifier
 
 class ModelMinhaRede(BaseBinaryClassifier):
     def build_network(self, input_dim: int = 100, hidden: int = 16) -> nn.Module:
-        return nn.Sequential(
-            nn.Linear(input_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, 1),
-        )
+        return nn.Sequential(nn.Linear(input_dim, hidden), nn.ReLU(), nn.Linear(hidden, 1))
 ```
 
-Não escreva `__init__` — a base monta a loss ponderada, as métricas, o índice SP e o otimizador.
-Cada argumento de `build_network` vira hiperparâmetro salvo, disponível como `self.hparams.hidden`
-e restaurado do checkpoint. A rede devolve **logits crus**: a loss aplica o sigmoid.
+Não precisa de `__init__`: a base já cuida da loss, das métricas e do otimizador. Os
+argumentos de `build_network` ficam salvos junto com o checkpoint. A rede devolve a saída crua,
+sem sigmoid.
 
-### 2. O preprocessador — `ai/preprocess/minha_rede.py`
-
-Herde de `BasePreprocessor` e escreva `required_columns` (quais colunas ler do parquet, entre as
-300+ disponíveis) e `transform` (DataFrame → array float32), terminando com `self.normalize(...)`:
+**2. O preprocessador:** `ai/preprocess/minha_rede.py`. Diz quais colunas ler e como elas
+viram a entrada da rede:
 
 ```python
+import numpy as np
+from ai.preprocess.base import BasePreprocessor
+
+
 class PreprocessMinhaRede(BasePreprocessor):
     def required_columns(self, available):
         return [c for c in available if c.startswith("ring_")]
 
     def transform(self, df):
         X = df[self.required_columns(list(df.columns))].to_numpy(dtype=np.float32)
-        return self.normalize(X)
+        return self.normalize(X)    # norm1: cada evento dividido pela soma das suas features
 ```
 
-`fit_transform` já vem da base, e o pipeline salva o preprocessador ajustado inteiro com joblib.
-Escreva `fit` apenas se houver estado a aprender dos dados (um scaler, uma média, como o
-StandardScaler da MLP); o `fit` padrão é no-op, que é o certo para um preprocessador sem estado
-como o da CNN2D.
+Se for só uma lista de colunas com norm1, basta declarar `feature_columns`: o `transform`
+padrão extrai essas colunas e aplica o norm1. Se o preprocessador precisa aprender algo dos
+dados de treino, como uma média ou um scaler, escreva também um `fit`, como a MLP faz.
 
-### 3. O pipeline — `ai/pipeline/pipeline_minha_rede.py`
-
-O nome do arquivo **precisa começar com `pipeline_`**: é assim que o registro o encontra.
+**3. O pipeline:** `ai/pipeline/pipeline_minha_rede.py`. O nome do arquivo precisa começar com
+`pipeline_`. É ele que liga o modelo ao preprocessador e dá o nome usado no config:
 
 ```python
-@register_pipeline("MinhaRede")     # o valor que vai em `model:` no YAML
+from ai.pipeline.base import BasePipeline
+from ai.pipeline.registry import register_pipeline
+from ai.models.minha_rede import ModelMinhaRede
+from ai.preprocess.minha_rede import PreprocessMinhaRede
+
+
+@register_pipeline("MinhaRede")     # o nome que vai em `model:`
 class PipelineMinhaRede(BasePipeline):
     model_class = ModelMinhaRede
     preprocessor_class = PreprocessMinhaRede
-```
 
-Se o preprocessador precisa de argumentos de construção, declare
-`preprocessor_class = functools.partial(PreprocessMinhaRede, arg=...)`.
-
-Se a arquitetura precisa de um valor que só se conhece depois do preprocessamento — tipicamente
-a dimensão de entrada — acrescente:
-
-```python
+    # Opcional: valores que só se sabe depois do preprocessamento, como o tamanho da entrada.
     def build_model_kwargs(self, X):
         return {"input_dim": int(X.shape[1])}
 ```
 
-### 4. Rodar
-
-Aponte `model: "MinhaRede"` no YAML e use os mesmos comandos de sempre:
-
-```bash
-python ai/run.py train    --config ai/configs/minha_rede.yaml
-python ai/run.py evaluate --config ai/configs/minha_rede.yaml
-python ai/run.py report   --config ai/configs/minha_rede.yaml
-```
-
-Para conferir que a arquitetura foi reconhecida:
+**4. Rodar:** coloque `model: "MinhaRede"` num config e use os comandos de sempre. Para ver os
+modelos registrados:
 
 ```bash
 python -c "from ai.pipeline.registry import available_pipelines; print(available_pipelines())"
 ```
 
-### Ganchos opcionais
+Mais algumas dicas:
 
-Sobrescreva apenas se precisar; nenhum é obrigatório:
-
-| Gancho | Quando usar |
-|---|---|
-| `forward` | a rede não é um único módulo chamável (ex.: dois ramos — veja `ai/models/fused.py`) |
-| `compute_loss` | losses auxiliares, além da principal |
-| `build_metrics` | acrescentar ou remover métricas |
-| `configure_optimizers` | outro otimizador ou um scheduler |
+- Para mudar só a normalização, crie um preprocessador novo e registre um pipeline com outro
+  nome. Assim cada resultado diz com que normalização foi treinado.
+- Se precisar, dá para sobrescrever também `forward` (rede com mais de um ramo, veja
+  `ai/models/fused.py`), `compute_loss` (losses extras), `build_metrics` ou
+  `configure_optimizers`.
 
 ---
 
-## 📂 Artefatos gerados
+## 📂 O que fica salvo
 
 ```
-results/<MODEL>[/et<i>_eta<j>]/
-├── artifacts/
-│   ├── preprocessor.joblib    # preprocessador ajustado SÓ no treino
-│   └── val_indices_fold_N.npy # linhas que o fold N validou (fora de amostra)
-├── checkpoints/
-│   ├── fold_N.ckpt            # melhor checkpoint do fold (nome fixo)
-│   └── fold_N.json            # pos_weight, melhor métrica, épocas, kwargs
-├── history/fold_N.csv         # loss de treino/validação por época
-├── scores/fold_N.parquet      # y_true, y_prob, et, eta, row_id, in_sample (região inteira)
-├── metrics/folds_long.csv     # tabela canônica desta região: PD/SP/FA por (fold, ponto de operação)
-└── plots/                     # ROC, PR, matriz de confusão, loss, ROC dos folds
+results/<MODELO>/et<i>_eta<j>/
+├── artifacts/     o preprocessador ajustado e quais eventos cada fold usou na validação
+├── checkpoints/   fold_N.ckpt (a melhor rede do fold) e fold_N.json (detalhes do treino)
+├── history/       a loss de cada época
+├── scores/        a nota que a rede deu a cada evento da região, por fold
+├── metrics/       folds_long.csv: P_D, SP e F_A por fold e ponto de operação
+└── plots/         ROC, PR, matriz de confusão e curvas de loss
 
-results/<MODEL>/pd_table/               # ou results/comparison/pd_table/ ao comparar modelos
-├── pd_table_long.csv                   # tabela canônica agregada (fonte da verdade)
-├── pd_table_<ponto>.tex                # por região: fragmento LaTeX para \input{}
-├── pd_table_<ponto>.html               # por região: a mesma tabela, sem precisar de LaTeX
-├── pd_table_integrated_long.csv        # integrado: números poolados por fold
-├── pd_table_integrated.tex             # integrado: fragmento LaTeX
-└── pd_table_integrated.html            # integrado: a mesma tabela em HTML
+results/<MODELO>/pd_table/     (ou results/comparison/pd_table/ ao comparar modelos)
+├── pd_table_<ponto>.tex e .html       o tabelão de cada ponto de operação
+├── pd_table_integrated.tex e .html    uma linha por modelo, juntando todas as regiões
+└── pd_table_long.csv                  os números por trás das tabelas
 ```
 
-Todos os CSVs são **sobrescritos** a cada execução (antes eram anexados, o que fazia execuções antigas se acumularem como se fossem folds extras).
+---
+
+## 📊 Como ler o tabelão
+
+- As linhas são as regiões de $|\eta|$ e as colunas, as regiões de $E_T$. Cada célula traz
+  $P_D$, $SP$ e $F_A$, com a média e o desvio entre os folds.
+- Cada rede é ajustada para acertar exatamente o $P_D$ alvo (a coluna em verde). O que
+  diferencia os modelos é o $SP$ e o $F_A$.
+- A tabela integrada junta todas as regiões, e cada região pesa de acordo com o seu número de
+  eventos.
+- Para comparar modelos de forma justa, os configs precisam usar os mesmos dados,
+  `max_files`, `n_splits` e `seed`. O `report` avisa quando isso não acontece.
+- O `.tex` precisa de `\usepackage{booktabs}`, `\usepackage[table]{xcolor}` e
+  `\usepackage{graphicx}`.
 
 ---
 
-## 📊 O tabelão de validação cruzada
+## 💡 Bom saber
 
-Tabela no formato ATLAS/Ringer: linhas são regiões de $|\eta|$, grupos de colunas são regiões de $E_T$, e cada grupo traz $P_D$ / $SP$ / $F_A$ como média ± desvio entre os folds. Quando mais de um modelo foi avaliado, cada região ganha **uma linha por modelo** (coluna `Model`), no lugar das linhas `Reference` / `Cross Validation` do formato original.
+- **Classes desbalanceadas:** em vez de descartar dados, a loss dá mais peso ao sinal. O peso
+  é o número de eventos de ruído dividido pelo de sinal, calculado só nos dados de treino de
+  cada fold.
+- **Quando o treino para:** o early stopping acompanha o SP, usando o melhor corte possível em
+  cada época.
+- **A avaliação usa a região inteira**, incluindo os eventos com que cada fold treinou. Para
+  olhar só os eventos que o fold não viu, use a coluna `in_sample` dos arquivos em `scores/`:
 
-A fonte da verdade é o CSV **longo** (`pd_table_long.csv`): uma linha puramente numérica por `(model, et_bin, eta_bin, fold, operating_point)`. O `.tex` e o `.html` são derivados dele, então existe um único lugar onde os números são produzidos e vários onde são formatados.
+  ```python
+  d = pd.read_parquet("results/MLP/et2_eta0/scores/fold_1.parquet")
+  fora = d[~d.in_sample]
+  ```
 
-O `.tex` gerado precisa dos pacotes:
-
-```latex
-\usepackage{booktabs}
-\usepackage[table]{xcolor}
-\usepackage{graphicx}
-```
-
-**Ajuste ao ponto de operação.** Para cada $P_D$ alvo, o limiar é o quantil $(1 - P_D)$ da distribuição de scores de sinal — ou seja, toda rede é ajustada para entregar exatamente aquele $P_D$ (coluna destacada em verde). O que efetivamente distingue os modelos é o $SP$ e o $F_A$ resultantes, e é por isso que a comparação entre arquiteturas se lê direto na vertical dessas duas colunas.
-
-**Convenção do desvio.** Todos os folds são avaliados sobre o **mesmo** conjunto de linhas (a região inteira). Logo o ± reportado é a variância *do modelo* entre folds, não a variância amostral do conjunto avaliado.
-
-**Sem linha de referência.** O dataset não traz coluna de decisão do T2Calo, então a tabela hoje só tem as linhas de `Cross Validation`, com alvos fixos de $P_D$ (90/95/99% por padrão). Uma linha de referência exigiria um arquivo externo de eficiências por região.
+- **`n_splits: 1`** treina um modelo só, guardando 20% dos dados para a validação.
 
 ---
 
-## ⚖️ Estratégia de Balanceamento de Classes (Weighted Loss)
-
-O repositório utiliza **função de custo ponderada** (`nn.BCEWithLogitsLoss(pos_weight=pos_weight)`) em substituição ao *undersampling* aleatório, preservando 100% dos dados originais.
-
-### 1. Cálculo Dinâmico de `pos_weight`
-
-$$\text{pos\_weight} = \frac{N_{\text{negativos}}}{N_{\text{positivos}}}$$
-
-- Calculado estritamente sobre as amostras de **treino** de cada fold (`train_ids`), sem vazamento de teste ou validação.
-- Registrado como buffer (`register_buffer("pos_weight", ...)`), acompanhando o dispositivo sem ser otimizado.
-- Salvo no sidecar `checkpoints/fold_N.json` — ele é excluído de `save_hyperparameters`, então precisa ser reinjetado ao recarregar o checkpoint.
-- Partição estratificada com `seed` fixo garante que `CNN2D` e `MLP` comparem resultados sob os mesmos splits.
-
-### 2. Métricas para dados desbalanceados
-
-Precision/Recall/F1, AUC-ROC, AUC-PR e o **SP Index** (`sqrt(sqrt(pd*(1-fa)) * (pd+1-fa)/2)`) maximizado sobre todos os limiares de decisão, que é a métrica monitorada pelo Early Stopping e pelo ModelCheckpoint.
-
-### 3. Normalização da entrada
-
-Cada evento é normalizado pela soma absoluta das suas próprias features,
-$r^{\prime}_i = r_i / |\sum_j r_j|$, de modo que a rede enxerga apenas o **formato** da
-deposição de energia e não a escala absoluta — que já é tratada pelo binning em $E_T$.
-
-Isso vive no preprocessador (`BasePreprocessor.normalize`, chamado no fim de cada `transform`),
-e não no modelo: é uma propriedade da representação de entrada, não da arquitetura. Também é
-mais barato — a normalização é calculada uma vez por conjunto, e não a cada batelada de cada
-época. O array persistido é exatamente o que a rede enxerga.
-
----
-
-## 🧹 Limpeza do Ambiente
+## 🧹 Limpeza
 
 ```bash
 make clean
