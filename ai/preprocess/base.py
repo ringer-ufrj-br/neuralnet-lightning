@@ -218,14 +218,15 @@ class BasePreprocessor:
 
     The baseline preprocessor is a column selection: set `feature_columns` and the inherited
     `required_columns` / `transform` do the rest - extract those columns, zero the sensor
-    anomalies, normalise each event. PreprocessMLP is exactly this, with its own `normalize`.
+    anomalies, normalise each event. PreprocessMLP is exactly this.
 
     A preprocessor whose input is not a flat slice of dataset columns (the CNN2D image
     builder, the Fused rings+cells concatenation) instead overrides `transform`, and usually
     `required_columns`, and leaves `feature_columns` as None.
 
-    Either kind overrides `fit` only if it has state to learn from the training split (a
-    scaler, a mean, ...). The pipeline persists the whole fitted instance with joblib, so
+    Either kind overrides `fit` only if it has state to learn (a scaler, a mean, ...). `fit`
+    sees the whole region, before the fold split, so that state includes every fold's
+    validation rows. The pipeline persists the whole fitted instance with joblib, so
     anything stored on `self` in `fit` is restored for evaluation with no extra code.
 
     The frames are polars end to end: converting to pandas would copy the whole frame, briefly

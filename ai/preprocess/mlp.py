@@ -1,13 +1,6 @@
-import logging
 from typing import List
 
-import numpy as np
-import polars as pl
-from sklearn.preprocessing import StandardScaler
-
 from ai.preprocess.base import BasePreprocessor, RING
-
-logger = logging.getLogger(__name__)
 
 
 def _selected_ring_columns(prefix: str = RING) -> List[str]:
@@ -67,36 +60,12 @@ class PreprocessMLP(BasePreprocessor):
     in the canonical `ring_i` vocabulary, so it is identical for a dataset storing one column
     per ring and one storing all 100 in a single list column.
 
-    Column selection and sensor-anomaly cleaning are the inherited BasePreprocessor defaults.
-    Its normalisation is the NeuralRinger reference MLP scaling, overriding the base per-event
-    norm1: log1p of the ring energies (negative noise clipped to zero), then a per-feature
-    StandardScaler fitted on the training rows only.
+    Cleaning and normalisation (the per-event norm1) are the inherited defaults.
 
-    A different normalisation is a different model: subclass this, override `fit`/`normalize`
-    (`BasePreprocessor.normalize(self, X)` gives the per-event norm1) and register a pipeline
-    for it. Keeping it in the class rather than in a config means the normalisation a set of
-    checkpoints was trained under is readable from the class that produced them.
+    A different normalisation is a different model: subclass this, override `normalize` and
+    register a pipeline for it. Keeping it in the class rather than in a config means the
+    normalisation a set of checkpoints was trained under is readable from the class that
+    produced them.
     """
 
     feature_columns = _selected_ring_columns()
-
-    def __init__(self) -> None:
-        self.scaler = StandardScaler()
-
-    @staticmethod
-    def _log_energies(X: np.ndarray) -> np.ndarray:
-        """log1p of the float32 ring energies with negative noise clipped to zero, in place."""
-        np.clip(X, 0.0, None, out=X)
-        return np.log1p(X, out=X)
-
-    def fit(self, df: pl.DataFrame) -> "PreprocessMLP":
-        """Fits the StandardScaler on the log1p-compressed rings. MUST see the training split only."""
-        X = self._log_energies(self.extract(df, self.feature_columns))
-        logger.info(f"📐 Fitting StandardScaler on {len(X)} training rows...")
-        self.scaler.fit(X)
-        return self
-
-    def normalize(self, X: np.ndarray) -> np.ndarray:
-        """log1p then the StandardScaler fitted in `fit`, in place."""
-        return self.scaler.transform(self._log_energies(X), copy=False)
-

@@ -49,7 +49,7 @@ Deixe o ambiente dentro da pasta do repositório, para os nós de computação e
 
 | `model:` | O que é |
 |---|---|
-| `MLP` | Rede pequena (uma camada de 5 neurônios) sobre metade dos anéis. Normalização: log1p + padronização |
+| `MLP` | Rede pequena (uma camada de 5 neurônios) sobre metade dos anéis. Normalização: norm1 (cada evento dividido pela soma dos seus anéis) |
 | `MLP_MC21` | A MLP com um nome próprio, para os resultados do mc21 não se misturarem com os do mc25 |
 | `CNN2D` | Rede convolucional sobre as imagens de células do calorímetro (uma camada = um canal) |
 | `Fused` | Anéis e imagens de células em dois ramos, que se juntam no final |
@@ -194,8 +194,10 @@ O `df` é do polars, não do pandas: converter para pandas copiaria o dataframe 
 matriz com `extract` (ou preenchendo um array já alocado) e trabalhe nela no lugar.
 
 Se for só uma lista de colunas com norm1, basta declarar `feature_columns`: o `transform`
-padrão extrai essas colunas e aplica o norm1. Se o preprocessador precisa aprender algo dos
-dados de treino, como uma média ou um scaler, escreva também um `fit`, como a MLP faz.
+padrão extrai essas colunas e aplica o norm1 (é assim que a MLP faz). Se o preprocessador
+precisa aprender algo dos dados, como uma média ou um scaler, escreva também um `fit`. Atenção:
+o `fit` recebe a região inteira, antes da divisão em folds, então o que ele aprende inclui os
+eventos de validação de cada fold.
 
 **3. O pipeline:** `ai/pipeline/pipeline_minha_rede.py`. O nome do arquivo precisa começar com
 `pipeline_`. É ele que liga o modelo ao preprocessador e dá o nome usado no config:

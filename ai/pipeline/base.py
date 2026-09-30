@@ -4,7 +4,7 @@ Shared training/evaluation pipeline.
 The pipeline is split into two independent phases so that they can be run as separate
 commands, on different machines and at different times:
 
-* `train`    - loads data, fits the preprocessor on the training rows only, runs the K-Fold
+* `train`    - loads data, fits the preprocessor on the whole region, runs the K-Fold
                cross-validation and persists everything an evaluation needs: one checkpoint
                per fold under a fixed name, the preprocessor, and each fold's validation
                indices.
