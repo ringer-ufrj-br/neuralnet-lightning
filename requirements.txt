@@ -12,6 +12,4 @@ pytorch-lightning
 torchmetrics
 scikit-learn
 matplotlib
-seaborn
 tqdm
-argparse

@@ -21,15 +21,7 @@ class PipelineMLP(BasePipeline):
     preprocessor_class = PreprocessMLP
 
     def build_model_kwargs(self, X: np.ndarray) -> Dict[str, Any]:
-        """
-        Derives the MLP input dimension from the preprocessed feature matrix.
-
-        Args:
-            X (np.ndarray): Preprocessed training features, shape (N, n_features).
-
-        Returns:
-            Dict[str, Any]: {'input_dim': n_features}, forwarded to ModelMLP.build_network.
-        """
+        """The MLP input dimension, from the preprocessed (N, n_features) matrix."""
         input_dim = int(X.shape[1])
         logger.info(f"📐 Model input dimension: {input_dim}")
         return {"input_dim": input_dim}

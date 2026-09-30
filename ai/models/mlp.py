@@ -11,16 +11,7 @@ class ModelMLP(BaseBinaryClassifier):
     """
 
     def build_network(self, input_dim: int = 100) -> nn.Module:
-        """
-        Builds the ring-based MLP.
-
-        Args:
-            input_dim (int): Number of input features (rings). Supplied by
-                PipelineMLP.build_model_kwargs from the preprocessed feature matrix.
-
-        Returns:
-            nn.Module: (Batch, input_dim) -> (Batch, 1) logits.
-        """
+        """(Batch, input_dim) -> (Batch, 1) logits; input_dim comes from PipelineMLP.build_model_kwargs."""
         return nn.Sequential(
             nn.Linear(input_dim, 5),
             nn.ReLU(),

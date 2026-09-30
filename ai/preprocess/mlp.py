@@ -1,16 +1,9 @@
-import logging
 from typing import List
 
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
-
-from ai.preprocess.base import BasePreprocessor
-
-logger = logging.getLogger(__name__)
+from ai.preprocess.base import BasePreprocessor, RING
 
 
-def _selected_ring_columns(prefix: str) -> List[str]:
+def _selected_ring_columns(prefix: str = RING) -> List[str]:
     """
     Selected ring columns for MLP training - we selected 1/2 of rings in each layer (fixed,
     not parameterized). Mirrors the reference selection from prior Ringer trainings:
@@ -24,7 +17,9 @@ def _selected_ring_columns(prefix: str) -> List[str]:
     Had3 - 4 rings
 
     Args:
-        prefix (str): printf-style column name template with one '%i' placeholder, e.g. 'cl_ring_%i'.
+        prefix (str): printf-style column name template with one '%i' placeholder. Defaults
+            to the canonical 'ring_%i', so the selection is the same whatever the dataset
+            calls its rings.
 
     Returns:
         List[str]: The 50 selected column names, in ring order.
@@ -61,75 +56,16 @@ def _selected_ring_columns(prefix: str) -> List[str]:
 
 class PreprocessMLP(BasePreprocessor):
     """
-    Baseline Ringer preprocessor: the leading half of every calorimeter layer's ring
-    features (50 of 100, see _selected_ring_columns).
+    Baseline Ringer preprocessor: the leading half of every calorimeter layer's rings. It works
+    in the canonical `ring_i` vocabulary, so it is identical for a dataset storing one column
+    per ring and one storing all 100 in a single list column.
 
-    Column selection and sensor-anomaly cleaning are the inherited BasePreprocessor
-    defaults. It replaces the per-event norm1 with the NeuralRinger reference MLP scaling:
-    log1p of the ring energies (negative noise clipped to zero), then a per-feature
-    StandardScaler fitted on the training rows only. The scaler lives on the instance, so
-    joblib persistence restores it for evaluation with no extra code.
+    Cleaning and normalisation (the per-event norm1) are the inherited defaults.
 
-    A ring column that is absent from the dataset raises KeyError during extraction rather
-    than being silently substituted.
+    A different normalisation is a different model: subclass this, override `normalize` and
+    register a pipeline for it. Keeping it in the class rather than in a config means the
+    normalisation a set of checkpoints was trained under is readable from the class that
+    produced them.
     """
 
-    def __init__(self) -> None:
-        """
-        Initializes PreprocessMLP instance.
-        """
-        self.feature_columns = _selected_ring_columns("cl_ring_%i")
-        self.scaler = StandardScaler()
-        self.is_fitted = False
-
-    @staticmethod
-    def _log_energies(X: np.ndarray) -> np.ndarray:
-        """
-        log1p of the ring energies with negative noise clipped to zero. The pre-scaler half
-        of the normalisation, shared by `fit` and `normalize`.
-
-        Args:
-            X (np.ndarray): Cleaned ring matrix, first dimension being the batch.
-
-        Returns:
-            np.ndarray: Float32 array of the same shape, log1p(max(X, 0)).
-        """
-        return np.log1p(np.clip(X, 0.0, None)).astype(np.float32)
-
-    def fit(self, df: pd.DataFrame) -> "PreprocessMLP":
-        """
-        Fits the StandardScaler on the log1p-compressed training rings. MUST see the training
-        split only - the pipeline calls this via fit_transform on the train rows and then
-        reuses the fitted instance for evaluation.
-
-        Args:
-            df (pd.DataFrame): Training rows.
-
-        Returns:
-            PreprocessMLP: self, for chaining.
-        """
-        X = self._log_energies(self.extract(df, self.feature_columns))
-        logger.info(f"📐 Fitting StandardScaler on {len(X)} training rows...")
-        self.scaler.fit(X)
-        self.is_fitted = True
-        return self
-
-    def normalize(self, X: np.ndarray) -> np.ndarray:
-        """
-        Applies the fitted normalisation: log1p of the clipped ring energies, then the
-        per-feature StandardScaler learned in `fit`. Replaces the base norm1.
-
-        Args:
-            X (np.ndarray): Cleaned ring matrix, first dimension being the batch.
-
-        Returns:
-            np.ndarray: Float32 array of the same shape, standardised per feature.
-
-        Raises:
-            RuntimeError: If called before `fit` (directly or via fit_transform).
-        """
-        if not self.is_fitted:
-            raise RuntimeError(
-                "❌ PreprocessMLP used before fit(). Call fit_transform() on the training rows first."
-            )
-        return self.scaler.transform(self._log_energies(X)).astype(np.float32)
+    feature_columns = _selected_ring_columns()

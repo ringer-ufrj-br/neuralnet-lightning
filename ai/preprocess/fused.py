@@ -1,87 +1,46 @@
-import numpy as np
-import pandas as pd
 import logging
-from typing import Tuple, List
+import math
+from typing import List
 
-from .cnn2d import PreprocessCNN2D
-from .base import BasePreprocessor
+import numpy as np
+import polars as pl
+
+from .base import BasePreprocessor, N_RINGS, ring_name
+from .cnn2d import CELL_COLUMNS, PreprocessCNN2D
 
 logger = logging.getLogger(__name__)
 
+
 class PreprocessFused(BasePreprocessor):
     """
-    Preprocessor for the Fused pipeline, combining ring features and calorimeter
-    cell images into a single feature array.
+    Preprocessor for the Fused pipeline: one flat vector per event, the rings (each event
+    divided by its total ring energy, the Ringer norm1) followed by the flattened cell image.
     """
 
-    def __init__(self, num_rings: int = 100, ring_norm: str = 'norm1') -> None:
-        """
-        Initializes PreprocessFused instance.
-        Args:
-            num_rings (int): Number of ring features to extract. Defaults to 100.
-            ring_norm (str): Ring normalization: 'norm1', 'log' or None. Defaults to 'norm1'.
-        """
+    def __init__(self) -> None:
         self.cells_pp = PreprocessCNN2D()
-        self.num_rings = num_rings
-        self.ring_norm = ring_norm
-        self.ring_columns = [f"cl_ring_{i}" for i in range(self.num_rings)]
+        self.ring_columns = [ring_name(i) for i in range(N_RINGS)]
 
-    def process_rings(self, df: pd.DataFrame) -> np.ndarray:
+    def transform(self, df: pl.DataFrame) -> np.ndarray:
         """
-        Extracts and normalizes the ring features.
-        Args:
-            df (pd.DataFrame): Input DataFrame containing ring feature columns.
-        Returns:
-            np.ndarray: Processed float32 array of shape (N, num_rings).
+        Float32 array of shape (N, n_rings + C*H*W). The cell images are written straight into
+        their slice of the one output array, so the large half is never built separately and
+        concatenated.
         """
-        cols = self.ring_columns
-        logger.info(f"🧪 Extracting {len(cols)} ring features ({cols[0]} ... {cols[-1]})...")
-        X = self.extract(df, cols)
+        n_rings = len(self.ring_columns)
+        cell_shape = self.cells_pp.target_shape
+        X = np.zeros((df.height, n_rings + math.prod(cell_shape)), dtype=np.float32)
 
-        if self.ring_norm == 'norm1':
-            # Ringer standard: divide by the total ring energy, removing the
-            # absolute energy dependence and keeping the shower profile
-            total = np.abs(X).sum(axis=1, keepdims=True)
-            X = np.divide(X, total, out=np.zeros_like(X), where=total > 0)
-        elif self.ring_norm == 'log':
-            X = np.log1p(np.clip(X, 0, None))
+        rings = self.extract(df, self.ring_columns)
+        total = np.abs(rings).sum(axis=1, keepdims=True)
+        np.divide(rings, total, out=X[:, :n_rings], where=total > 0)
 
-        return X.astype(np.float32)
+        # copy=False: a view is required, or the images would land in a discarded copy.
+        self.cells_pp.build_images(df, out=X[:, n_rings:].reshape((df.height, *cell_shape), copy=False))
 
-    def transform_split(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Transforms the DataFrame into separate ring and cell arrays.
-        Args:
-            df (pd.DataFrame): Input DataFrame.
-        Returns:
-            Tuple[np.ndarray, np.ndarray]: Rings of shape (N, num_rings) and cells of shape (N, 7, 7, 15).
-        """
-        return self.process_rings(df), self.cells_pp.build_images(df)
-
-    def transform(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Transforms the DataFrame into a single array with rings and flattened cells.
-        Args:
-            df (pd.DataFrame): Input DataFrame.
-        Returns:
-            np.ndarray: Float32 array of shape (N, num_rings + C*H*W).
-        """
-        X_rings, X_cells = self.transform_split(df)
-        X_cells_flat = X_cells.reshape(X_cells.shape[0], -1)
-
-        X = np.concatenate([X_rings, X_cells_flat], axis=1).astype(np.float32)
-        logger.info(f"🔗 Fused features: {X.shape} ({X_rings.shape[1]} rings + {X_cells_flat.shape[1]} cells)")
+        logger.info(f"🔗 Fused features: {X.shape} ({n_rings} rings + {X.shape[1] - n_rings} cells)")
         return self.normalize(X)
 
     def required_columns(self, available: List[str]) -> List[str]:
-        """
-        Both branches' columns: the ring columns this model reads plus the 7 cell-image
-        columns the CNN branch needs.
-
-        Args:
-            available (List[str]): Column names present in the dataset files.
-
-        Returns:
-            List[str]: Ring columns plus the cell columns.
-        """
-        return list(self.ring_columns) + self.cells_pp.required_columns(available)
+        """Both branches' columns: the rings plus the cell images."""
+        return self.ring_columns + list(CELL_COLUMNS)

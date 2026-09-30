@@ -1,21 +1,12 @@
-import pandas as pd
 from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
     roc_auc_score,
     average_precision_score,
     confusion_matrix
 )
-import os
-import logging
-from typing import Dict, Union, List, Optional, Any
+from typing import Dict, Union, List, Optional
 import numpy as np
 
 from ai.evaluation.metrics import sp_index
-
-logger = logging.getLogger(__name__)
 
 DEFAULT_OPERATING_POINTS: Dict[str, float] = {"tight": 0.90, "medium": 0.95, "loose": 0.99}
 
@@ -26,22 +17,14 @@ def compute_operating_points(
     targets: Optional[Dict[str, float]] = None
 ) -> List[Dict[str, float]]:
     """
-    Computes FA (background false alarm rate) at fixed PD (signal detection probability)
-    working points. For each target PD, the threshold is set to the (1 - PD) quantile of the
+    FA (background false alarm rate) at fixed PD (signal detection probability) working points,
+    one dict per point in the long-table vocabulary (operating_point, target_pd, threshold, pd,
+    fa, sp). For each target PD, the threshold is set to the (1 - PD) quantile of the
     signal-class score distribution, guaranteeing that exactly that fraction of signal is kept.
 
     This is the mechanism behind the cross-validation table ("pd_table"): every network is
     tuned to deliver the same PD, so the columns that actually differ between models are
     SP and FA.
-
-    Args:
-        y_true (Union[List[int], np.ndarray]): True target labels.
-        y_prob (Union[List[float], np.ndarray]): Predicted probabilities.
-        targets (Optional[Dict[str, float]]): Mapping of working point name to target PD.
-            Defaults to {"tight": 0.90, "medium": 0.95, "loose": 0.99}.
-
-    Returns:
-        List[Dict[str, float]]: One entry per working point with Threshold, achieved PD, FA and SP_Index.
     """
     targets = targets or DEFAULT_OPERATING_POINTS
     y_true_arr = np.asarray(y_true).flatten()
@@ -58,44 +41,30 @@ def compute_operating_points(
         fa_rate = fp / (fp + tn) if (fp + tn) > 0 else 0.0
 
         points.append({
-            "Operating_Point": name,
-            "Target_PD": float(target_pd),
-            "Threshold": threshold,
-            "PD": float(pd_rate),
-            "FA": float(fa_rate),
-            "SP_Index": float(sp_index(pd_rate, fa_rate))
+            "operating_point": name,
+            "target_pd": float(target_pd),
+            "threshold": threshold,
+            "pd": float(pd_rate),
+            "fa": float(fa_rate),
+            "sp": float(sp_index(pd_rate, fa_rate))
         })
     return points
 
 
 def compute_metrics(
     y_true: Union[List[int], np.ndarray],
-    y_prob: Union[List[float], np.ndarray],
-    threshold: float = 0.5,
-    pos_weight: Optional[float] = None
+    y_prob: Union[List[float], np.ndarray]
 ) -> Dict[str, float]:
     """
-    Computes the global (fixed-threshold) metric set for one set of predictions.
+    The threshold-free metrics of one set of predictions, in the long-table vocabulary
+    (auc_roc, auc_pr, n_signal, n_background).
 
-    Pure function with no I/O, so it can be reused by the pipeline, by notebooks and by
-    the table builder without dragging a ModelSummary instance along.
-
-    Args:
-        y_true (Union[List[int], np.ndarray]): True target labels.
-        y_prob (Union[List[float], np.ndarray]): Predicted probabilities.
-        threshold (float): Classification decision threshold. Defaults to 0.5.
-        pos_weight (Optional[float]): Positive class weight used during training. Defaults to None.
-
-    Returns:
-        Dict[str, float]: Accuracy, AUC_ROC, AUC_PR, Precision, Recall, F1_Score, SP_Index,
-        Threshold, N_Positives, N_Negatives and (when given) Pos_Weight.
+    Everything here is a property of the score ranking rather than of any particular cut, so
+    it is comparable across models without agreeing on a decision threshold first. Metrics at
+    a cut belong to `compute_operating_points`, where the cut is derived from a target PD.
     """
     y_true_arr = np.asarray(y_true).flatten()
     y_prob_arr = np.asarray(y_prob).flatten()
-    y_pred = (y_prob_arr >= threshold).astype(int)
-
-    n_pos = int((y_true_arr == 1).sum())
-    n_neg = int((y_true_arr == 0).sum())
 
     try:
         auc_roc = float(roc_auc_score(y_true_arr, y_prob_arr))
@@ -107,117 +76,9 @@ def compute_metrics(
     except Exception:
         auc_pr = 0.0
 
-    tn, fp, fn, tp = confusion_matrix(y_true_arr, y_pred, labels=[0, 1]).ravel()
-    pd_rate = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    fa_rate = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-
-    metrics = {
-        "Accuracy": float(accuracy_score(y_true_arr, y_pred)),
-        "AUC_ROC": auc_roc,
-        "AUC_PR": auc_pr,
-        "Precision": float(precision_score(y_true_arr, y_pred, zero_division=0)),
-        "Recall": float(recall_score(y_true_arr, y_pred, zero_division=0)),
-        "F1_Score": float(f1_score(y_true_arr, y_pred, zero_division=0)),
-        "PD": float(pd_rate),
-        "FA": float(fa_rate),
-        "SP_Index": float(sp_index(pd_rate, fa_rate)),
-        "Threshold": float(threshold),
-        "N_Positives": n_pos,
-        "N_Negatives": n_neg
+    return {
+        "auc_roc": auc_roc,
+        "auc_pr": auc_pr,
+        "n_signal": int((y_true_arr == 1).sum()),
+        "n_background": int((y_true_arr == 0).sum()),
     }
-
-    if pos_weight is not None:
-        metrics["Pos_Weight"] = float(pos_weight)
-
-    return metrics
-
-
-class ModelSummary:
-    """
-    Writes evaluation metrics as tidy CSV files, one row per (fold, operating point).
-
-    Every write **overwrites** its target file. The previous append-mode behaviour silently
-    accumulated one duplicate row set per re-run, which made any downstream aggregation
-    (mean +/- std across folds) read stale rows from earlier runs as if they were extra folds.
-    """
-
-    def __init__(self, output_dir: str = "results/metrics") -> None:
-        """
-        Initializes ModelSummary instance.
-
-        Args:
-            output_dir (str): Directory where CSV metric files are saved. Defaults to 'results/metrics'.
-        """
-        self.output_dir = output_dir
-        os.makedirs(self.output_dir, exist_ok=True)
-
-    def _write(self, records: List[Dict[str, Any]], filename: str, description: str) -> pd.DataFrame:
-        """
-        Writes a list of record dicts to CSV, replacing any previous content.
-
-        Args:
-            records (List[Dict[str, Any]]): Rows to write.
-            filename (str): CSV output filename, relative to output_dir.
-            description (str): Human-readable label used in the log line.
-
-        Returns:
-            pd.DataFrame: The written frame.
-        """
-        df = pd.DataFrame(records)
-        filepath = os.path.join(self.output_dir, filename)
-        df.to_csv(filepath, index=False)
-        logger.info(f"📝 Saved {description} ({len(df)} rows) to: {filepath}")
-        return df
-
-    def save_metrics(
-        self,
-        records: List[Dict[str, Any]],
-        filename: str = "per_fold.csv"
-    ) -> pd.DataFrame:
-        """
-        Saves the per-fold global metric rows (as produced by compute_metrics, plus a Fold key).
-
-        Args:
-            records (List[Dict[str, Any]]): One dict per fold.
-            filename (str): CSV output filename. Defaults to 'per_fold.csv'.
-
-        Returns:
-            pd.DataFrame: The written frame.
-        """
-        return self._write(records, filename, "per-fold metrics")
-
-    def save_operating_points(
-        self,
-        records: List[Dict[str, Any]],
-        filename: str = "operating_points.csv"
-    ) -> pd.DataFrame:
-        """
-        Saves the per-fold working point rows (as produced by compute_operating_points, plus a Fold key).
-
-        Args:
-            records (List[Dict[str, Any]]): One dict per (fold, operating point).
-            filename (str): CSV output filename. Defaults to 'operating_points.csv'.
-
-        Returns:
-            pd.DataFrame: The written frame.
-        """
-        return self._write(records, filename, "operating points")
-
-    def save_long_table(
-        self,
-        records: List[Dict[str, Any]],
-        filename: str = "folds_long.csv"
-    ) -> pd.DataFrame:
-        """
-        Saves the canonical tidy table for this kinematic region: one purely numeric row per
-        (fold, operating point). This is the single source of truth the cross-validation table
-        builder (ai.evaluation.pd_table) reads back; the LaTeX/figure renders are derived from it.
-
-        Args:
-            records (List[Dict[str, Any]]): One dict per (fold, operating point).
-            filename (str): CSV output filename. Defaults to 'folds_long.csv'.
-
-        Returns:
-            pd.DataFrame: The written frame.
-        """
-        return self._write(records, filename, "long-format fold table")

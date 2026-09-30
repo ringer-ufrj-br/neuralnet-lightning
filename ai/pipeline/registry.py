@@ -25,16 +25,8 @@ _DISCOVERED = False
 
 def register_pipeline(name: str):
     """
-    Registers a pipeline class under the name used in a config's `model:` field.
-
-    Args:
-        name (str): Config name, e.g. 'MLP'. Also becomes the results/<NAME>/ directory.
-
-    Returns:
-        Callable: The class decorator.
-
-    Raises:
-        ValueError: If the name is already taken by a different class.
+    Class decorator registering a pipeline under the name used in a config's `model:` field,
+    e.g. 'MLP' - also its results/<NAME>/ directory. A name can only be claimed once.
     """
     def decorator(cls: type) -> type:
         existing = _PIPELINES.get(name)
@@ -71,29 +63,13 @@ def _discover() -> None:
 
 
 def available_pipelines() -> List[str]:
-    """
-    Lists every registered pipeline name.
-
-    Returns:
-        List[str]: Registered names, sorted.
-    """
+    """Every registered pipeline name, sorted."""
     _discover()
     return sorted(_PIPELINES)
 
 
 def get_pipeline(name: str) -> Type:
-    """
-    Resolves a config's `model:` string to its pipeline class.
-
-    Args:
-        name (str): The registered name.
-
-    Returns:
-        Type: The pipeline class.
-
-    Raises:
-        ValueError: If no pipeline is registered under that name.
-    """
+    """Resolves a config's `model:` string to its pipeline class (ValueError if unknown)."""
     _discover()
     if name not in _PIPELINES:
         raise ValueError(

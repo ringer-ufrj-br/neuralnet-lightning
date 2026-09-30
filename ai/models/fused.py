@@ -27,20 +27,9 @@ class ModelFused(BaseBinaryClassifier):
         dropout: float = 0.5
     ) -> nn.Module:
         """
-        Builds both branches, their auxiliary heads and the fusion head.
-
-        Args:
-            n_rings (int): Ring features in the flattened input. Defaults to 100.
-            cell_shape (Tuple[int, int, int]): (channels, height, width) of the cell image.
-            rings_embed_dim (int): Ring branch embedding width. Defaults to 32.
-            cells_embed_dim (int): Cell branch embedding width. Defaults to 64.
-            fusion_source (str): 'embedding' concatenates the two embeddings; anything else
-                concatenates the two auxiliary logits. Defaults to 'embedding'.
-            aux_loss_weight (float): Weight of each auxiliary loss. 0 disables them.
-            dropout (float): Dropout probability in both branches. Defaults to 0.5.
-
-        Returns:
-            nn.Module: A ModuleDict holding every submodule; forward() wires them together.
+        Both branches, their auxiliary heads and the fusion head, as a ModuleDict that
+        forward() wires together. fusion_source 'embedding' concatenates the two embeddings,
+        anything else the two auxiliary logits; aux_loss_weight 0 disables the auxiliary losses.
         """
         c, h, w = cell_shape
         self.n_rings = n_rings
@@ -98,17 +87,8 @@ class ModelFused(BaseBinaryClassifier):
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Splits a flat input vector back into the rings and cells branches.
-
-        Args:
-            x (Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]): Either the concatenated
-                (rings | flattened cells) tensor or an explicit (rings, cells) pair.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: (rings, cells) with cells shaped (B, C, H, W).
-
-        Raises:
-            ValueError: If a concatenated tensor has the wrong width.
+        (rings, cells) with cells shaped (B, C, H, W), from either the concatenated
+        (rings | flattened cells) tensor or an explicit (rings, cells) pair.
         """
         if isinstance(x, (tuple, list)):
             rings, cells = x
@@ -124,16 +104,7 @@ class ModelFused(BaseBinaryClassifier):
         return rings, cells
 
     def _forward_all(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Runs both branches and the fusion head.
-
-        Args:
-            x (torch.Tensor): Input batch.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (fusion logits, rings logits,
-                cells logits).
-        """
+        """Runs both branches and the fusion head: (fusion, rings, cells) logits."""
         rings, cells = self._split_inputs(x)
         net = self.network
 
@@ -151,30 +122,13 @@ class ModelFused(BaseBinaryClassifier):
         return net["fusion"](fused), logit_rings, logit_cells
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass returning the fusion logits only - the auxiliary heads exist for training.
-
-        Args:
-            x (torch.Tensor): Input batch.
-
-        Returns:
-            torch.Tensor: Fusion logits of shape (Batch, 1).
-        """
+        """The fusion logits only - the auxiliary heads exist for training."""
         return self._forward_all(x)[0]
 
     def compute_loss(
         self, batch: Tuple[torch.Tensor, torch.Tensor]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Fusion loss plus the weighted auxiliary supervision of each branch.
-
-        Args:
-            batch (Tuple[torch.Tensor, torch.Tensor]): (features, targets).
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (loss, fusion probabilities,
-                integer targets).
-        """
+        """Fusion loss plus the weighted auxiliary supervision of each branch."""
         x, y = batch
         y = y.unsqueeze(1).float()
 

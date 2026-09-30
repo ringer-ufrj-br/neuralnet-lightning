@@ -4,10 +4,10 @@ Shared training/evaluation pipeline.
 The pipeline is split into two independent phases so that they can be run as separate
 commands, on different machines and at different times:
 
-* `train`    - loads data, fits the preprocessor on the training rows only, runs the K-Fold
+* `train`    - loads data, fits the preprocessor on the whole region, runs the K-Fold
                cross-validation and persists everything an evaluation needs: one checkpoint
-               per fold under a fixed name, the preprocessor, each fold's validation indices and
-               a manifest describing the dataset the split was derived from.
+               per fold under a fixed name, the preprocessor, and each fold's validation
+               indices.
 * `evaluate` - reloads those artefacts, re-runs inference over the whole region for every fold,
                persists the raw scores and produces the per-fold metrics, the plots and the
                region's slice of the cross-validation table.
@@ -17,52 +17,36 @@ requires retraining, and the numbers that end up in the table always come from a
 that is on disk and addressable.
 """
 
-import hashlib
+import glob
 import json
 import logging
 import os
-import sys
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
+import joblib
 import numpy as np
 import pandas as pd
+import polars
 import pytorch_lightning as pl
 import torch
 
-logger = logging.getLogger(__name__)
-
-# Ensure root directory is in path for imports
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
-
-from ai.loader.loader import DataLoader
-from ai.label.label_generator import LabelGenerator
-from ai.trainer.trainer import ModelTrainer
+from ai.trainer.trainer import MONITOR, ModelTrainer
 from ai.evaluation.monitor import ModelMonitor
-from ai.evaluation.summary import (
-    DEFAULT_OPERATING_POINTS,
-    ModelSummary,
-    compute_metrics,
-    compute_operating_points,
-)
-from ai.binning.kinematics import bin_filter_expr, bin_label, bin_description
+from ai.evaluation.summary import DEFAULT_OPERATING_POINTS, compute_metrics, compute_operating_points
+from ai.binning import kinematics
+from ai.label.label_generator import validate_files
+from ai.preprocess.base import ET, ETA, LABEL, ROW_ID, DatasetSchema
 
-MANIFEST_VERSION = 1
+logger = logging.getLogger(__name__)
 
 
 def _atomic_write_json(payload: Dict[str, Any], filepath: str) -> str:
     """
     Writes JSON via a temporary file plus os.replace.
 
-    Under SLURM every fold of a region is its own process writing the same manifest; a plain
-    open()/write() lets a reader observe a half-written file. os.replace is atomic on POSIX,
-    so a reader always sees either the old or the new complete file.
-
-    Args:
-        payload (Dict[str, Any]): JSON-serialisable content.
-        filepath (str): Destination path.
-
-    Returns:
-        str: The written path.
+    Under SLURM these sidecars are written by many processes at once and read by the step that
+    follows; a plain open()/write() lets a reader observe a half-written file. os.replace is
+    atomic on POSIX, so a reader always sees either the old or the new complete file.
     """
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     tmp_path = f"{filepath}.tmp.{os.getpid()}"
@@ -78,7 +62,8 @@ class BasePipeline:
 
     Subclasses declare the model class and the preprocessor, plus whatever model kwargs are
     derived from the feature array; everything else - data loading, kinematic binning, the
-    cross-validation, artefact persistence, scoring and reporting - is common.
+    cross-validation, artefact persistence, scoring and reporting - is common. A preprocessor
+    that needs constructor arguments is declared as `functools.partial(PreprocessX, ...)`.
     """
 
     #: LightningModule subclass this pipeline trains (a BaseBinaryClassifier subclass).
@@ -90,15 +75,10 @@ class BasePipeline:
     #: Registry name, set by @register_pipeline. Also the results/<NAME>/ directory.
     model_name: str = "Model"
 
-    #: Metric monitored by EarlyStopping/ModelCheckpoint, and its improvement direction.
-    monitor_metric: str = "val_sp"
-    monitor_mode: str = "max"
-
     def __init__(
         self,
-        data_path: Optional[str] = None,
-        max_files: Optional[int] = None,
-        label_col: str = 'label',
+        schema: Optional[DatasetSchema] = None,
+        results_root: str = "results",
         max_epochs: int = 20,
         batch_size: int = 32,
         patience: int = 5,
@@ -108,48 +88,39 @@ class BasePipeline:
         eta_bin: Optional[int] = None
     ) -> None:
         """
-        Initializes the pipeline and resolves the results directory for this kinematic region.
+        Resolves the results directory for this kinematic region.
 
-        Args:
-            data_path (Optional[str]): Data folder or pattern path.
-            max_files (Optional[int]): Maximum number of files to process per folder.
-            label_col (str): Column name containing labels. Defaults to 'label'.
-            max_epochs (int): Maximum training epochs. Defaults to 20.
-            batch_size (int): Training batch size. Defaults to 32.
-            patience (int): Early stopping patience. Defaults to 5.
-            accelerator (str): PyTorch Lightning accelerator ('auto', 'cpu', 'cuda'). Defaults to 'auto'.
-            devices (Union[int, str, List[int]]): Devices specification. Defaults to 'auto'.
-            et_bin (Optional[int]): Et bin index (0-4, see ai.binning.kinematics). Trains on the
-                whole dataset when None (together with eta_bin) or on only that kinematic slice
-                when both are set - the standard 5x5=25-network Ringer scheme. Defaults to None.
-            eta_bin (Optional[int]): |eta| bin index (0-4). Defaults to None.
+        Nothing here knows the dataset's column names: the schema (the mc25 layout by default)
+        translates whatever is on disk into the canonical `label` / `et` / `eta` / `ring_i`
+        vocabulary every stage below works in.
 
-        Raises:
-            ValueError: If exactly one of et_bin/eta_bin is set.
+        Artefacts go to `<results_root>/<model>/<region>`. Give each dataset its own root: the
+        region directories are named after bin *indices*, so two datasets sharing a root would
+        silently overwrite each other's identically-named regions. With et_bin and eta_bin both
+        None the pipeline covers the whole dataset; with both set, only that kinematic slice -
+        the Ringer one-network-per-region scheme. Raises ValueError if exactly one is set or
+        the region is outside the grid.
         """
         if (et_bin is None) != (eta_bin is None):
             raise ValueError("❌ et_bin and eta_bin must be set together (or both left as None).")
 
-        self.label_col = label_col
-        self.data_path = data_path
-        self.max_files = max_files
+        self.schema = schema or DatasetSchema()
         self.et_bin = et_bin
         self.eta_bin = eta_bin
 
-        self.results_dir = os.path.join("results", self.model_name)
+        self.results_dir = os.path.join(results_root, self.model_name)
         if et_bin is not None:
-            self.results_dir = os.path.join(self.results_dir, bin_label(et_bin, eta_bin))
-            logger.info(f"🎯 Kinematic bin selected: {bin_description(et_bin, eta_bin)}")
+            kinematics.validate(et_bin, eta_bin)
+            self.results_dir = os.path.join(self.results_dir, kinematics.bin_label(et_bin, eta_bin))
+            logger.info(f"🎯 Kinematic bin selected: {kinematics.bin_description(et_bin, eta_bin)}")
 
         self.artifacts_dir = os.path.join(self.results_dir, "artifacts")
         self.checkpoints_dir = os.path.join(self.results_dir, "checkpoints")
         self.history_dir = os.path.join(self.results_dir, "history")
         self.scores_dir = os.path.join(self.results_dir, "scores")
-        self.manifest_path = os.path.join(self.artifacts_dir, "manifest.json")
         self.preprocessor_path = os.path.join(self.artifacts_dir, "preprocessor.joblib")
 
-        self.loader = DataLoader(data_path=data_path, max_files=max_files)
-        self.preprocessor = self.build_preprocessor()
+        self.preprocessor = self.preprocessor_class()
 
         self.trainer = ModelTrainer(
             max_epochs=max_epochs,
@@ -158,192 +129,83 @@ class BasePipeline:
             log_dir=os.path.join(self.results_dir, "lightning_logs"),
             checkpoint_dir=self.checkpoints_dir,
             accelerator=accelerator,
-            devices=devices,
-            monitor_metric=self.monitor_metric,
-            monitor_mode=self.monitor_mode
+            devices=devices
         )
 
         self.monitor = ModelMonitor(output_dir=os.path.join(self.results_dir, "plots"))
-        self.summary = ModelSummary(output_dir=os.path.join(self.results_dir, "metrics"))
 
     # ------------------------------------------------------------------ hooks
 
-    def build_preprocessor(self) -> Any:
-        """
-        Builds the preprocessor for this architecture. The default instantiates
-        `preprocessor_class` with no arguments; override only if it needs constructor
-        arguments.
-
-        Returns:
-            Any: A fresh, unfitted preprocessor instance.
-
-        Raises:
-            NotImplementedError: If the subclass declares neither preprocessor_class nor an
-                override.
-        """
-        if getattr(self, "preprocessor_class", None) is None:
-            raise NotImplementedError(
-                f"{type(self).__name__} must set preprocessor_class or override "
-                f"build_preprocessor()."
-            )
-        return self.preprocessor_class()
-
     def build_model_kwargs(self, X: np.ndarray) -> Dict[str, Any]:
         """
-        Builds the constructor kwargs for the model, given the (already preprocessed) training
-        feature array - this is where an architecture picks up e.g. its input dimension.
-
-        Args:
-            X (np.ndarray): Preprocessed training features.
-
-        Returns:
-            Dict[str, Any]: Keyword arguments for model_class.
+        Constructor kwargs for the model, given the (already preprocessed) training feature
+        array - this is where an architecture picks up e.g. its input dimension.
         """
         return {}
 
-    def required_columns(self, available: List[str]) -> Optional[List[str]]:
-        """
-        Declares which dataset columns this architecture actually consumes, so the loader can
-        prune everything else at the parquet scan (the raw files carry 300+ columns, most of
-        them nested calorimeter images no MLP-style model ever touches - loading them all is
-        what used to exhaust memory on full-dataset runs).
-
-        Args:
-            available (List[str]): Column names present in the dataset files.
-
-        Returns:
-            Optional[List[str]]: Columns to load, or None to load every column.
-        """
-        return self.preprocessor.required_columns(available)
-
     # ------------------------------------------------------------------ data
 
-    def load_dataframe(self) -> Optional[pd.DataFrame]:
+    def load_dataframe(self) -> Optional[polars.DataFrame]:
         """
-        Loads the dataset, attaches labels and applies the kinematic bin cut.
+        Loads the dataset in the canonical column vocabulary and applies the kinematic cut, or
+        returns None when nothing could be loaded.
 
-        Runs as a single lazy polars query - column projection, per-file labelling and the
-        bin filter all happen inside the streaming parquet scan - so peak memory is bound by
-        the selected columns of the selected rows, never by the full dataset.
+        Runs as a single lazy polars query - the join with any side table, the column
+        projection, the label derivation and the region filter all happen inside the streaming
+        parquet scan - so peak memory is bound by the selected columns of the selected rows,
+        never by the full dataset. A ring stored as element `i` of a nested list is projected
+        exactly like one stored in its own column, so the layout costs nothing either way.
 
         Deterministic given the same files on disk, which is what lets `train` and `evaluate`
         run as separate processes over the same row ordering.
-
-        Returns:
-            Optional[pd.DataFrame]: The prepared DataFrame, or None when nothing could be loaded.
         """
         logger.info("📂 Loading dataset...")
-        files = self.loader.get_files()
+        files = self.schema.files()
         if not files:
             logger.error("❌ No data was loaded.")
             return None
 
-        LabelGenerator.validate_files(files)
+        if self.schema.needs_file_paths:
+            validate_files(files)
 
-        lazy_frame = self.loader.scan(files)
-        available = [name for name in lazy_frame.collect_schema().names() if name != 'file_path']
+        lazy_frame = self.schema.scan(files)
+        available = self.schema.canonical_columns(lazy_frame.collect_schema().names())
 
-        logger.info("🏷️ Generating labels...")
-        lazy_frame = lazy_frame.with_columns(
-            LabelGenerator.label_expr(file_path_col='file_path', label_col=self.label_col)
-        )
-
-        columns = self.required_columns(available)
-        if columns is not None:
-            keep = list(dict.fromkeys(
-                list(columns)
-                + [col for col in ('cl_et', 'cl_eta') if col in available]
-                + [self.label_col]
-            ))
-            logger.info(f"🔎 Projecting scan down to {len(keep)} of {len(available)} columns.")
-            lazy_frame = lazy_frame.select(keep)
-        else:
-            lazy_frame = lazy_frame.drop('file_path')
+        columns = self.preprocessor.required_columns(available)
+        if columns is None:
+            columns = [name for name in available if name != LABEL]
+        keep = list(dict.fromkeys(
+            list(columns)
+            + [name for name in (ET, ETA, ROW_ID) if name in available]
+            + [LABEL]
+        ))
+        logger.info(f"🔎 Projecting scan down to {len(keep)} canonical column(s).")
+        lazy_frame = self.schema.project(lazy_frame, keep)
 
         if self.et_bin is not None:
-            logger.info(f"✂️ Restricting to kinematic bin {bin_label(self.et_bin, self.eta_bin)} "
-                        f"({bin_description(self.et_bin, self.eta_bin)})...")
-            lazy_frame = lazy_frame.filter(bin_filter_expr(self.et_bin, self.eta_bin))
+            logger.info(f"✂️ Restricting to kinematic bin {kinematics.bin_label(self.et_bin, self.eta_bin)} "
+                        f"({kinematics.bin_description(self.et_bin, self.eta_bin)})...")
+            lazy_frame = lazy_frame.filter(kinematics.filter_expr(self.et_bin, self.eta_bin, ET, ETA))
 
-        df = lazy_frame.collect(engine="streaming").to_pandas()
+        df = lazy_frame.collect(engine="streaming")
 
-        if df.empty:
+        if df.is_empty():
             if self.et_bin is not None:
                 logger.error("❌ No data remaining after kinematic binning.")
             else:
                 logger.error("❌ No data was loaded.")
             return None
 
+        # The label is always cast to Int8 (DatasetSchema.label_expr), so null is its only
+        # "missing" value.
+        if missing := df[LABEL].null_count():
+            raise RuntimeError(
+                f"❌ {missing} row(s) have no label. Check "
+                f"dataset.label in the config against the dataset's actual contents."
+            )
+
         logger.info(f"   {len(df)} rows loaded.")
         return df
-
-    def dataset_fingerprint(self, df: pd.DataFrame, Y: np.ndarray) -> Dict[str, Any]:
-        """
-        Describes the exact dataset the fold indices were drawn from, so `evaluate` can
-        refuse to run against a different one.
-
-        The parquet rows carry no stable physical key - (run_number, event_number, cl_idx)
-        repeats heavily across files - so rows can only be referenced positionally.
-        That makes this fingerprint the guard rail: it pins the file list, the row/class
-        counts and an order-sensitive row digest; a mismatch means the positional indices no
-        longer point at the same rows.
-
-        The row digest hashes the label sequence and the cl_et sequence in row order. Counts
-        alone are permutation-invariant, and labels alone are constant within each source file
-        (they derive from the file path), so only a per-row quantity like cl_et makes a
-        reordering *inside* a file - which streaming collects are in principle free to do -
-        detectable.
-
-        Args:
-            df (pd.DataFrame): The loaded DataFrame.
-            Y (np.ndarray): The label array.
-
-        Returns:
-            Dict[str, Any]: Fingerprint fields.
-        """
-        files = sorted(self.loader.get_files())
-        digest = hashlib.sha1("\n".join(files).encode()).hexdigest()
-
-        row_hasher = hashlib.sha1(np.ascontiguousarray(Y, dtype=np.int8).tobytes())
-        if 'cl_et' in df.columns:
-            row_hasher.update(np.ascontiguousarray(df['cl_et'].to_numpy(), dtype=np.float32).tobytes())
-
-        return {
-            "data_path": self.data_path,
-            "max_files": self.max_files,
-            "n_files": len(files),
-            "files_sha1": digest,
-            "n_rows": int(len(df)),
-            "n_positives": int((Y == 1).sum()),
-            "n_negatives": int((Y == 0).sum()),
-            "rows_sha1": row_hasher.hexdigest(),
-        }
-
-    @staticmethod
-    def _check_fingerprint(stored: Dict[str, Any], current: Dict[str, Any]) -> None:
-        """
-        Compares two dataset fingerprints and raises on any difference that would invalidate
-        the stored positional fold indices.
-
-        Args:
-            stored (Dict[str, Any]): Fingerprint recorded at training time.
-            current (Dict[str, Any]): Fingerprint of the data just loaded.
-
-        Raises:
-            RuntimeError: If the fingerprints disagree.
-        """
-        blocking = ["n_rows", "n_files", "files_sha1", "n_positives", "n_negatives", "rows_sha1"]
-        differences = [
-            f"{key}: trained on {stored.get(key)!r}, now {current.get(key)!r}"
-            for key in blocking
-            if stored.get(key) != current.get(key)
-        ]
-        if differences:
-            raise RuntimeError(
-                "❌ The dataset changed since training, so the stored fold indices no longer "
-                "identify the same rows:\n  - " + "\n  - ".join(differences) +
-                "\n   Re-run `train` for this region before evaluating."
-            )
 
     # ------------------------------------------------------------------ train
 
@@ -353,78 +215,55 @@ class BasePipeline:
         learning_rate: float = 0.001,
         target_fold: Optional[int] = None,
         seed: int = 42,
-        n_inits: int = 1
-    ) -> List[Dict[str, Any]]:
+        n_inits: int = 1,
+        target_init: Optional[int] = None
+    ) -> None:
         """
         Trains the cross-validation folds and persists every artefact `evaluate` will need.
 
-        No metrics, plots or tables are produced here - training's only job is to leave behind
-        reproducible models. Safe to run as N parallel single-fold jobs: the split is a pure
-        function of (data, seed), the shared artefacts are written atomically with identical
-        content, and each fold owns its own checkpoint and sidecar.
-
-        Args:
-            n_splits (int): Number of K-Fold splits. Defaults to 5.
-            learning_rate (float): Model learning rate. Defaults to 0.001.
-            target_fold (Optional[int]): Train only this fold (1-indexed), for SLURM parallelism.
-            seed (int): Seed for the fold partition. Defaults to 42.
-            n_inits (int): Independent initialisations per fold; the best is kept. Defaults to 1.
-
-        Returns:
-            List[Dict[str, Any]]: The fold records returned by ModelTrainer.fit_kfold.
+        No metrics, plots or tables are produced here, and nothing is picked or discarded:
+        training's only job is to leave behind reproducible models, every (fold, init) pair
+        under its own `fold_N_init_M` name. Choosing each fold's best initialisation is up to
+        `evaluate`. Safe to run as parallel single-(fold, init) jobs: the split is a pure
+        function of (data, seed), the shared artefacts are written with identical content, and
+        each (fold, init) owns its own checkpoint and sidecar.
         """
         logger.info(f"🚀 Starting training: {self.model_name} ({self.region_label()})")
 
         df = self.load_dataframe()
         if df is None:
-            return []
+            return
 
-        Y = self.preprocessor.get_labels(df, label_col=self.label_col)
-        if Y is None:
-            logger.error("❌ Labels column not found.")
-            return []
+        Y = df[LABEL].cast(polars.Float32).to_numpy()
 
         # The k-fold partition is the whole scheme: k-1 partitions train and 1 validates, which
         # is what drives early stopping and the choice between initialisations. There is no
         # separate holdout, because `evaluate` scores every fold over the full region anyway.
         logger.info(f"✂️ Stratified {n_splits}-fold partition over {len(df)} rows.")
         X_all = self.preprocessor.fit_transform(df)
+        # Everything training needs is in X_all and Y now; the frame would otherwise stay
+        # resident, as large as X_all itself, for the whole of training.
+        del df
 
         os.makedirs(self.artifacts_dir, exist_ok=True)
-        self.preprocessor.save(self.preprocessor_path)
-
-        _atomic_write_json({
-            "manifest_version": MANIFEST_VERSION,
-            "model": self.model_name,
-            "model_class": self.model_class.__name__,
-            "et_bin": self.et_bin,
-            "eta_bin": self.eta_bin,
-            "region": self.region_label(),
-            "label_col": self.label_col,
-            "seed": seed,
-            "n_splits": n_splits,
-            "n_inits": n_inits,
-            "learning_rate": learning_rate,
-            "monitor_metric": self.monitor_metric,
-            "n_rows": int(len(df)),
-            "dataset": self.dataset_fingerprint(df, Y),
-            "preprocessor": os.path.relpath(self.preprocessor_path, self.results_dir),
-        }, self.manifest_path)
-        logger.info(f"📄 Wrote manifest: {self.manifest_path}")
+        joblib.dump(self.preprocessor, self.preprocessor_path)
+        logger.info(f"💾 Saved preprocessor to: {self.preprocessor_path}")
 
         model_kwargs = {'learning_rate': learning_rate, **self.build_model_kwargs(X_all)}
         logger.info(f"🏋️ Training {n_splits} folds (kwargs={model_kwargs}, weighted loss enabled)...")
 
-        fold_records = self.trainer.fit_kfold(
+        records = self.trainer.fit_kfold(
             self.model_class, model_kwargs, X_all, Y,
-            n_splits=n_splits, target_fold=target_fold, seed=seed, n_inits=n_inits
+            n_splits=n_splits, target_fold=target_fold, seed=seed, n_inits=n_inits,
+            target_init=target_init
         )
 
         os.makedirs(self.history_dir, exist_ok=True)
-        for record in fold_records:
+        for record in records:
             fold = record["fold"]
+            stem = f"fold_{fold}_init_{record['init']}"
 
-            history_path = os.path.join(self.history_dir, f"fold_{fold}.csv")
+            history_path = os.path.join(self.history_dir, f"{stem}.csv")
             loss_callback = record["loss_callback"]
             pd.DataFrame({
                 "epoch": range(max(len(loss_callback.train_loss), len(loss_callback.val_loss))),
@@ -434,63 +273,47 @@ class BasePipeline:
 
             # The rows this fold validated on rather than trained on. Evaluation scores every
             # row regardless, so these only mark which predictions are out of sample.
-            val_rel = None
-            if record.get("val_ids") is not None:
-                val_path = os.path.join(self.artifacts_dir, f"val_indices_fold_{fold}.npy")
-                np.save(val_path, np.sort(record["val_ids"]))
-                val_rel = os.path.relpath(val_path, self.results_dir)
+            val_path = os.path.join(self.artifacts_dir, f"val_indices_fold_{fold}.npy")
+            np.save(val_path, np.sort(record["val_ids"]))
 
             _atomic_write_json({
                 "fold": fold,
+                "init": record["init"],
                 "checkpoint": os.path.relpath(record["checkpoint"], self.results_dir),
-                "val_indices": val_rel,
-                "n_inits": record.get("n_inits", 1),
-                "best_init": record.get("best_init", 1),
+                "val_indices": os.path.relpath(val_path, self.results_dir),
                 "pos_weight": record["pos_weight"],
                 "best_score": record["best_score"],
-                "monitor_metric": self.monitor_metric,
+                "monitor_metric": MONITOR,
                 "epochs": record["epochs"],
                 "n_train": record["n_train"],
                 "n_val": record["n_val"],
-                "model_kwargs": {k: v for k, v in model_kwargs.items()},
+                "model_kwargs": model_kwargs,
                 "history": os.path.relpath(history_path, self.results_dir),
-            }, os.path.join(self.checkpoints_dir, f"fold_{fold}.json"))
+            }, os.path.join(self.checkpoints_dir, f"{stem}.json"))
 
         logger.info(f"✅ Training complete. Artefacts under: {self.results_dir}")
-        logger.info(f"   Next: python ai/run.py evaluate {self.cli_region_args()}")
-        return fold_records
+        logger.info(f"   Next, once every training of this region has finished: "
+                    f"python ai/run.py evaluate {self.cli_region_args()}")
 
     # --------------------------------------------------------------- evaluate
 
     def evaluate(
         self,
-        threshold: float = 0.5,
         operating_points: Optional[Dict[str, float]] = None,
         reuse_scores: bool = False,
         make_plots: bool = True
-    ) -> pd.DataFrame:
+    ) -> None:
         """
-        Scores every trained fold over the whole region and writes its metrics, plots and
-        its slice of the cross-validation table.
+        Scores every trained fold over the whole region and writes its metrics, plots and its
+        slice of the cross-validation table (see ai.evaluation.pd_table.LONG_COLUMNS).
 
-        Args:
-            threshold (float): Fixed decision threshold for the global metric set. Defaults to 0.5.
-            operating_points (Optional[Dict[str, float]]): Working point name -> target PD.
-                Defaults to {"tight": 0.90, "medium": 0.95, "loose": 0.99}.
-            reuse_scores (bool): Skip inference and read `scores/fold_N.parquet` written by an
-                earlier evaluation. Lets working points and plots be recut in seconds without
-                touching the data or the GPU. Defaults to False.
-            make_plots (bool): Whether to render the ROC/PR/confusion/loss figures. Defaults to True.
-
-        Returns:
-            pd.DataFrame: This region's long-format table (see ai.evaluation.pd_table.LONG_COLUMNS).
-
-        Raises:
-            FileNotFoundError: If the region has not been trained yet.
-            RuntimeError: If the dataset no longer matches the one training split.
+        `operating_points` maps working point name -> target PD (tight/medium/loose at
+        90/95/99% by default). `reuse_scores` skips inference and reads the
+        `scores/fold_N.parquet` of an earlier evaluation, so working points and plots can be
+        recut in seconds without touching the data or the GPU. Raises FileNotFoundError if the
+        region has not been trained yet.
         """
         operating_points = operating_points or DEFAULT_OPERATING_POINTS
-        manifest = self.load_manifest()
         fold_infos = self.load_fold_infos()
 
         if not fold_infos:
@@ -499,70 +322,43 @@ class BasePipeline:
             )
 
         logger.info(f"📊 Evaluating {self.model_name} ({self.region_label()}): "
-                    f"{len(fold_infos)} fold(s), threshold={threshold}")
+                    f"{len(fold_infos)} fold(s)")
 
-        fold_scores = self._collect_scores(manifest, fold_infos, reuse_scores)
+        fold_scores = self._collect_scores(fold_infos, reuse_scores)
 
-        metric_rows, operating_rows, long_rows = [], [], []
+        long_rows = []
         for fold in sorted(fold_scores):
             y_true, y_prob = fold_scores[fold]
-            pos_weight = fold_infos[fold].get("pos_weight")
+            metrics = compute_metrics(y_true, y_prob)
 
-            metrics = compute_metrics(y_true, y_prob, threshold=threshold, pos_weight=pos_weight)
-            metric_rows.append({"Fold": fold, **metrics})
-
-            points = compute_operating_points(y_true, y_prob, operating_points)
-            for point in points:
-                operating_rows.append({"Fold": fold, **point})
-                long_rows.append({
-                    "model": self.model_name,
-                    "et_bin": self.et_bin,
-                    "eta_bin": self.eta_bin,
-                    "fold": fold,
-                    "operating_point": point["Operating_Point"],
-                    "target_pd": point["Target_PD"],
-                    "threshold": point["Threshold"],
-                    "pd": point["PD"],
-                    "fa": point["FA"],
-                    "sp": point["SP_Index"],
-                    "auc_roc": metrics["AUC_ROC"],
-                    "auc_pr": metrics["AUC_PR"],
-                    "n_signal": metrics["N_Positives"],
-                    "n_background": metrics["N_Negatives"],
-                })
+            for point in compute_operating_points(y_true, y_prob, operating_points):
+                long_rows.append({"model": self.model_name, "et_bin": self.et_bin,
+                                  "eta_bin": self.eta_bin, "fold": fold, **point, **metrics})
                 logger.info(
-                    f"   fold {fold} {point['Operating_Point']:<7} PD={point['PD']:.4f} "
-                    f"(target {point['Target_PD']:.2f}) -> FA={point['FA']:.4f}, "
-                    f"SP={point['SP_Index']:.4f}, threshold={point['Threshold']:.4f}"
+                    f"   fold {fold} {point['operating_point']:<7} PD={point['pd']:.4f} "
+                    f"(target {point['target_pd']:.2f}) -> FA={point['fa']:.4f}, "
+                    f"SP={point['sp']:.4f}, threshold={point['threshold']:.4f}"
                 )
 
-        self.summary.save_metrics(metric_rows, filename="per_fold.csv")
-        self.summary.save_operating_points(operating_rows, filename="operating_points.csv")
-        long_df = self.summary.save_long_table(long_rows, filename="folds_long.csv")
+        metrics_dir = os.path.join(self.results_dir, "metrics")
+        os.makedirs(metrics_dir, exist_ok=True)
+        long_path = os.path.join(metrics_dir, "folds_long.csv")
+        pd.DataFrame(long_rows).to_csv(long_path, index=False)
+        logger.info(f"📝 Saved long-format fold table ({len(long_rows)} rows) to: {long_path}")
 
         if make_plots:
-            self._render_plots(fold_scores, threshold, operating_points)
+            self._render_plots(fold_scores, operating_points, fold_infos)
 
         logger.info(f"✅ Evaluation complete. Results under: {self.results_dir}")
-        return long_df
 
     def _collect_scores(
         self,
-        manifest: Dict[str, Any],
         fold_infos: Dict[int, Dict[str, Any]],
         reuse_scores: bool
     ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
         """
-        Produces (y_true, y_prob) for every fold, either by reloading cached score files or by
-        running each fold's checkpoint over the full region (in-sample rows included).
-
-        Args:
-            manifest (Dict[str, Any]): The training manifest.
-            fold_infos (Dict[int, Dict[str, Any]]): Per-fold sidecars, keyed by fold number.
-            reuse_scores (bool): Read cached scores instead of re-running inference.
-
-        Returns:
-            Dict[int, Tuple[np.ndarray, np.ndarray]]: Mapping fold -> (y_true, y_prob).
+        (y_true, y_prob) for every fold, either by reloading cached score files or by running
+        each fold's checkpoint over the full region (in-sample rows included).
         """
         if reuse_scores:
             cached = {}
@@ -579,11 +375,8 @@ class BasePipeline:
         if df is None:
             raise RuntimeError("❌ No data was loaded; cannot evaluate.")
 
-        Y = self.preprocessor.get_labels(df, label_col=self.label_col)
-        self._check_fingerprint(manifest.get("dataset", {}), self.dataset_fingerprint(df, Y))
-
-        preprocessor = type(self.preprocessor).load(os.path.join(self.results_dir, manifest["preprocessor"]))
-        self.preprocessor = preprocessor
+        self.preprocessor = joblib.load(self.preprocessor_path)
+        logger.info(f"📂 Loaded preprocessor from: {self.preprocessor_path}")
 
         # Every fold is scored over the WHOLE region, in-sample rows included. Train and
         # validation are separated during training - that is what drives early stopping and
@@ -591,28 +384,21 @@ class BasePipeline:
         # space rather than only each fold's held-out partition. The `in_sample` column below
         # records which rows the fold trained on, so an out-of-sample-only cut stays available
         # to anyone who wants it.
-        y_true = Y.flatten()
-        X_all = preprocessor.transform(df)
+        y_true = df[LABEL].cast(polars.Float32).to_numpy()
+        X_all = self.preprocessor.transform(df)
         logger.info(f"🧾 Scoring the full region: {len(y_true)} rows "
                     f"({int((y_true == 1).sum())} signal, {int((y_true == 0).sum())} background).")
 
         # Kept alongside the scores so the table can be re-cut per kinematic region later
         # without re-running inference.
-        kinematics = {
+        kinematic_columns = {
             column: df[column].to_numpy()
-            for column in ("cl_et", "cl_eta") if column in df.columns
+            for column in (ET, ETA, ROW_ID) if column in df.columns
         }
+        del df  # the rest of the frame is not needed for inference
 
         def out_of_sample_mask(fold: int) -> Optional[np.ndarray]:
-            """
-            Boolean mask of the rows this fold did NOT train on, or None when unknown.
-
-            Args:
-                fold (int): Fold number.
-
-            Returns:
-                Optional[np.ndarray]: True where the row was held out from this fold's training.
-            """
+            """True where the row was held out from this fold's training; None when unknown."""
             rel = fold_infos[fold].get("val_indices")
             if not rel:
                 return None
@@ -631,7 +417,8 @@ class BasePipeline:
                 logger.warning(f"⚠️ Fold {fold}: checkpoint '{checkpoint}' is missing; skipping.")
                 continue
 
-            logger.info(f"🧠 Fold {fold}: loading {checkpoint}")
+            logger.info(f"🧠 Fold {fold}: best initialisation is {checkpoint} "
+                        f"({MONITOR}={fold_infos[fold].get('best_score')})")
             # pos_weight is excluded from save_hyperparameters (it is a training-time buffer,
             # not architecture), so Lightning cannot rebuild it from the checkpoint's hparams
             # and the state_dict keys would not match. Feed it back from the fold sidecar.
@@ -642,7 +429,7 @@ class BasePipeline:
             scores[fold] = (y_true, y_prob)
 
             held_out = out_of_sample_mask(fold)
-            columns = {"y_true": y_true, "y_prob": y_prob, **kinematics}
+            columns = {"y_true": y_true, "y_prob": y_prob, **kinematic_columns}
             if held_out is not None:
                 columns["in_sample"] = ~held_out
                 logger.info(f"   fold {fold}: {int(held_out.sum())} of {len(y_true)} rows were out of sample")
@@ -655,18 +442,9 @@ class BasePipeline:
 
     def _predict(self, model: pl.LightningModule, X: np.ndarray, batch_size: int = 8192) -> np.ndarray:
         """
-        Runs batched inference and returns post-sigmoid probabilities.
-
-        Batched rather than in one shot because a region can be tens of millions of rows,
-        which would not fit in memory as a single forward pass.
-
-        Args:
-            model (pl.LightningModule): Trained model, already restored from a checkpoint.
-            X (np.ndarray): Preprocessed features.
-            batch_size (int): Inference batch size. Defaults to 8192.
-
-        Returns:
-            np.ndarray: Probabilities, shape (N,).
+        Post-sigmoid probabilities, shape (N,). Batched rather than in one shot because a
+        region can be tens of millions of rows, which would not fit in memory as a single
+        forward pass.
         """
         model.eval()
         outputs = []
@@ -679,31 +457,27 @@ class BasePipeline:
     def _render_plots(
         self,
         fold_scores: Dict[int, Tuple[np.ndarray, np.ndarray]],
-        threshold: float,
-        operating_points: Dict[str, float]
+        operating_points: Dict[str, float],
+        fold_infos: Dict[int, Dict[str, Any]]
     ) -> None:
-        """
-        Renders the per-fold figures plus the fold-overlay ROC for this region.
-
-        Args:
-            fold_scores (Dict[int, Tuple[np.ndarray, np.ndarray]]): Mapping fold -> (y_true, y_prob).
-            threshold (float): Decision threshold used for the confusion matrix.
-            operating_points (Dict[str, float]): Working point name -> target PD.
-        """
+        """Renders the per-fold figures plus the fold-overlay ROC for this region."""
         logger.info(f"🖼️ Rendering plots into {self.monitor.output_dir}...")
         for fold in sorted(fold_scores):
             y_true, y_prob = fold_scores[fold]
             points = compute_operating_points(y_true, y_prob, operating_points)
+            # The confusion matrix needs one cut; the tightest working point is the one the
+            # trigger would actually run at, so it is the cut worth picturing.
+            cut = min(points, key=lambda point: point["target_pd"])["threshold"]
 
             self.monitor.plot_roc_curve(y_true, y_prob, filename=f"roc_curve_fold_{fold}.pdf", operating_points=points)
             self.monitor.plot_pr_curve(y_true, y_prob, filename=f"pr_curve_fold_{fold}.pdf")
             self.monitor.plot_confusion_matrix(
-                y_true, (y_prob >= threshold).astype(int),
+                y_true, (y_prob >= cut).astype(int),
                 filename=f"confusion_matrix_fold_{fold}.pdf"
             )
 
-            history_path = os.path.join(self.history_dir, f"fold_{fold}.csv")
-            if os.path.exists(history_path):
+            history_path = os.path.join(self.results_dir, fold_infos[fold].get("history", ""))
+            if os.path.isfile(history_path):
                 history = pd.read_csv(history_path)
                 self.monitor.plot_loss(
                     history["train_loss"].dropna().tolist(),
@@ -720,62 +494,28 @@ class BasePipeline:
 
     # ----------------------------------------------------------------- shared
 
-    def load_manifest(self) -> Dict[str, Any]:
-        """
-        Reads the training manifest for this region.
-
-        Returns:
-            Dict[str, Any]: The manifest contents.
-
-        Raises:
-            FileNotFoundError: If this region has not been trained.
-        """
-        if not os.path.exists(self.manifest_path):
-            raise FileNotFoundError(
-                f"❌ No manifest at '{self.manifest_path}'. Run `train` for this region first."
-            )
-        with open(self.manifest_path) as handle:
-            return json.load(handle)
-
     def load_fold_infos(self) -> Dict[int, Dict[str, Any]]:
         """
-        Reads the per-fold sidecars written by train().
-
-        Each fold owns its own file rather than sharing one manifest entry, so N parallel
-        single-fold SLURM jobs never contend over the same file.
-
-        Returns:
-            Dict[int, Dict[str, Any]]: Mapping fold number -> sidecar contents.
+        The sidecar of each fold's best initialisation - the highest monitored score - keyed by
+        fold number. Training keeps every (fold, init) model; this is where one is picked per
+        fold. A single `fold_N.json` left by older versions counts as that fold's only init.
         """
-        infos = {}
-        if not os.path.isdir(self.checkpoints_dir):
-            return infos
-        for name in sorted(os.listdir(self.checkpoints_dir)):
-            if not name.startswith("fold_") or not name.endswith(".json"):
-                continue
-            with open(os.path.join(self.checkpoints_dir, name)) as handle:
+        candidates: Dict[int, List[Dict[str, Any]]] = {}
+        for path in sorted(glob.glob(os.path.join(self.checkpoints_dir, "fold_*.json"))):
+            with open(path) as handle:
                 info = json.load(handle)
-            infos[int(info["fold"])] = info
-        return infos
+            candidates.setdefault(int(info["fold"]), []).append(info)
+        return {fold: max(infos, key=lambda info: info.get("best_score") or 0.0)
+                for fold, infos in sorted(candidates.items())}
 
     def region_label(self) -> str:
-        """
-        Human-readable label of the kinematic region this pipeline instance covers.
-
-        Returns:
-            str: e.g. 'et2_eta0' or 'full phase space'.
-        """
+        """Human-readable label of this region, e.g. 'et2_eta0' or 'full phase space'."""
         if self.et_bin is None:
             return "full phase space"
-        return bin_label(self.et_bin, self.eta_bin)
+        return kinematics.bin_label(self.et_bin, self.eta_bin)
 
     def cli_region_args(self) -> str:
-        """
-        The `--et-bin/--eta-bin` fragment that reproduces this region on the command line.
-
-        Returns:
-            str: e.g. '--et-bin 2 --eta-bin 0', or '' for the ungridded case.
-        """
+        """The `--et-bin/--eta-bin` fragment that reproduces this region ('' when ungridded)."""
         if self.et_bin is None:
             return ""
         return f"--et-bin {self.et_bin} --eta-bin {self.eta_bin}"
