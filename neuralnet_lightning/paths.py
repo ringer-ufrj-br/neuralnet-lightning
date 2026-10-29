@@ -1,8 +1,5 @@
 """
-Where every artefact of one run lives, derived from (results_root, experiment name, region).
-
-Kept in one dataclass so training, evaluation, the report and the shell launchers agree on the
-layout by construction instead of each joining the same strings:
+Artefact paths of one run, derived from (results_root, experiment name, region):
 
     <results_root>/<name>/<region>/
         artifacts/    preprocessor.joblib, val_indices_fold_N.npy
@@ -23,7 +20,7 @@ from neuralnet_lightning.binning import FULL_PHASE_SPACE, Region
 
 @dataclass(frozen=True)
 class RunPaths:
-    """Artefact paths of one (experiment, region). Nothing is created on construction."""
+    """Artefact paths of one (experiment, region)."""
 
     root: str
 
@@ -66,7 +63,7 @@ class RunPaths:
 
     @property
     def folds_long(self) -> str:
-        """The region's per-fold metrics table - also the 'region is evaluated' marker."""
+        """The region's per-fold metrics table; its presence marks the region as evaluated."""
         return os.path.join(self.metrics, "folds_long.csv")
 
     @staticmethod
@@ -90,7 +87,7 @@ class RunPaths:
         return os.path.join(self.scores, f"fold_{fold}.parquet")
 
     def rel(self, path: str) -> str:
-        """`path` relative to the run directory, as stored in sidecars so a tree can be moved."""
+        """`path` relative to the run directory."""
         return os.path.relpath(path, self.root)
 
     def resolve(self, rel_path: str) -> str:

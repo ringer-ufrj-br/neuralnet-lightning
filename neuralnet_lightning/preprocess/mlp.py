@@ -1,4 +1,4 @@
-"""The baseline Ringer input: the leading half of every calorimeter layer's rings, norm1."""
+"""Baseline Ringer input: the inner half of each calorimeter layer's rings, norm1."""
 
 from typing import Any, Dict, List
 
@@ -12,11 +12,7 @@ LAYER_RINGS = (8, 64, 8, 8, 4, 4, 4)
 
 
 def selected_rings() -> List[str]:
-    """
-    The leading half of each layer's rings (4 + 32 + 4 + 4 + 2 + 2 + 2 = 50), in ring order.
-    Mirrors the reference selection of prior Ringer trainings: the outer rings of a layer carry
-    little energy and mostly noise.
-    """
+    """The inner half of each layer's rings (4 + 32 + 4 + 4 + 2 + 2 + 2 = 50), in ring order."""
     names: List[str] = []
     start = 0
     for n_rings in LAYER_RINGS:
@@ -26,15 +22,7 @@ def selected_rings() -> List[str]:
 
 
 class PreprocessMLP(BasePreprocessor):
-    """
-    Cleaning and normalisation are the inherited defaults. It works in the canonical `ring_i`
-    vocabulary, so it is identical for a dataset storing one column per ring and one storing
-    all 100 in a single list column.
-
-    A different normalisation is a different input representation: subclass this and override
-    `normalize`, so the normalisation a set of checkpoints was trained under is readable from
-    the class that produced them.
-    """
+    """The selected rings, cleaned and normalised by the base class defaults."""
 
     feature_columns = selected_rings()
 

@@ -1,30 +1,20 @@
 """
-Name -> model class registry.
-
-The `model:` string in a config is looked up here, so adding an architecture never means
-editing the CLI or the pipeline. A model registers itself with a decorator:
+Registry mapping a config's `model:` name to its class:
 
     @register_model("MyNet")
     class MyNet(BaseBinaryClassifier):
         preprocessor = PreprocessMLP
         def build_network(self, input_dim: int = 50) -> nn.Module: ...
 
-Every module of neuralnet_lightning.models is imported on first lookup, so dropping the file
-into the package is enough for its decorator to run - there is no list to append to.
+Every module of neuralnet_lightning.models is imported on first lookup. A registered class
+provides (BaseBinaryClassifier implements all of them):
 
-What the task-independent core (training, evaluation, pipeline) reads from a registered class:
-
-    preprocessor    the BasePreprocessor subclass producing the model's input
-    monitor         the logged metric early stopping, checkpointing and the choice between
-                    initialisations follow; `monitor_mode` says whether higher ("max") is better
-    fold_kwargs(y)  extra constructor kwargs derived from one fold's training targets (e.g. a
-                    class weight); stored in the fold sidecar and fed back on reload
-    stratify_labels(y)  what the K-Fold stratifies on (None: plain KFold)
-    predict_scores  model input -> the scores evaluation persists
-    summarize       one region's scores -> metrics table and plots
-
-neuralnet_lightning.binary.model.BaseBinaryClassifier provides all of them for the electron x
-jet task; another task supplies its own base class and the core needs no change.
+    preprocessor        BasePreprocessor subclass producing the model input
+    monitor             metric for early stopping and checkpointing; `monitor_mode` "max" or "min"
+    fold_kwargs(y)      constructor kwargs derived from a fold's training labels
+    stratify_labels(y)  labels the K-Fold stratifies on (None: plain KFold)
+    predict_scores      model input -> scores
+    summarize           one region's scores -> metrics and plots
 """
 
 import importlib
@@ -51,11 +41,7 @@ def register_model(name: str):
 
 
 def _discover() -> None:
-    """
-    Imports every neuralnet_lightning.models module once, so their decorators populate the
-    registry. A module that fails to import is warned about rather than fatal: one broken
-    architecture must not stop the others from running.
-    """
+    """Imports every neuralnet_lightning.models module once; import failures are logged as warnings."""
     global _DISCOVERED
     if _DISCOVERED:
         return

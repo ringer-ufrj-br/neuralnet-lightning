@@ -1,8 +1,4 @@
-"""
-Task-independent half of `evaluate`: pick each fold's best initialisation, run its checkpoint
-over the whole region and persist the scores. Turning scores into figures of merit is the
-task layer's job (neuralnet_lightning.binary.summary).
-"""
+"""Selects each fold's best initialisation, scores the region with it and saves the scores."""
 
 import glob
 import json
@@ -18,16 +14,14 @@ from neuralnet_lightning.paths import RunPaths
 
 logger = logging.getLogger(__name__)
 
-#: Rows per forward pass at inference. A region can hold millions of rows, too many for one pass.
+#: Rows per forward pass at inference.
 INFERENCE_BATCH = 8192
 
 
 def best_inits(paths: RunPaths, mode: str) -> Dict[int, Dict[str, Any]]:
     """
-    The sidecar of each fold's best initialisation - by the monitored score, in `mode`
-    ("max" or "min") - keyed by fold number. Training keeps every (fold, init) model; this is
-    where one is picked per fold. An init without a score (no validation epoch completed)
-    ranks last.
+    Sidecar of each fold's best initialisation by `best_score` (`mode` "max" or "min"), keyed by
+    fold. Inits without a score rank last.
     """
     worst = float("-inf") if mode == "max" else float("inf")
     pick = max if mode == "max" else min
@@ -63,13 +57,8 @@ def score_folds(
     extra_columns: Optional[Dict[str, np.ndarray]] = None
 ) -> Dict[int, np.ndarray]:
     """
-    Scores every fold's chosen checkpoint over the WHOLE region, in-sample rows included, and
-    writes `scores/fold_N.parquet` (y_true, y_score, in_sample, plus `extra_columns`, e.g. the
-    kinematics, so the table can be re-cut later without re-running inference).
-
-    Train and validation are separated during training - that drives early stopping and model
-    selection - but the reported figures deliberately cover the full phase space. The
-    `in_sample` column keeps an out-of-sample-only cut available.
+    Scores every row of the region with each fold's checkpoint and writes
+    `scores/fold_N.parquet` (y_true, y_score, in_sample and `extra_columns`). Returns fold -> scores.
     """
     os.makedirs(paths.scores, exist_ok=True)
     scores: Dict[int, np.ndarray] = {}
@@ -80,8 +69,7 @@ def score_folds(
             continue
         logger.info(f"🧠 Fold {fold}: init {info['init']} ({info['monitor']}={info['best_score']})")
 
-        # fold_kwargs (e.g. pos_weight) are not hyperparameters - they come from the training
-        # split - so Lightning cannot rebuild them from the checkpoint. Fed back from the sidecar.
+        # fold_kwargs (e.g. pos_weight) are not stored in the checkpoint.
         model = model_cls.load_from_checkpoint(checkpoint, map_location="cpu", **info.get("fold_kwargs", {}))
         y_score = predict(model, X)
         scores[fold] = y_score
@@ -96,10 +84,7 @@ def score_folds(
 
 
 def load_scores(infos: Dict[int, Dict[str, Any]], paths: RunPaths) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
-    """
-    (y_true, fold -> y_score) of an earlier evaluation, without touching data or models - so
-    working points and plots can be recut in seconds.
-    """
+    """(y_true, fold -> y_score) read from an earlier evaluation's score files."""
     y_true: Optional[np.ndarray] = None
     scores: Dict[int, np.ndarray] = {}
     for fold in sorted(infos):

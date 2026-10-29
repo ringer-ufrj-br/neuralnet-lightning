@@ -7,12 +7,7 @@ from neuralnet_lightning.preprocess.mlp import PreprocessMLP
 
 @register_model("MLP")
 class ModelMLP(BaseBinaryClassifier):
-    """
-    The Ringer MLP: one small hidden layer over the 50 selected rings (norm1).
-
-    Everything except the architecture lives in BaseBinaryClassifier; `hidden` can be changed
-    per experiment through the config's model_args.
-    """
+    """Ringer MLP: one hidden layer over the 50 selected rings (norm1)."""
 
     preprocessor = PreprocessMLP
 

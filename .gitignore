@@ -5,5 +5,5 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 results/
-data/
+/data/
 *.parquet

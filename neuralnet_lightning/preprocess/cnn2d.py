@@ -10,9 +10,7 @@ from neuralnet_lightning.preprocess.base import BasePreprocessor
 
 logger = logging.getLogger(__name__)
 
-#: Cell-image columns, one per calorimeter layer. These are source column names (the mc25
-#: layout): the schema exposes any non-aliased column under its own name, and a dataset without
-#: them fails in the loader with "not in the dataset" before anything is trained.
+#: Cell-image source columns (mc25 layout), one per calorimeter layer.
 CELL_COLUMNS: List[str] = [
     "cl_cells_presampler",
     "cl_cells_em1",
@@ -25,33 +23,26 @@ CELL_COLUMNS: List[str] = [
 
 
 class PreprocessCNN2D(BasePreprocessor):
-    """
-    Formats calorimeter cell energies into multi-channel 2D images, one channel per layer.
-    Deterministic (padding + log1p), so the inherited no-op `fit` is all it needs.
-    """
+    """Calorimeter cell energies as (C, H, W) images, one channel per layer."""
 
     #: (channels, height, width) every event's image is padded to.
     target_shape = (len(CELL_COLUMNS), 7, 15)
 
     def required_columns(self) -> List[str]:
-        """The cell-image columns, leaving the ring/shower-shape columns unread."""
+        """The cell-image columns."""
         return list(CELL_COLUMNS)
 
     def transform(self, df: pl.DataFrame) -> np.ndarray:
-        """Builds the cell images and normalises each one by its own total."""
+        """Cell images, each normalised by its own total."""
         return self.normalize(self.build_images(df))
 
     def model_kwargs(self, X: np.ndarray) -> Dict[str, Any]:
-        """The image geometry, so the network is built for the shape it is actually fed."""
+        """Image geometry for the network."""
         channels, height, width = self.target_shape
         return {"in_channels": channels, "cell_height": height, "cell_width": width}
 
     def layer_cells(self, df: pl.DataFrame, col: str) -> np.ndarray:
-        """
-        One layer as an (N, h, w) array. Every event carries the same grid for a given layer
-        (3x3 presampler, 3x15 EM1, 7x7 EM2, ...), so polars converts the nested lists into one
-        fixed-size buffer and no per-event Python object is ever created.
-        """
+        """One layer as an (N, h, w) array; every event must have the same grid."""
         first = df[col][0].to_list()
         h, w = len(first), len(first[0])
         if h > self.target_shape[1] or w > self.target_shape[2]:
@@ -65,13 +56,8 @@ class PreprocessCNN2D(BasePreprocessor):
 
     def build_images(self, df: pl.DataFrame, out: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        The (N, C, H, W) cell images, unnormalised. Separate from `transform` so PreprocessFused
-        can take the raw images and normalise once over the concatenated rings+cells vector.
-
-        Each layer is written centred into its channel of one preallocated array, and cleaned
-        there in place: -999 sensor anomalies zeroed, then log1p of the energies clipped at zero.
-        The padding stays zero. `out`, a zeroed (N, C, H, W) float32 array or view, is filled
-        instead of a new array when given.
+        Unnormalised (N, C, H, W) images: each layer centred in its channel, -999 set to zero,
+        then log1p of the energies clipped at zero. Fills `out` (zeroed, float32) when given.
         """
         _, height, width = self.target_shape
         X = np.zeros((df.height, *self.target_shape), dtype=np.float32) if out is None else out

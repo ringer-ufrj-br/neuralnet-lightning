@@ -1,15 +1,9 @@
 """
-Cross-validation table ("tabelão" / pd_table) builder.
+Cross-validation table ("tabelão" / pd_table).
 
-The canonical artefact is a **long** table: one numeric row per (name, et_bin, eta_bin, fold,
-operating_point), concatenated from every region's `metrics/folds_long.csv`. Every render - the
-LaTeX fragment and the HTML view - is derived from it, so numbers are produced in one place and
-only formatted in the others.
-
-The rendered layout follows the ATLAS/Ringer convention: rows are |eta| regions, column groups
-are Et regions, each carrying the PD / SP / FA triplet. With several experiments, each |eta|
-region gets one row per experiment, so they are compared side by side under identical
-operating points.
+Concatenates every region's `metrics/folds_long.csv` into a long table, aggregates it over
+folds and renders it as LaTeX and HTML: rows are |eta| regions (one per experiment), column
+groups are Et regions with PD / SP / FA.
 """
 
 import glob
@@ -26,7 +20,7 @@ from neuralnet_lightning.binary.metrics import sp_index
 
 logger = logging.getLogger(__name__)
 
-#: Column contract of the long table. Anything writing `folds_long.csv` emits these.
+#: Columns of the long table (`folds_long.csv`).
 LONG_COLUMNS: List[str] = [
     "name", "et_bin", "eta_bin", "fold", "operating_point",
     "target_pd", "threshold", "pd", "fa", "sp", "auc_roc", "auc_pr",
@@ -62,12 +56,8 @@ def _eta_label(eta_bin: float, latex: bool) -> str:
 
 def discover_regions(results_root: str, names: Optional[Sequence[str]] = None) -> pd.DataFrame:
     """
-    One row per trained region under `<results_root>/<name>/<region>/`: name, region, path,
-    folds_trained, folds_evaluated, evaluated.
-
-    Anchored on each region's checkpoint sidecars rather than its metrics, so a region that was
-    trained but never evaluated is still found and reported as missing instead of silently
-    leaving a hole in the table.
+    One row per trained region under `<results_root>/<name>/<region>/` (name, region, path,
+    folds_trained, folds_evaluated, evaluated), evaluated or not.
     """
     rows = []
     for target in names or ["*"]:
@@ -89,10 +79,7 @@ def discover_regions(results_root: str, names: Optional[Sequence[str]] = None) -
 
 
 def log_inventory(inventory: pd.DataFrame, results_root: str) -> None:
-    """
-    Logs what was found on disk, one line per region, and spells out the command that fills
-    each gap. A table with unexplained holes is worse than no table.
-    """
+    """Logs each region found and the command that evaluates the missing ones."""
     if inventory.empty:
         logger.warning(f"⚠️ No trained region found under '{results_root}'. Run `train` (then `evaluate`) first.")
         return
@@ -142,11 +129,7 @@ def collect(results_root: str, names: Optional[Sequence[str]] = None) -> pd.Data
 
 
 def check_comparable(long_df: pd.DataFrame) -> List[str]:
-    """
-    Within each region, every experiment should have been scored on the same rows - which
-    holds when their configs agree on the data, max_files, n_splits and seed. Differing
-    signal/background counts are a cheap proxy for drift; one message per offending region.
-    """
+    """One message per region where experiments differ in signal/background counts."""
     problems = []
     for (et_bin, eta_bin), group in long_df.groupby(["et_bin", "eta_bin"], dropna=False):
         counts = group.groupby("name")[["n_signal", "n_background"]].first()
@@ -162,13 +145,8 @@ def check_comparable(long_df: pd.DataFrame) -> List[str]:
 
 def integrate(long_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Pools every region into the phase-space total: one row per (name, fold, operating point),
-    marked et_bin = eta_bin = INTEGRATED.
-
-    Each region's network carries its own threshold, so the pooled efficiency is a ratio of
-    summed counts, PD = sum(pd_r * n_signal_r) / sum(n_signal_r) (likewise FA), never an
-    average of rates - that would let a sparse bin weigh as much as a dense one. Pooling is
-    done per fold, so the quoted spread is the real fold-to-fold spread of the pooled number.
+    Pools every region into one row per (name, fold, operating point), marked
+    et_bin = eta_bin = INTEGRATED. PD = sum(pd_r * n_signal_r) / sum(n_signal_r), likewise FA.
     """
     binned = long_df[long_df["et_bin"].notna() & long_df["eta_bin"].notna()]
     source = binned if not binned.empty else long_df
@@ -184,8 +162,7 @@ def integrate(long_df: pd.DataFrame) -> pd.DataFrame:
     pooled["pd"] = np.where(pooled["n_signal"] > 0, pooled["_tp"] / pooled["n_signal"], 0.0)
     pooled["fa"] = np.where(pooled["n_background"] > 0, pooled["_fp"] / pooled["n_background"], 0.0)
     pooled["sp"] = sp_index(pooled["pd"], pooled["fa"])
-    # Meaningless once pooled - each region had its own threshold, and AUCs cannot be combined
-    # from summary numbers. NaN rather than a silently wrong average.
+    # Not defined once regions are pooled.
     pooled[["threshold", "auc_roc", "auc_pr"]] = np.nan
     pooled["et_bin"] = INTEGRATED
     pooled["eta_bin"] = INTEGRATED
@@ -194,9 +171,8 @@ def integrate(long_df: pd.DataFrame) -> pd.DataFrame:
 
 def aggregate(long_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Reduces over folds into `<metric>_mean` / `<metric>_std` plus `n_folds`, one row per
-    (name, et_bin, eta_bin, operating_point), in percent - the tables are always quoted in
-    percent, and converting once here keeps the renderers free of unit logic.
+    Mean and std over folds of pd, sp and fa (in percent) plus `n_folds`, one row per
+    (name, et_bin, eta_bin, operating_point).
     """
     working = long_df.assign(**{column: long_df[column] * 100.0 for column in ("pd", "sp", "fa")})
     agg = working.groupby(["name", "et_bin", "eta_bin", "operating_point"], dropna=False).agg(
@@ -205,17 +181,14 @@ def aggregate(long_df: pd.DataFrame) -> pd.DataFrame:
         fa_mean=("fa", "mean"), fa_std=("fa", "std"),
         n_folds=("fold", "nunique"),
     ).reset_index()
-    # A single fold yields std=NaN; 0.0 is the honest reading (no spread observed).
+    # A single fold gives std NaN.
     std_columns = [column for column in agg.columns if column.endswith("_std")]
     agg[std_columns] = agg[std_columns].fillna(0.0)
     return agg
 
 
 def resolve_names(agg: pd.DataFrame, names: Optional[Sequence[str]] = None) -> List[str]:
-    """
-    Which experiments appear as rows, in order: an explicit list is honoured verbatim (minus
-    names with no evaluated region), otherwise every one present, sorted.
-    """
+    """Experiments shown as rows: `names` in order (dropping those without results), else all, sorted."""
     present = set(agg["name"].unique())
     if not names:
         return sorted(present)
@@ -236,10 +209,7 @@ def format_cell(mean: float, std: float, decimals: int = 2, latex: bool = False)
 
 def _pivot(agg: pd.DataFrame, rows: List[str], group: str, index: pd.Index,
            groups: Sequence[str], decimals: int, latex: bool) -> pd.DataFrame:
-    """
-    Pivots aggregate rows into a printed table: the `index` rows, one (group, metric) column
-    pair per entry of `groups`, cells formatted as mean±std and '--' where there is no result.
-    """
+    """Pivots aggregate rows into mean±std cells: `index` rows, one (group, metric) column per entry of `groups`."""
     labels = [tex if latex else plain for _, plain, tex in TABLE_METRICS]
     cells = pd.DataFrame(
         {label: [format_cell(mean, std, decimals, latex) for mean, std in zip(agg[f"{key}_mean"], agg[f"{key}_std"])]
@@ -253,9 +223,8 @@ def _pivot(agg: pd.DataFrame, rows: List[str], group: str, index: pd.Index,
 def build_wide(agg: pd.DataFrame, operating_point: str, names: Optional[Sequence[str]] = None,
                decimals: int = 2, latex: bool = False) -> pd.DataFrame:
     """
-    The table of one operating point: one row per (|eta| region, experiment), one column per
-    (Et region, metric). A whole-phase-space run renders as a single 'all Et' / 'all |eta|'
-    cell; mixed with binned regions, only the binned ones are shown.
+    Table of one operating point: one row per (|eta| region, experiment), one column per
+    (Et region, metric). Binned regions take precedence over whole-phase-space runs.
     """
     subset = agg[agg["operating_point"] == operating_point]
     rows = resolve_names(subset, names)
@@ -280,12 +249,8 @@ def build_integrated_wide(agg: pd.DataFrame, names: Optional[Sequence[str]], poi
 
 
 def _to_latex(wide: pd.DataFrame, caption: str, label: str) -> str:
-    """
-    A wide table as a standalone LaTeX fragment, ready for \\input{}, with each group's PD
-    column shaded - PD is the quantity every network was tuned to reproduce.
-    """
-    # Experiment names are plain text, and names like 'mlp_mc21' are the norm: an
-    # unescaped '_' would not compile. The |eta| / Et labels are LaTeX already.
+    """A wide table as a LaTeX fragment for \\input{}, with the PD columns shaded."""
+    # Escape '_' in experiment names; the region labels are already LaTeX.
     wide = wide.rename(index=lambda value: str(value).replace("_", r"\_"), level="Experiment")
     pd_columns = [column for column in wide.columns if column[1] == TABLE_METRICS[0][2]]
     tabular = wide.style.map(lambda value: "" if value == "--" else "cellcolor:{green!25};", subset=pd_columns).to_latex(
@@ -295,8 +260,7 @@ def _to_latex(wide: pd.DataFrame, caption: str, label: str) -> str:
         clines="skip-last;data" if wide.index.nlevels > 1 else None,
         column_format="l" * wide.index.nlevels + "c" * len(wide.columns),
     )
-    # Styler separates the |eta| blocks with \cline, the last one included; booktabs wants a
-    # \midrule between blocks and nothing right above \bottomrule.
+    # Replace Styler's \cline separators with \midrule, dropping the one before \bottomrule.
     tabular = re.sub(r"\\cline\{[^}]*\}\n(\\bottomrule)?", lambda m: m.group(1) or "\\midrule\n", tabular)
     return "\n".join([
         "% Generated by neuralnet_lightning/binary/report.py - do not edit by hand.",
@@ -314,7 +278,7 @@ def _to_latex(wide: pd.DataFrame, caption: str, label: str) -> str:
 
 
 def _to_html(wide: pd.DataFrame, title: str) -> str:
-    """The same table as HTML, so the numbers can be read without a LaTeX toolchain."""
+    """A wide table as HTML, with the PD columns shaded."""
     pd_columns = [column for column in wide.columns if column[1] == TABLE_METRICS[0][1]]
     return wide.style.map(lambda value: "" if value == "--" else "background-color: #d6f5d6;", subset=pd_columns) \
         .set_caption(title) \
@@ -347,17 +311,14 @@ def build_report(
     integrated: bool = True
 ) -> Dict[str, List[str]]:
     """
-    collect -> aggregate -> a LaTeX fragment and an HTML view per operating point, plus the
-    integrated table unless `integrated` is False. Returns the written paths by kind.
+    Writes the long CSV and a LaTeX + HTML table per operating point, plus the integrated table
+    unless `integrated` is False. Returns the written paths by kind.
 
-    Several `names` give one comparison table per operating point, a row per (|eta| region,
-    experiment) in that order. Output goes to `<results_root>/<name>/pd_table` for a single
-    experiment, `<results_root>/comparison/pd_table` otherwise, unless `output_dir` is given.
+    Output goes to `output_dir`, else `<results_root>/<name>/pd_table` for a single experiment
+    and `<results_root>/comparison/pd_table` for several.
     """
     written: Dict[str, List[str]] = {"long": [], "tables": [], "integrated": []}
 
-    # Announce what was found before touching the numbers: which regions exist, which are still
-    # unevaluated, and therefore why the table looks the way it does.
     log_inventory(discover_regions(results_root, names), results_root)
 
     long_df = collect(results_root, names)
@@ -393,8 +354,6 @@ def build_report(
                                           caption, f"tab:pd_table_{point}", f"Cross Validation — operating point: {point}")
 
     if integrated:
-        # Its own artefact rather than a margin of the grid: it answers a different question
-        # and is usually quoted on its own.
         integrated_long = integrate(long_df)
         csv_path = os.path.join(output_dir, "pd_table_integrated_long.csv")
         integrated_long.to_csv(csv_path, index=False)

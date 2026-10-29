@@ -1,10 +1,4 @@
-"""
-Kinematic binning: the Et x |eta| grid the Ringer scheme trains one network per cell of.
-
-The grid is fixed - it is the ATLAS standard binning, the same for every dataset here - so it
-lives as module constants. Et is compared in the unit the dataset stores (MeV in every dataset
-so far) and only converted for display.
-"""
+"""Et x |eta| kinematic grid; one network is trained per cell."""
 
 import math
 from dataclasses import dataclass
@@ -12,10 +6,10 @@ from typing import List
 
 import polars as pl
 
-#: Et bin edges in MeV, one more than there are bins; the last is open-ended.
+#: Et bin edges in MeV; the last bin is open-ended.
 ET_EDGES: List[float] = [15e3, 20e3, 30e3, 40e3, 50e3, float("inf")]
 
-#: |eta| bin edges, closed at both ends - at or above the last is outside acceptance.
+#: |eta| bin edges.
 ETA_EDGES: List[float] = [0.0, 0.8, 1.37, 1.54, 2.37, 2.5]
 
 N_ET_BINS, N_ETA_BINS = len(ET_EDGES) - 1, len(ETA_EDGES) - 1
@@ -23,14 +17,13 @@ N_ET_BINS, N_ETA_BINS = len(ET_EDGES) - 1, len(ETA_EDGES) - 1
 #: Et is stored in MeV and printed in GeV.
 ET_SCALE, ET_UNIT = 1e-3, "GeV"
 
-#: Region label of a run over the whole phase space (no --et-bin/--eta-bin), so every run sits
-#: at the same depth of the results tree: results/<name>/<region>/.
+#: Region label of a run over the whole phase space (no --et-bin/--eta-bin).
 FULL_PHASE_SPACE = "all"
 
 
 @dataclass(frozen=True)
 class Region:
-    """One (et_bin, eta_bin) cell of the grid. Construction validates the indices."""
+    """One (et_bin, eta_bin) cell of the grid."""
 
     et_bin: int
     eta_bin: int
@@ -58,10 +51,7 @@ class Region:
         return f"--et-bin {self.et_bin} --eta-bin {self.eta_bin}"
 
     def filter_expr(self, et_col: str, eta_col: str) -> pl.Expr:
-        """
-        Rows of this region, as a lazy filter - so out-of-region rows are dropped during the
-        parquet scan rather than after loading.
-        """
+        """Polars filter selecting this region's rows."""
         et = pl.col(et_col).cast(pl.Float64)
         expr = et >= ET_EDGES[self.et_bin]
         if not math.isinf(ET_EDGES[self.et_bin + 1]):
@@ -70,7 +60,7 @@ class Region:
         return expr & (abs_eta >= ETA_EDGES[self.eta_bin]) & (abs_eta < ETA_EDGES[self.eta_bin + 1])
 
 
-#: Every region in row-major order - what a launcher fans out over.
+#: Every region, in row-major order.
 REGIONS: List[Region] = [Region(et, eta) for et in range(N_ET_BINS) for eta in range(N_ETA_BINS)]
 
 

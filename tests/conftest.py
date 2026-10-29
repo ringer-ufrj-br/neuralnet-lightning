@@ -1,8 +1,4 @@
-"""
-Synthetic parquet datasets in both on-disk layouts, small enough for the whole suite to run on
-CPU in seconds. Signal deposits its energy in the EM2 core, background leaks into the hadronic
-layers - in the rings and in the cell images alike - so even a one-epoch network separates them.
-"""
+"""Small synthetic parquet datasets in both ring layouts; signal and background are easily separable."""
 
 import os
 from typing import Tuple

@@ -1,9 +1,4 @@
-"""
-End to end through the CLI: train -> evaluate -> report, 2 folds, on CPU. A few epochs at a
-high learning rate - enough for the AUC check to catch features and labels drifting apart. MLP
-covers the whole flow; Fused covers a model with its own forward/compute_loss and a
-multi-input preprocessor.
-"""
+"""End-to-end CLI tests (train -> evaluate -> report) on CPU, 2 folds."""
 
 import glob
 import json

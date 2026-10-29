@@ -7,17 +7,12 @@ from neuralnet_lightning.preprocess.cnn2d import PreprocessCNN2D
 
 @register_model("CNN2D")
 class ModelCNN2D(BaseBinaryClassifier):
-    """
-    2D CNN over the seven calorimeter layers treated as image channels.
-
-    Everything except the architecture lives in BaseBinaryClassifier.
-    """
+    """2D CNN over the calorimeter cell images, one channel per layer."""
 
     preprocessor = PreprocessCNN2D
 
     def build_network(self, in_channels: int = 7, cell_height: int = 7, cell_width: int = 15) -> nn.Module:
-        """The convolutional feature extractor plus its classifier head:
-        (Batch, in_channels, cell_height, cell_width) -> (Batch, 1) logits."""
+        """(Batch, in_channels, cell_height, cell_width) -> (Batch, 1) logits."""
         features = nn.Sequential(
             # Convolutional Block 1
             nn.Conv2d(in_channels=in_channels, out_channels=32, kernel_size=3, padding=1),
@@ -31,8 +26,6 @@ class ModelCNN2D(BaseBinaryClassifier):
             nn.ReLU(),
         )
 
-        # Derived rather than hardcoded, so changing the kernel/pool sizes above or the cell
-        # grid does not silently produce a shape mismatch in the first Linear.
         flat_dim = 64 * (cell_height // 2) * (cell_width // 2)
 
         return nn.Sequential(

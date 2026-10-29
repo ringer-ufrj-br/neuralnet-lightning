@@ -10,13 +10,8 @@ from neuralnet_lightning.preprocess.fused import PreprocessFused
 @register_model("Fused")
 class ModelFused(BaseBinaryClassifier):
     """
-    Two-branch model: an MLP over the rings and a CNN over the calorimeter cells, joined by a
-    fusion head. Each branch also carries an auxiliary classification head, because without
-    auxiliary supervision the weaker branch receives almost no gradient.
-
-    This is the example of an architecture that needs more than build_network: it overrides
-    `forward` (two branches, not one callable) and `compute_loss` (the auxiliary terms).
-    Everything else - metrics, SP index, logging, optimizer - still comes from the base.
+    Two-branch model: an MLP over the rings and a CNN over the cell images, joined by a fusion
+    head. Each branch has an auxiliary classification head, weighted by `aux_loss_weight`.
     """
 
     preprocessor = PreprocessFused
@@ -32,9 +27,8 @@ class ModelFused(BaseBinaryClassifier):
         dropout: float = 0.5
     ) -> nn.Module:
         """
-        Both branches, their auxiliary heads and the fusion head, as a ModuleDict that
-        forward() wires together. fusion_source 'embedding' concatenates the two embeddings,
-        anything else the two auxiliary logits; aux_loss_weight 0 disables the auxiliary losses.
+        Branches, auxiliary heads and fusion head as a ModuleDict. `fusion_source` 'embedding'
+        fuses the two embeddings, anything else the two auxiliary logits.
         """
         c, h, w = cell_shape
         self.n_rings = n_rings
@@ -127,7 +121,7 @@ class ModelFused(BaseBinaryClassifier):
         return net["fusion"](fused), logit_rings, logit_cells
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """The fusion logits only - the auxiliary heads exist for training."""
+        """Fusion logits only."""
         return self._forward_all(x)[0]
 
     def compute_loss(

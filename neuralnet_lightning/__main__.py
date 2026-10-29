@@ -7,11 +7,10 @@ Command line entrypoint.
     python -m neuralnet_lightning report   --config configs/mlp.yaml   (or --names a,b)
     python -m neuralnet_lightning grid
 
-`train` only produces models, every (fold, initialisation) pair kept on disk - with
-`--fold`/`--init` it trains exactly one, which is what lets a scheduler run one training per
-job. `evaluate` picks each fold's best initialisation and turns it into scores, metrics and
-plots for one region. `report` aggregates every evaluated region into the cross-validation
-table. `grid` prints one 'et eta' line per region, for launchers that fan out over it.
+train     trains every (fold, init) model, or a single one with --fold/--init.
+evaluate  scores each fold's best initialisation and writes metrics and plots for one region.
+report    builds the cross-validation table from every evaluated region.
+grid      prints one 'et eta' line per region.
 """
 
 import argparse
@@ -132,9 +131,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             pipeline.evaluate(reuse_scores=args.reuse_scores, make_plots=not args.no_plots)
         return 0
     except (FileNotFoundError, KeyError, ValueError) as exc:
-        # The expected "holding it wrong" failures - a bad config, an untrained region, a
-        # missing column - are raised by this package with a ❌ message saying what to fix; a
-        # stack trace adds nothing. Anything else is a bug and keeps its traceback.
+        # Errors raised with a ❌ message are logged without a traceback.
         message = str(exc).strip("'\"")
         if not message.startswith("❌"):
             raise

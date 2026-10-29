@@ -1,7 +1,4 @@
-"""
-Binary-task figures of merit: the SP index (in training and in evaluation), FA at fixed-PD
-operating points, and the threshold-free AUCs.
-"""
+"""Binary-task metrics: SP index, operating points and AUCs."""
 
 from typing import Dict, List, TypeVar
 
@@ -14,28 +11,14 @@ Number = TypeVar("Number", float, np.ndarray, torch.Tensor)
 
 def sp_index(pd: Number, fa: Number) -> Number:
     """
-    SP Index (Ringer): sqrt(sqrt(pd*(1-fa)) * (pd+1-fa)/2).
-
-    pd = probability of detection (signal efficiency), fa = false alarm rate (background
-    efficiency). Combines the geometric and arithmetic means of pd and (1-fa) so a threshold
-    only scores well if signal efficiency and background rejection improve together.
-
-    Uses `** 0.5` rather than np.sqrt/torch.sqrt so one implementation serves Python floats,
-    numpy arrays and torch tensors - the per-epoch training metric and the evaluation report.
+    SP index: sqrt(sqrt(pd*(1-fa)) * (pd+1-fa)/2), with pd the probability of detection and fa
+    the false alarm rate. Accepts floats, numpy arrays and torch tensors.
     """
     return ((pd * (1 - fa)) ** 0.5 * (pd + 1 - fa) / 2) ** 0.5
 
 
 def max_sp_index(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """
-    Highest SP Index reachable over every decision threshold - the NeuralRinger stopping
-    criterion - rather than SP at one arbitrary cut: with the class imbalance of this dataset
-    and a pos_weight-weighted loss, the best operating point is nowhere near 0.5, so a fixed
-    cut would rank epochs by where their scores happen to sit instead of by separability.
-
-    Sweeps the thresholds the ROC visits - one per distinct score, so a cut never splits a
-    group of equal scores - and returns the best SP among them (0 when either class is absent).
-    """
+    """Maximum SP index over every decision threshold (0 when a class is absent)."""
     scores = preds.flatten()
     y = targets.flatten().long()
 
@@ -50,7 +33,7 @@ def max_sp_index(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     pd_rate = torch.cumsum(y, 0).float() / n_pos
     fa_rate = torch.cumsum(1 - y, 0).float() / n_neg
 
-    # Keep only the last row of each run of equal scores: those are the reachable cuts.
+    # Only the last of each run of equal scores is a reachable cut.
     reachable = torch.ones_like(scores, dtype=torch.bool)
     reachable[:-1] = scores[1:] != scores[:-1]
 
@@ -63,12 +46,8 @@ def compute_operating_points(
     targets: Dict[str, float]
 ) -> List[Dict[str, float]]:
     """
-    FA at fixed-PD working points, one dict per point (operating_point, target_pd, threshold,
-    pd, fa, sp). For each target PD the threshold is the (1 - PD) quantile of the signal score
-    distribution, so exactly that fraction of signal is kept.
-
-    This is the mechanism behind the cross-validation table: every network is tuned to the
-    same PD, so the columns that actually differ between models are SP and FA.
+    One dict per operating point (operating_point, target_pd, threshold, pd, fa, sp). The
+    threshold is the (1 - target_pd) quantile of the signal scores.
     """
     y_true = np.asarray(y_true).ravel()
     y_score = np.asarray(y_score).ravel()
@@ -95,11 +74,7 @@ def compute_operating_points(
 
 
 def compute_metrics(y_true: np.ndarray, y_score: np.ndarray) -> Dict[str, float]:
-    """
-    The threshold-free metrics of one set of scores (auc_roc, auc_pr, n_signal, n_background).
-    Properties of the score ranking rather than of a cut, so comparable across models without
-    agreeing on a threshold first. A single-class input yields NaN AUCs.
-    """
+    """Threshold-free metrics (auc_roc, auc_pr, n_signal, n_background); NaN AUCs for a single class."""
     y_true = np.asarray(y_true).ravel()
     y_score = np.asarray(y_score).ravel()
     both_classes = len(np.unique(y_true)) == 2

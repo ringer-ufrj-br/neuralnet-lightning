@@ -20,11 +20,10 @@ logger = logging.getLogger(__name__)
 
 class BaseBinaryClassifier(pl.LightningModule):
     """
-    Everything every binary architecture shares: the pos_weight-weighted BCE criterion, the
-    epoch-level metric collection, the SP-index validation metric that EarlyStopping and
-    ModelCheckpoint monitor, and the optimizer.
+    Base of the binary classifiers: pos_weight-weighted BCE loss, epoch-level metrics, the
+    `val_sp` validation metric and the Adam optimizer.
 
-    A new architecture subclasses this, names its preprocessor and implements ONE method:
+    A subclass sets `preprocessor` and implements `build_network`, without an `__init__`:
 
         @register_model("MyNet")
         class MyNet(BaseBinaryClassifier):
@@ -32,19 +31,15 @@ class BaseBinaryClassifier(pl.LightningModule):
             def build_network(self, input_dim: int = 50, hidden: int = 5) -> nn.Module:
                 return nn.Sequential(nn.Linear(input_dim, hidden), nn.ReLU(), nn.Linear(hidden, 1))
 
-    Do not write an `__init__` in the subclass. The preprocessor's `model_kwargs` and the
-    config's `model_args` arrive here as `**arch_kwargs` and are forwarded to `build_network`,
-    so declaring them as its parameters is all it takes - they are saved as hyperparameters and
-    restored by `load_from_checkpoint`.
-
-    Further hooks, none required: `forward` (a network that is not one callable module),
-    `compute_loss` (auxiliary losses), `configure_optimizers` (another optimizer/scheduler).
+    The preprocessor's `model_kwargs` and the config's `model_args` are passed to
+    `build_network` and saved as hyperparameters. `forward`, `compute_loss` and
+    `configure_optimizers` may also be overridden.
     """
 
     #: The input representation this model consumes.
     preprocessor: ClassVar[Type[BasePreprocessor]]
 
-    #: SP index maximised over every threshold (see on_validation_epoch_end). Higher is better.
+    #: Metric for early stopping, checkpointing and init selection.
     monitor: ClassVar[str] = "val_sp"
     monitor_mode: ClassVar[str] = "max"
 
@@ -54,25 +49,18 @@ class BaseBinaryClassifier(pl.LightningModule):
         pos_weight: Optional[Union[float, torch.Tensor]] = None,
         **arch_kwargs: Any
     ) -> None:
-        """
-        `pos_weight` is left out of the saved hyperparameters: it is derived from the fold's
-        training split, not chosen by the user, so evaluation feeds it back from the sidecar.
-        """
+        """`pos_weight` is not saved as a hyperparameter; evaluation restores it from the sidecar."""
         super().__init__()
         self.learning_rate = learning_rate
 
-        # build_network's own defaults are folded in before saving, so self.hparams carries
-        # every architecture parameter whether or not the caller passed it, and a checkpoint
-        # keeps rebuilding the same network even if a default changes later. bind() also
-        # rejects an argument build_network does not declare (a typo in model_args).
+        # build_network's defaults are saved too; bind() rejects undeclared arguments.
         arch = inspect.signature(self.build_network).bind(**arch_kwargs)
         arch.apply_defaults()
         self.save_hyperparameters({"learning_rate": learning_rate, **arch.arguments})
 
-        #: The architecture itself, whatever build_network returned.
         self.network = self.build_network(**arch.arguments)
 
-        # A buffer, not a parameter: it moves with .to(device) but the optimizer never sees it.
+        # A buffer: follows the module's device but is not optimised.
         if pos_weight is not None:
             pos_weight = torch.as_tensor(pos_weight, dtype=torch.float32).reshape(1)
         self.register_buffer("pos_weight", pos_weight)
@@ -90,10 +78,7 @@ class BaseBinaryClassifier(pl.LightningModule):
 
     @classmethod
     def fold_kwargs(cls, y_train: np.ndarray) -> Dict[str, Any]:
-        """
-        pos_weight = n_negatives / n_positives over one fold's training labels, so the weighted
-        loss balances the classes instead of discarding background events.
-        """
+        """pos_weight = n_negatives / n_positives over the fold's training labels."""
         y_train = np.asarray(y_train).ravel()
         n_pos = int((y_train == 1).sum())
         n_neg = int((y_train == 0).sum())
@@ -107,7 +92,7 @@ class BaseBinaryClassifier(pl.LightningModule):
 
     @classmethod
     def stratify_labels(cls, y: np.ndarray) -> Optional[np.ndarray]:
-        """What the K-Fold stratifies on: the class itself, so every fold keeps the imbalance."""
+        """Labels the K-Fold stratifies on."""
         return y
 
     def predict_scores(self, x: torch.Tensor) -> torch.Tensor:
@@ -120,24 +105,11 @@ class BaseBinaryClassifier(pl.LightningModule):
     # ------------------------------------------------------------------ hooks
 
     def build_network(self, **kwargs: Any) -> nn.Module:
-        """
-        Builds the architecture. THE ONE METHOD A NEW ARCHITECTURE MUST IMPLEMENT.
-
-        The module maps (Batch, ...) inputs to (Batch, 1) raw logits, NOT probabilities - the
-        loss applies the sigmoid.
-        """
+        """Builds the network: (Batch, ...) inputs -> (Batch, 1) logits. Implemented by subclasses."""
         raise NotImplementedError(f"{type(self).__name__} must implement build_network() and return an nn.Module.")
 
     def build_metrics(self) -> MetricCollection:
-        """
-        The per-epoch metric collection, without a train_/val_ prefix. Override only to add or
-        drop metrics.
-
-        Grouping them lets the threshold-based ones share one confusion-matrix state and the
-        curve-based ones one prediction buffer. They are only `.update()`d in the steps and
-        computed once per epoch: computing per batch used to dominate training time, because
-        AUROC re-sorts its whole buffer on every compute.
-        """
+        """Per-epoch metrics, without the train_/val_ prefix. Updated per step, computed per epoch."""
         return MetricCollection({
             "acc": Accuracy(task="binary"),
             "precision": Precision(task="binary"),
@@ -152,10 +124,7 @@ class BaseBinaryClassifier(pl.LightningModule):
         return self.network(x)
 
     def compute_loss(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        (loss, predicted probabilities, integer targets) for one batch - the last two feed the
-        metrics. Override to add auxiliary losses; the metric and SP machinery keep working.
-        """
+        """(loss, predicted probabilities, integer targets) for one batch."""
         x, y = batch
         y = y.unsqueeze(1).float()
         logits = self(x)
@@ -174,7 +143,7 @@ class BaseBinaryClassifier(pl.LightningModule):
         return loss
 
     def on_train_epoch_end(self) -> None:
-        """Computes the accumulated training metrics once per epoch, outside the hot loop."""
+        """Logs and resets the training metrics."""
         self.log_dict(self.train_metrics.compute())
         self.train_metrics.reset()
 
@@ -187,10 +156,7 @@ class BaseBinaryClassifier(pl.LightningModule):
         return loss
 
     def on_validation_epoch_end(self) -> None:
-        """
-        Logs the epoch's validation metrics and `val_sp`, the SP index maximised over every
-        threshold on the full validation set - not averaged per batch.
-        """
+        """Logs the validation metrics and `val_sp`, computed over the whole validation set."""
         if not self._val_preds:
             return
         self.log_dict(self.val_metrics.compute())

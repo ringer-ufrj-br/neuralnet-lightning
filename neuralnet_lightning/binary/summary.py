@@ -1,8 +1,4 @@
-"""
-Binary half of `evaluate`: one region's scores in, its slice of the cross-validation table
-(`metrics/folds_long.csv`, see neuralnet_lightning.binary.report.LONG_COLUMNS) and its figures
-out.
-"""
+"""Per-region evaluation output of the binary task: `metrics/folds_long.csv` and plots."""
 
 import logging
 import os
@@ -69,8 +65,7 @@ def _render(
     for fold in sorted(fold_scores):
         y_score = fold_scores[fold]
         points = compute_operating_points(y_true, y_score, operating_points)
-        # The confusion matrix needs one cut; the tightest working point is the one the trigger
-        # would actually run at, so it is the cut worth picturing.
+        # Confusion matrix at the tightest operating point.
         cut = min(points, key=lambda point: point["target_pd"])["threshold"]
 
         plots.plot_roc_curve(y_true, y_score, os.path.join(paths.plots, f"roc_curve_fold_{fold}.pdf"), points)

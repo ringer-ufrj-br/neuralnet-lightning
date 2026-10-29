@@ -76,12 +76,7 @@ def plot_loss(train_loss: List[float], val_loss: List[float], path: str) -> None
 
 
 def plot_roc_folds(y_true: np.ndarray, fold_scores: Dict[int, np.ndarray], path: str, title: str) -> None:
-    """
-    Overlays the ROC curve of every fold, with the mean curve and a ±1σ band, so the spread
-    quoted in the cross-validation table has a visual counterpart. Curves are interpolated onto
-    a shared FA grid before averaging. A zoomed inset covers the high-PD / low-FA corner, the
-    only region that matters at the tight working point.
-    """
+    """Every fold's ROC curve with their mean and ±1σ band, plus an inset zoomed on low FA / high PD."""
     grid = np.linspace(0.0, 1.0, 1001)
     curves, interpolated, aucs = [], [], []
 
@@ -107,8 +102,6 @@ def plot_roc_folds(y_true: np.ndarray, fold_scores: Dict[int, np.ndarray], path:
     plt.legend(loc="lower right", fontsize=8)
     plt.grid(True, alpha=0.3)
 
-    # Mid-right of the axes: a good ROC hugs the top-left corner, so this area is empty, and
-    # it stays clear of the lower-right legend.
     inset = plt.gca().inset_axes([0.44, 0.33, 0.52, 0.44])
     for fpr, tpr in curves:
         inset.plot(fpr, tpr, lw=1.0, alpha=0.45)

@@ -1,22 +1,15 @@
 """
-Typed experiment configuration, loaded from YAML and validated on load.
+Experiment configuration, loaded from YAML:
 
-The YAML mirrors these dataclasses one to one:
-
-    name: mlp_mc21                 # the experiment: results go to <results_root>/<name>/<region>/
-    model: MLP                     # the architecture, looked up in models/registry.py
+    name: mlp_mc21                 # results go to <results_root>/<name>/<region>/
+    model: MLP                     # name registered in models/registry.py
     dataset: datasets/mc21.yaml    # DatasetSchema: a mapping, a YAML file, or {file: ..., <overrides>}
-    model_args: {hidden: 5}        # optional overrides of the model's build_network defaults
+    model_args: {hidden: 5}        # overrides of the model's build_network defaults
     training: {...}                # TrainingConfig
     evaluation: {...}              # EvaluationConfig
 
-`dataset:` names a file so that several experiments share one dataset description instead of
-each repeating it; `{file: ..., max_files: 100}` takes the file and overrides some of its keys.
-A relative file path is resolved against the folder of the config that names it, so a config
-means the same thing whatever directory the command runs from.
-
-The defaults below are the only defaults in the package. An unknown key - typically a typo -
-is an error rather than a silently ignored setting, and so is a value of the wrong type.
+A relative dataset file is resolved against the config's folder. Unknown keys and values of the
+wrong type raise ConfigError.
 """
 
 import dataclasses
@@ -36,9 +29,8 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class TrainingConfig:
     """
-    Everything that shapes how the networks are fitted. `n_splits: 1` opts out of
-    cross-validation (one model on a stratified 80/20 split); `n_inits` trains each fold that
-    many times from different weights, evaluation keeps the best.
+    Training settings. `n_splits: 1` uses a single stratified 80/20 split instead of
+    cross-validation; each fold is trained `n_inits` times from different initial weights.
     """
 
     max_epochs: int = 5000
@@ -77,11 +69,7 @@ class EvaluationConfig:
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    """
-    One experiment. `name` and `model` are deliberately separate: the same architecture on
-    another dataset, or with other model_args, is another experiment under another name - not
-    another class.
-    """
+    """One experiment: model, dataset and settings, stored under `name`."""
 
     name: str
     model: str
@@ -97,10 +85,7 @@ class ExperimentConfig:
 
 
 def load_config(path: str, **training_overrides: Any) -> ExperimentConfig:
-    """
-    Parses and validates a YAML config. `training_overrides` replace training fields after
-    loading - the CLI's --accelerator/--devices; None values are ignored.
-    """
+    """Loads a YAML config; non-None `training_overrides` replace the matching training fields."""
     config = from_dict(_read_yaml(path, "config"), base_dir=os.path.dirname(os.path.abspath(path)))
     overrides = {key: value for key, value in training_overrides.items() if value is not None}
     if overrides:
@@ -110,8 +95,8 @@ def load_config(path: str, **training_overrides: Any) -> ExperimentConfig:
 
 def from_dict(raw: Dict[str, Any], base_dir: Optional[str] = None) -> ExperimentConfig:
     """
-    Builds an ExperimentConfig from an already-parsed mapping (ConfigError if invalid).
-    `base_dir` is where a relative `dataset:` file is looked up (default: the working directory).
+    Builds an ExperimentConfig from a parsed mapping. `base_dir` resolves a relative `dataset:`
+    file (default: the working directory).
     """
     if isinstance(raw, dict) and "dataset" in raw:
         raw = {**raw, "dataset": _resolve_dataset(raw["dataset"], base_dir or os.getcwd())}
@@ -119,7 +104,7 @@ def from_dict(raw: Dict[str, Any], base_dir: Optional[str] = None) -> Experiment
 
 
 def _read_yaml(path: str, what: str) -> Dict[str, Any]:
-    """A YAML file as a mapping; a missing file is a ConfigError rather than a traceback."""
+    """Reads a YAML mapping; ConfigError if the file is missing or not a mapping."""
     if not os.path.isfile(path):
         raise ConfigError(f"❌ {what.capitalize()} file '{path}' not found.")
     with open(path) as handle:
@@ -131,9 +116,8 @@ def _read_yaml(path: str, what: str) -> Dict[str, Any]:
 
 def _resolve_dataset(raw: Any, base_dir: str) -> Any:
     """
-    The `dataset:` block as one mapping: a string is a YAML file of DatasetSchema keys, and a
-    mapping with a `file` key is that file with the mapping's other keys taking precedence.
-    Anything else is returned unchanged for _build to validate.
+    Resolves `dataset:` to a mapping: a string is a YAML file path, and `{file: ..., **overrides}`
+    merges the overrides over that file.
     """
     if isinstance(raw, str):
         raw = {"file": raw}

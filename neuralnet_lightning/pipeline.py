@@ -1,16 +1,4 @@
-"""
-The orchestrator: config -> loader -> preprocessor -> training / evaluation, for one region.
-
-The two phases run as separate commands, on different machines and at different times:
-
-* `train`    - loads the region, fits the preprocessor, runs the K-Fold and persists every
-               (fold, init) model plus what evaluation needs to reproduce its inputs.
-* `evaluate` - picks each fold's best initialisation, scores the whole region with it, and
-               hands the scores to the model's task layer for metrics and plots.
-
-Keeping them apart means re-scoring or re-cutting operating points never requires retraining,
-and every reported number comes from a checkpoint that is on disk and addressable.
-"""
+"""Training and evaluation of one experiment in one region."""
 
 import logging
 import os
@@ -51,20 +39,13 @@ class Pipeline:
         return load_dataframe(self.config.dataset, preprocessor.required_columns(), self.region)
 
     def train(self, fold: Optional[int] = None, init: Optional[int] = None) -> None:
-        """
-        Trains the requested (fold, init) models - all of them by default. Safe to run as
-        parallel single-model jobs: the split is a pure function of (data, seed), the shared
-        artefacts are written atomically with identical content, and each (fold, init) owns its
-        checkpoint and sidecar.
-        """
+        """Trains the requested (fold, init) models, all by default. Safe to run as parallel jobs."""
         logger.info(f"🚀 Training '{self.config.name}' ({self.config.model}) on {self.where}")
         preprocessor = self.model_cls.preprocessor()
         df = self._load(preprocessor)
 
         y = df[LABEL].cast(pl.Float32).to_numpy()
         X = preprocessor.fit_transform(df)
-        # Everything training needs is in X and y now; the frame would otherwise stay resident,
-        # as large as X itself, for the whole of training.
         del df
 
         os.makedirs(self.paths.artifacts, exist_ok=True)
@@ -73,7 +54,7 @@ class Pipeline:
         os.replace(tmp_path, self.paths.preprocessor)
         logger.info(f"💾 Saved preprocessor to: {self.paths.preprocessor}")
 
-        # The config's model_args win over data-derived kwargs: they are the explicit choice.
+        # The config's model_args override the data-derived kwargs.
         model_kwargs = {"learning_rate": self.config.training.learning_rate,
                         **preprocessor.model_kwargs(X), **self.config.model_args}
         logger.info(f"🏋️ Model kwargs: {model_kwargs}")
@@ -88,9 +69,9 @@ class Pipeline:
 
     def evaluate(self, reuse_scores: bool = False, make_plots: bool = True) -> None:
         """
-        Scores each fold's best initialisation over the whole region and writes the region's
-        metrics and plots. `reuse_scores` skips data and inference and reads the scores of an
-        earlier evaluation. Raises FileNotFoundError if the region has not been trained.
+        Scores each fold's best initialisation over the region and writes metrics and plots.
+        `reuse_scores` reads the scores of an earlier evaluation instead of running inference.
+        Raises FileNotFoundError if the region has not been trained.
         """
         infos = best_inits(self.paths, self.model_cls.monitor_mode)
         if not infos:
@@ -105,7 +86,7 @@ class Pipeline:
             df = self._load(preprocessor)
             y = df[LABEL].cast(pl.Float32).to_numpy()
 
-            # The fold indices only mean something over the same rows in the same order.
+            # The saved fold indices are only valid over the rows used in training.
             expected = next(iter(infos.values()))
             if len(y) != expected["n_train"] + expected["n_val"]:
                 raise ValueError(f"❌ The region has {len(y)} rows but was trained on "
@@ -113,7 +94,6 @@ class Pipeline:
                                  f"config changed since training. Retrain, or restore them.")
 
             X = preprocessor.transform(df)
-            # Kept next to the scores so the table can be re-cut later without inference.
             extra = {name: df[name].to_numpy() for name in (ET, ETA, ROW_ID) if name in df.columns}
             del df
             scores = score_folds(self.model_cls, X, y, infos, self.paths, extra)
