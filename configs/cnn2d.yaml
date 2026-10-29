@@ -1,0 +1,16 @@
+# The 2D CNN over the mc25 cell images, on the first 100 files of each folder.
+name: cnn2d_mc25
+model: CNN2D
+
+dataset:
+  file: datasets/mc25.yaml
+  max_files: 100
+
+training:
+  max_epochs: 200
+  batch_size: 64
+  learning_rate: 0.001
+  patience: 20
+  n_splits: 5
+  n_inits: 1
+  seed: 42

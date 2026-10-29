@@ -1,19 +1,24 @@
-.PHONY: venv clean copy-data
+.PHONY: venv test copy-data clean
 
-VENV = neuralnet-env
+VENV ?= neuralnet-env
 PYTHON = $(VENV)/bin/python
-PIP = $(VENV)/bin/pip
+# Where `copy-data` copies from; override with `make copy-data DATA_SRC=/other/path`.
+DATA_SRC ?= /mnt/shared/storage03/projects/cern/lorenzetti/r1/parquet
+DATA_DST ?= data/
 
 venv:
-	rm -rf neuralnet-env
+	rm -rf $(VENV)
 	python3 -m venv $(VENV)
-	$(PIP) install --upgrade pip
-	$(PIP) install -r requirements.txt
+	$(PYTHON) -m pip install --upgrade pip
+	$(PYTHON) -m pip install -r requirements.txt
+
+test:
+	$(PYTHON) -m pytest -q
 
 copy-data:
-	cp -r /mnt/shared/storage03/projects/cern/lorenzetti/r1/parquet data/
+	mkdir -p $(DATA_DST)
+	cp -r $(DATA_SRC) $(DATA_DST)
 
 clean:
-	rm -rf $(VENV)
-	find . -type f -name '*.pyc' -delete
-	find . -type d -name '__pycache__' -delete
+	rm -rf $(VENV) .pytest_cache *.egg-info
+	find . -type d -name '__pycache__' -prune -exec rm -rf {} +

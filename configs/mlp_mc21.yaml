@@ -1,0 +1,14 @@
+# The same MLP on mc21: only `name` and the dataset differ from mlp.yaml.
+name: mlp_mc21
+model: MLP
+
+dataset: datasets/mc21.yaml
+
+training:
+  max_epochs: 5000
+  batch_size: 1024
+  learning_rate: 0.001
+  patience: 50
+  n_splits: 5
+  n_inits: 5
+  seed: 42

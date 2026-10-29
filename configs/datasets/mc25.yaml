@@ -1,0 +1,8 @@
+# mc25, Lorenzetti r1: 4 folders (2 Zee, 2 JF17), ~1.47 M events. One column per ring, no label
+# column - the label comes from the file name (Zee = signal, JF17 = background). Also carries
+# the cell images (cl_cells_*) CNN2D and Fused read, and the shower shapes cl_rhad, cl_rphi,
+# cl_eratio, cl_weta2, cl_f3.
+data_path: /mnt/shared/storage03/projects/cern/lorenzetti/r1/parquet
+rings_col: "cl_ring_%i"
+et_col: cl_et            # MeV
+eta_col: cl_eta

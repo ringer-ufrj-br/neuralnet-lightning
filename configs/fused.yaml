@@ -1,0 +1,17 @@
+# Rings + cell images in two branches. Same data, folds and training as cnn2d.yaml, so the two
+# experiments are comparable row by row in the table.
+name: fused_mc25
+model: Fused
+
+dataset:
+  file: datasets/mc25.yaml
+  max_files: 100
+
+training:
+  max_epochs: 200
+  batch_size: 64
+  learning_rate: 0.001
+  patience: 20
+  n_splits: 5
+  n_inits: 1
+  seed: 42

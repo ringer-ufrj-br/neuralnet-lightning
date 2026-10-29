@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neuralnet-lightning"
+version = "0.1.0"
+description = "Ringer electron/jet networks for ATLAS calorimeter data (PyTorch Lightning)."
+requires-python = ">=3.13"
+# Pinned to the versions the cluster environment is validated with. torch carries the +cu126
+# local tag: see requirements.txt for why, and for the index it is fetched from.
+dependencies = [
+    "joblib==1.6.0",
+    "matplotlib==3.11.2",
+    "numpy==2.5.3",
+    "pandas==3.0.6",
+    "polars==2.0.0",
+    "pyarrow==25.0.1",
+    "pytorch-lightning==2.6.6",
+    "pyyaml==6.0.3",
+    "scikit-learn==1.9.1",
+    "torch==2.13.0+cu126",
+    "torchmetrics==1.9.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.1.1"]
+
+[tool.setuptools.packages.find]
+include = ["neuralnet_lightning*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,8 @@
+# mc21, "isabela QT, 2 sigma restriction": one folder of 725 files, ~7.2 M events. All 100 rings
+# in one list column, a real label column and a row id; shower shapes and tracking under
+# HLTElectronContainer.*. No cell images, so only ring-based models (MLP) run on it.
+data_path: /mnt/shared/storage03/projects/cern/homes/lucas.nunes/data/ringer-datasets/datasets/mc21_isabela_qt_2sigma_restriction/electron_ringer.parquet
+rings_col: "TrigEMClusterContainer.ringsE"
+et_col: "TrigEMClusterContainer.et"      # MeV
+eta_col: "TrigEMClusterContainer.eta"
+label_col: target

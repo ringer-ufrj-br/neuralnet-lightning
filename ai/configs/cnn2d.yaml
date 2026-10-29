@@ -1,9 +1,0 @@
-model: "CNN2D"
-data_path: data/parquet/
-max_files: 100
-max_epochs: 200
-batch_size: 64
-learning_rate: 0.001
-patience: 20
-n_splits: 5
-seed: 42
